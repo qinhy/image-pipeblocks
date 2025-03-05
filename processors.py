@@ -359,28 +359,68 @@ class TorchResizeBlock(PipeBlock):
 
     def test_forward(self, imgs: List[Any], meta: Dict = {}):
         return self.test_forward_torch_rgb(imgs,meta)
-
+    
 class CVResizeBlock(PipeBlock):
-    def __init__(self, output_size: tuple=(1280,1280), interpolation=cv2.INTER_LINEAR):
+    def __init__(self, output_size: tuple = (1280, 1280), interpolation=cv2.INTER_LINEAR, fast_mode=False):
         super().__init__()
         self.title = 'cv_resize'
         self.output_size = output_size  # (width, height)
         self.interpolation = interpolation
+        self.fast_mode = fast_mode
 
-    def forward(self, imgs, meta={}):
-        meta[self.title]={'original_sizes':[]}
+    def forward(self, imgs, meta=None):
+        if meta is None:
+            meta = {}
+
+        meta[self.title] = {'original_sizes': []}
         resized_imgs = []
+
         for img in imgs:
-            # Store the original size
-            width,height = img.shape[:2]
-            meta[self.title]['original_sizes'].append((width,height))
-            # Resize the image
-            resized_img = cv2.resize(img, self.output_size, interpolation=self.interpolation)
+            height, width = img.shape[:2]  # Corrected order
+            meta[self.title]['original_sizes'].append((width, height))
+
+            if self.fast_mode:
+                # Use improved fast resizing (pure NumPy)
+                target_width, target_height = self.output_size
+                resized_img = self.fast_resize(img, target_width, target_height)
+            else:
+                # Standard mode: Use OpenCV's cv2.resize
+                resized_img = cv2.resize(img, self.output_size, interpolation=self.interpolation)
+
             resized_imgs.append(resized_img)
+
         return resized_imgs, meta
 
-    def test_forward(self, imgs: List[Any], meta: Dict = {}):
-        return self.test_forward_numpy_rgb(imgs,meta)
+    def fast_resize(self, img, target_width, target_height):
+        """
+        Fast resizing using pure NumPy.
+        - Downscaling: Uses stride-based subsampling.
+        - Upscaling: Uses np.repeat() to stretch pixels.
+        """
+        height, width, channels = img.shape  # Preserve color channels
+
+        # Stride-based downsampling (for reducing size)
+        y_stride = max(height // target_height, 1)
+        x_stride = max(width // target_width, 1)
+
+        resized_img = img[::y_stride, ::x_stride]
+
+        # Upscale manually using NumPy (if needed)
+        h_scale = target_height // resized_img.shape[0]
+        w_scale = target_width // resized_img.shape[1]
+
+        if h_scale > 1 or w_scale > 1:
+            resized_img = np.repeat(np.repeat(resized_img, h_scale, axis=0), w_scale, axis=1)
+
+        # Ensure exact output size by trimming or padding
+        resized_img = resized_img[:target_height, :target_width]
+
+        return resized_img
+
+    def test_forward(self, imgs: List[Any], meta: Dict = None):
+        if meta is None:
+            meta = {}
+        return self.forward(imgs, meta)
 
 class TileImagesBlock(PipeBlock):
     def __init__(self, tile_width=2):
