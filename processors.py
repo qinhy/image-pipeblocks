@@ -1,22 +1,23 @@
 
-from concurrent.futures import ThreadPoolExecutor
 import enum
+import math
 import random
-import time
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
-import ultralytics
 from ultralytics.utils import ops
-import time
 import numpy as np
 from typing import List, Any, Dict, Tuple, Union
 import numpy as np
 import cv2
 from PIL import Image
 from typing import Tuple, Dict, List, Optional, Any
+
+# global setting
+torch_img_dtype = torch.float16
+numpy_img_dtype = np.uint8
 
 class Layout(enum.Enum):
     """Possible Bayer color filter array layouts.
@@ -190,15 +191,15 @@ class ImageVerifier:
         """Verify that a NumPy image is of type uint8."""
         if not isinstance(img, np.ndarray):
             return self._raise_error(f"Expected a NumPy array at index {idx}, but got {type(img)}.", strict)
-        if img.dtype != np.uint8:
+        if img.dtype != numpy_img_dtype:
             return self._raise_error(f"NumPy image at index {idx} has invalid dtype {img.dtype}. Expected uint8.", strict)
 
     def verify_type_torch(self, img: torch.Tensor, idx: int, strict: bool = True) -> bool:
-        """Verify that a Torch image is of type float32 or float64."""
+        """Verify that a Torch image is of type."""
         if not isinstance(img, torch.Tensor):
             return self._raise_error(f"Expected a Torch tensor at index {idx}, but got {type(img)}.", strict)
-        if img.dtype not in [torch.float32, torch.float64]:
-            return self._raise_error(f"Torch image at index {idx} has invalid dtype {img.dtype}. Expected float32 or float64.", strict)
+        if img.dtype not in [torch_img_dtype]:#[torch.float16, torch.float32, torch.float64]:
+            return self._raise_error(f"Torch image at index {idx} has invalid dtype {img.dtype}. Expected {torch_img_dtype}.", strict)
 
     # ------------------------- SHAPE CHECKS -------------------------
     def _validate_shape(self, img, expected_shapes, img_type: str, strict: bool) -> bool:
@@ -285,7 +286,7 @@ class PipeBlock(ImageVerifier):
             self.verify_shape_rgb_torch(img)
             self.verify_range_torch(img,idx)
         return self.forward(imgs, meta)
-    
+        
     def test_forward_numpy_bayer(self, imgs: List[Any], meta: Dict = {}):
         self._basic_test(imgs, meta)
         for idx, img in enumerate(imgs):
@@ -308,13 +309,16 @@ class StaticWords(enum.Enum):
     yolo_results = 'yolo_results'
     yolo_input_imgs ='yolo_input_imgs'
     yolo_input_img_w_h ='yolo_input_img_w_h'
-    sliding_window_input_imgs = 'input_imgs'
+
+    sliding_window_input_img_w_h ='sliding_window_input_img_w_h'
+    sliding_window_size = 'sliding_window_size'
+    sliding_window_input_imgs = 'sliding_window_input_imgs'
+    sliding_window_imgs_idx = 'sliding_window_imgs_idx'
     sliding_window_output_offsets = 'sliding_window_output_offsets'
 
 class LambdaBlock(PipeBlock):
     def __init__(self,forward_func=lambda imgs,meta:(imgs,meta),title='lambda'):
-        super().__init__()
-        self.title = title
+        super().__init__(title)
         self.forward_func = forward_func
 
     def forward(self, imgs, meta={}):
@@ -325,8 +329,7 @@ class LambdaBlock(PipeBlock):
     
 class CvDebayerBlock(PipeBlock):
     def __init__(self,formart=cv2.COLOR_BAYER_BG2RGB):
-        super().__init__()
-        self.title = 'cv_debayer'
+        super().__init__('cv_debayer')
         self.formart = formart
 
     def test_forward(self, imgs: List[Any], meta: Dict = {}):
@@ -337,14 +340,13 @@ class CvDebayerBlock(PipeBlock):
         return debayered_imgs, meta
 
 class TorchDebayerBlock(PipeBlock):
-    def __init__(self, dtype=torch.float32):
+    def __init__(self, dtype=torch.float16):
         """
         Converts a batched Bayer image (B, 1, H, W) into an RGB image (B, 3, H, W) using Torch's Debayer5x5.
 
         :param batched_img: PyTorch tensor of shape (B, 1, H, W) with dtype uint8.
         """
-        super().__init__()
-        self.title = 'torch_debayer'
+        super().__init__('torch_debayer')
         self.num_gpus = self.gpu_info()
         self.dtype = dtype
         
@@ -354,14 +356,14 @@ class TorchDebayerBlock(PipeBlock):
             """
             Convert a Bayer raw image (B, 1, H, W) tensor to an RGB image (B, 3, H, W) using PyTorch's Debayer5x5.
             """
-            model = Debayer5x5().to(device)
+            model = Debayer5x5().to(device).to(self.dtype)
             self.debayer_models.append((model, device))
 
     def test_forward(self, imgs, meta={}):
         self.test_forward_torch_bayer(imgs, meta)
         return self.forward(imgs,meta)
 
-    def forward(self, imgs: List[np.ndarray], meta={}):
+    def forward(self, imgs: List[torch.Tensor], meta={}):
         torch_imgs = []
         for i,img in enumerate(imgs):
             model,device = self.debayer_models[i%self.num_gpus]
@@ -371,8 +373,7 @@ class TorchDebayerBlock(PipeBlock):
 
 class TorchRGBToNumpyBGRBlock(PipeBlock):
     def __init__(self):
-        super().__init__()
-        self.title = 'torch_to_numpy'
+        super().__init__('torch_to_numpy')
 
     def forward(self, imgs: List[np.ndarray], meta={}):
         # [ [1,3,h,w], ...]
@@ -382,7 +383,7 @@ class TorchRGBToNumpyBGRBlock(PipeBlock):
         ]
         
         imgs = [
-            img.cpu().numpy()[0][:,:,::-1]
+            img.cpu().numpy()[0][:,:,::-1] # to BGR
             for i,img in enumerate(imgs)
         ]
         return imgs, meta
@@ -392,9 +393,8 @@ class TorchRGBToNumpyBGRBlock(PipeBlock):
         return self.forward(imgs, meta)
     
 class NumpyRGBToTorchBlock(PipeBlock):
-    def __init__(self,dtype=torch.float32):
-        super().__init__()
-        self.title = "numpy_rgb_to_torch"
+    def __init__(self,dtype=torch.float16):
+        super().__init__("numpy_rgb_to_torch")
         self.num_gpus = self.gpu_info()
         self.dtype = dtype
 
@@ -422,9 +422,8 @@ class NumpyRGBToTorchBlock(PipeBlock):
         return self.forward(imgs, meta)
 
 class NumpyBayerToTorchBlock(PipeBlock):
-    def __init__(self,dtype=torch.float32):
-        super().__init__()
-        self.title = "numpy_bayer_to_torch"
+    def __init__(self,dtype=torch.float16):
+        super().__init__("numpy_bayer_to_torch")
         self.num_gpus = self.gpu_info()
         self.dtype = dtype
 
@@ -440,7 +439,6 @@ class NumpyBayerToTorchBlock(PipeBlock):
     def forward(self, imgs: List[np.ndarray], meta={}):
         torch_imgs = [
             self.tensor_models[i%self.num_gpus][0](img)
-            # torch.tensor(img, dtype=torch.float32, device=self.device).div(255.0).unsqueeze(0)  # Normalize & add channel dim
             for i,img in enumerate(imgs)
         ]
         return torch_imgs, meta
@@ -450,8 +448,7 @@ class NumpyBayerToTorchBlock(PipeBlock):
 
 class TorchResizeBlock(PipeBlock):
     def __init__(self, output_size: tuple=(1280,1280), mode: str = 'bilinear', align_corners: bool = False):
-        super().__init__()
-        self.title = 'torch_resize'
+        super().__init__('torch_resize')
         self.output_size = output_size  # (height, width)
         self.mode = mode
         self.align_corners = align_corners
@@ -472,8 +469,7 @@ class TorchResizeBlock(PipeBlock):
 
 class CVResizeBlock(PipeBlock):
     def __init__(self, output_size: tuple=(1280,1280), interpolation=cv2.INTER_LINEAR):
-        super().__init__()
-        self.title = 'cv_resize'
+        super().__init__('cv_resize')
         self.output_size = output_size  # (width, height)
         self.interpolation = interpolation
 
@@ -494,29 +490,22 @@ class CVResizeBlock(PipeBlock):
 
 class TileImagesBlock(PipeBlock):
     def __init__(self, tile_width=2):
-        super().__init__()
-        self.title = 'tile_images'
+        super().__init__('tile_images')
         self.tile_width = tile_width
     
     def forward(self, imgs, meta={}):
-        if not imgs:
-            raise ValueError("The images list cannot be empty.")
-
-        # Resize images if a target size is specified
-        # if self.dsize:
-        #     imgs = [cv2.resize(img, self.dsize) for img in imgs]
-
         # Get image dimensions
         h, w = imgs[0].shape[:2]
         num_images = len(imgs)
         tile_height = (num_images + self.tile_width - 1) // self.tile_width  # Ensures enough rows
 
         # Create a blank canvas
-        tile = np.zeros((tile_height * h, self.tile_width * w, 3), dtype=imgs[0].dtype)
+        tile_width = math.ceil(num_images / tile_height)
+        tile = np.zeros((tile_height * h, tile_width * w, 3), dtype=imgs[0].dtype)
 
         # Place images in the tile
         for i, img in enumerate(imgs):
-            r, c = divmod(i, self.tile_width)
+            r, c = divmod(i, tile_width)
             tile[r * h:(r + 1) * h, c * w:(c + 1) * w] = img
 
         return [tile], meta
@@ -527,8 +516,7 @@ class TileImagesBlock(PipeBlock):
   
 class EncodeJpegBlock(PipeBlock):
     def __init__(self, quality=None):
-        super().__init__()
-        self.title = 'encode_jpeg'
+        super().__init__('encode_jpeg')
         self.quality = quality  # JPEG encoding quality (0-100)
 
     def forward(self, imgs, meta={}):
@@ -538,12 +526,10 @@ class EncodeJpegBlock(PipeBlock):
                 success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.quality)])
             else:
                 success, encoded = cv2.imencode('.jpeg', img)
-
             if not success:
                 raise ValueError("JPEG encoding failed.")
-
             encoded_images.append(encoded)
-
+            
         return encoded_images, meta
 
     def test_forward(self, imgs: List[Any], meta: Dict = {}):
@@ -551,29 +537,29 @@ class EncodeJpegBlock(PipeBlock):
  
 class MergeYoloResultsBlock(PipeBlock):
     def __init__(self):
-        super().__init__()
-        self.title = 'merge_yolo_results'
+        super().__init__('merge_yolo_results')
 
     def forward(self, imgs, meta={}):
-        results = meta.get(StaticWords.yolo_results)
-        if not results:
-            raise ValueError("yolo results list cannot get.")
+        results = meta.get(StaticWords.yolo_results,[])
 
         if len(results) == 1:
-            return results[0], meta
-        
+            result = results[0]        
         # Merge YOLO detection results        
-        if hasattr(results[0],'boxes'):
+        elif hasattr(results[0],'boxes'):
             boxes = torch.cat([res.boxes.data.cpu() for res in results])
             # Create a new result object and update it with merged boxes
             result = results[0].new()
             result.update(boxes=boxes)
         elif isinstance(results[0],np.ndarray):
             result = np.vstack(results)
-        meta[StaticWords.yolo_results] = result
+
+        meta[StaticWords.yolo_results] = results
         return imgs, meta
     
     def test_forward(self, imgs, meta = {}):
+        results = meta.get(StaticWords.yolo_results)
+        if not results:
+            raise ValueError("yolo results list cannot get.")
         return self.forward(imgs, meta)
     
 class YOLOPredictor(PipeBlock):
@@ -584,13 +570,15 @@ class YOLOPredictor(PipeBlock):
         class_names=None,
         non_notify_classes=None,
         conf_thres_per_class=None,
-        conf_thres_per_class_rlfb=None
+        conf_thres_per_class_rlfb=None,
+        dtype=torch.float16
     ):
-        super().__init__()
-        self.title = 'yolo_predictor'
-        # Default values
+        super().__init__('yolo_predictor')
+        self.dtype = dtype
+        self.model_path = model_path
         self.imgsz = imgsz
         self.conf = conf
+        self.iou = -1
         self.class_names = class_names or []
         self.non_notify_classes = non_notify_classes or []
         self.conf_thres_per_class = conf_thres_per_class or {}
@@ -600,78 +588,87 @@ class YOLOPredictor(PipeBlock):
         self.conf_thres_per_class_rlfb = [
             {k: v for k, v in conf_thres} for conf_thres in conf_thres_per_class_rlfb
         ]
-
-        self.gpu_info()
-        # Load models onto separate GPUs
-        self.yolo_models = []
-        if torch.cuda.is_available():
-            for i in range(self.num_gpus):
-                device = f"cuda:{i}"
-                model = YOLO(model_path).to(device)
-                self.yolo_models.append((model, device))
-
-            print("[YOLOPredictor] Models loaded on available GPUs:", [device for _, device in self.yolo_models])
-        else: 
-            self.yolo_models = [YOLO(model_path).to('cpu')]
+        self.yolo_models = [(YOLO(model_path).to('cpu'),'cpu')]
     
     def forward(self, imgs, meta={}):
-        meta[StaticWords.yolo_input_imgs] = imgs
         res = self.predict(imgs)
-        meta[self.title] = self.postprocess(res)
-        meta[StaticWords.yolo_results] = meta[self.title]
+        res = self.postprocess(res)
+
+        meta[StaticWords.yolo_input_imgs] = imgs
+        meta[StaticWords.yolo_results] = res
+        meta[self.title] = res
         return imgs, meta
     
     def test_forward(self, imgs, meta = {}):
         return self.forward(imgs,meta)
     
-    def predict(self, imgs):
+    def predict(self, imgs)-> list[np.ndarray]: # [(N,5) ... ] x1,x2,y1,y2,conf,id : x,y is persentages
         raise NotImplemented('this is a interface class!')
 
     def postprocess(self, results):
-        # results = [OriginalDetectionResults(res) for res in results]
         # Apply confidence threshold filtering
-        results = self.remove_classes(results)
-        results = [self.filter_thres(res, self.conf_thres_per_class) for res in results]
-        # for res in results:
-        #     for i, label_name in enumerate(self.class_names):
-        #         res.names[i] = label_name
+        results = self.remove_classes(results, self.non_notify_classes)
+        results = self.filter_conf_per_class(results, self.conf_thres_per_class) 
         return results
 
-    def remove_classes(self,results):
+    def remove_classes(self,results,non_notify_classes):
         if len(self.non_notify_classes)==0:  return results
-        results_filtered = []
-        for res in results:
-            keep = [cls not in self.non_notify_classes for cls in res.boxes.cls]
-            # res_new = ultralytics.engine.results.Results(res)
-            res.update(boxes=res.boxes.data[keep])
-            results_filtered.append(res)
-        return results_filtered
+        for i,res in enumerate(results):
+            if len(res)==0:continue
+            labels = res[:,5]
+            keep = [int(l) not in non_notify_classes for l in labels]
+            results[i]=res[keep]                
+        return results
     
-    def filter_thres(self, result, conf_thres_per_class:dict):
+    def filter_conf_per_class(self, results, conf_thres_per_class:dict):
         """Filters results based on class-specific confidence thresholds."""
-        if not conf_thres_per_class: return result
-        if hasattr(result,'boxes'):
-            boxes = result.boxes.data
-            confs = boxes[:, 4].tolist()
-            labels = boxes[:, 5].int().tolist()
-            keep = [(conf_thres_per_class.get(l, 0) < c) for c, l in zip(confs, labels)]
-            result.update(boxes=boxes[keep])
-            return result
-        elif isinstance(result,np.ndarray):
+        if len(conf_thres_per_class)==0: return results
+        for i,result in enumerate(results):
+            if len(result)==0:continue
             confs = result[:,4]
             labels = result[:,5]
             keep = [(conf_thres_per_class.get(int(l), 0) < c) for c, l in zip(confs, labels)]
-            return result[keep]
+            results[i]=result[keep]
+        return results
 
 class YOLOPredictorGPU(YOLOPredictor):
 
     def test_forward(self, imgs, meta = {}):
+        self.gpu_info()
+        # Load models onto separate GPUs
+        if torch.cuda.is_available():
+            self.yolo_models = []
+            for i in range(self.num_gpus):
+                device = f"cuda:{i}"
+                model = YOLO(self.model_path).to(device)
+                self.yolo_models.append((model, device))
+            print("[YOLOPredictor] Models loaded on available GPUs:", [device for _, device in self.yolo_models])
+
         for i in range(self.num_gpus):
             batch = [(i * 255).clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()[0]
                       for i in imgs[i::self.num_gpus]]
             (yolo_model,device) = self.yolo_models[i]
-            # print([i.shape for i in batch])
-            yolo_model(batch, imgsz=self.imgsz, conf=self.conf)
+
+            batch = [i.astype(np.uint8) for i in batch]
+            if len(batch)==0:continue
+
+            half= self.dtype == torch.float16
+            
+            # run one time and init
+            yolo_model(batch, imgsz=self.imgsz, conf=self.conf, half=half)
+
+            self.iou = yolo_model.predictor.args.iou
+            self.classes = yolo_model.predictor.args.classes
+            self.agnostic_nms = yolo_model.predictor.args.agnostic_nms
+            self.max_det = yolo_model.predictor.args.max_det
+            self.nc = len(yolo_model.predictor.model.names)
+            self.end2end = getattr(yolo_model.predictor.model, "end2end", False)
+            self.rotated = yolo_model.predictor.args.task == "obb"
+                
+        self.imgs_device_dict = {d:[] for d in set([i.device.index for i in imgs])}
+        for i,img in enumerate(imgs):
+            self.imgs_device_dict[img.device.index].append(i)
+
         return self.forward(imgs,meta)
     
     def predict(self, imgs):
@@ -679,42 +676,47 @@ class YOLOPredictorGPU(YOLOPredictor):
         Run YOLO inference in parallel across GPUs.
         """       
         predictions = [None] * len(imgs)  # Placeholder for ordered predictions
+        res = []
 
-        for i in range(self.num_gpus):
-            batch_indices = list(range(i, len(imgs), self.num_gpus))  # Track original indices
+        for i in range(min(self.num_gpus,len(imgs))):
+            batch_indices = np.asarray(self.imgs_device_dict[i])  # Track original indices
             batch = [imgs[idx] for idx in batch_indices]  # Assign correct images to batch
+            if len(batch)==0:continue
 
             (yolo_model, device) = self.yolo_models[i]
             
             with torch.no_grad():
-                tmp = torch.vstack([img.to(device) for img in batch])  # Move batch to correct GPU
+                tmp = torch.vstack([img for img in batch])  # Move batch to correct GPU
                 b, c, h, w = tmp.shape
+                res.append([yolo_model.model(tmp),h, w])
 
-                preds, feature_maps = yolo_model.model(tmp)
+        # do it later for parallel GPU infer
+        for r in res:
+            (preds, feature_maps), h, w = r
+            preds = ops.non_max_suppression(
+                preds,
+                self.conf,
+                self.iou,
+                self.classes,
+                self.agnostic_nms,
+                
+                max_det = self.max_det,
+                nc =      self.nc,
+                end2end = self.end2end,
+                rotated = self.rotated,
+            )
+            
+            # Normalize predictions and store them in the correct order
+            for j, pred in enumerate(preds):
+                if pred is not None and len(pred) > 0:
+                    pred[:, 0] /= w  # Normalize x1
+                    pred[:, 1] /= h  # Normalize y1
+                    pred[:, 2] /= w  # Normalize x2
+                    pred[:, 3] /= h  # Normalize y2
+                
+                predictions[batch_indices[j]] = pred  # Store at the original index
 
-                preds = ops.non_max_suppression(
-                    preds,
-                    yolo_model.predictor.args.conf,
-                    yolo_model.predictor.args.iou,
-                    yolo_model.predictor.args.classes,
-                    yolo_model.predictor.args.agnostic_nms,
-                    max_det=yolo_model.predictor.args.max_det,
-                    nc=len(yolo_model.predictor.model.names),
-                    end2end=getattr(yolo_model.predictor.model, "end2end", False),
-                    rotated=yolo_model.predictor.args.task == "obb",
-                )
-
-                # Normalize predictions and store them in the correct order
-                for j, pred in enumerate(preds):
-                    if pred is not None and len(pred) > 0:
-                        pred[:, 0] /= w  # Normalize x1
-                        pred[:, 1] /= h  # Normalize y1
-                        pred[:, 2] /= w  # Normalize x2
-                        pred[:, 3] /= h  # Normalize y2
-                    
-                    predictions[batch_indices[j]] = pred  # Store at the original index
-                    
-        results = [r.cpu().numpy() for r in predictions]
+        results = [r.cpu().numpy() if r is not None else [] for r in predictions]
         return results
 
 class YOLOPredictorCPU(YOLOPredictor):
@@ -728,221 +730,243 @@ class YOLOPredictorCPU(YOLOPredictor):
             results[i] = np.hstack([boxes,conf,cls])
         return results
 
-# class SlidingWindowBlock(PipeBlock):
-#     def __init__(self, window_size=(1280,1280), stride=None):
-#         """
-#         Splits an image into sliding windows.
+class SlidingWindowBlock(PipeBlock):
+    def __init__(self, window_size=(1280,1280), stride=None):
+        """
+        Splits an image into sliding windows.
 
-#         :param batched_img: NumPy array (H, W, C) or PyTorch tensor (C, H, W)
-#         :param window_size: Tuple (window_height, window_width)
-#         :param stride: Tuple (stride_height, stride_width), default is window_size (non-overlapping)
-#         """
-#         self.title = "sliding_window"
-#         self.window_size = window_size
-#         self.stride = stride if stride else window_size
+        :param batched_img: NumPy array (H, W, C) or PyTorch tensor (C, H, W)
+        :param window_size: Tuple (window_height, window_width)
+        :param stride: Tuple (stride_height, stride_width), default is window_size (non-overlapping)
+        """
+        self.title = "sliding_window"
+        self.window_size = window_size
+        self.stride = stride if stride else window_size
 
-#     def test_forward(self, imgs, meta):
-#         self.test_forward_one_img(imgs[0],meta)
-#         return self.forward(imgs,meta)
+    def test_forward(self, imgs, meta):
+        self.test_forward_one_img(imgs[0],meta)
+        return self.forward(imgs,meta)
     
-#     def forward(self, imgs, meta={}):        
-#         meta[StaticWords.sliding_window_input_imgs] = imgs
-#         output_offsets = []
-#         new_imgs = []
+    def forward(self, imgs, meta={}):
+        output_offsets = []
+        new_imgs = []       
+        imgs_idx = {}
+        for i,img in enumerate(imgs):
+            out_imgs,offs = self.forward_one_img(img,meta)
+            imgs_idx[i] = list(range(len(new_imgs), len(new_imgs)+len(out_imgs)))
+            new_imgs += out_imgs
+            output_offsets.append(offs)
+        meta[StaticWords.sliding_window_size] = self.window_size
+        meta[StaticWords.sliding_window_imgs_idx] = imgs_idx
+        meta[StaticWords.sliding_window_input_imgs] = imgs
+        meta[StaticWords.sliding_window_output_offsets] = output_offsets
+        return new_imgs,meta
+    
+    def test_forward_one_img(self, batched_img, meta):
+        """
+        Validate input image format.
+        """
+        if isinstance(batched_img, np.ndarray):
+            if batched_img.ndim not in [3, 4]:
+                raise ValueError("NumPy input must have shape (H, W, C) or (B, H, W, C).")
+        elif isinstance(batched_img, torch.Tensor):
+            if batched_img.dim() not in [3, 4]:
+                raise ValueError("PyTorch input must have shape (C, H, W) or (B, C, H, W).")
+        else:
+            raise TypeError("Input must be either a NumPy array or a PyTorch tensor.")
         
-#         for img in imgs:
-#             out_imgs,offs = self.forward_one_img(img)
-#             new_imgs += out_imgs
-#             output_offsets.append(offs)
+        return self.forward_one_img(batched_img,meta)
 
-#         meta[StaticWords.sliding_window_output_offsets] = output_offsets
-#         return new_imgs,meta
-    
-#     def test_forward_one_img(self, batched_img, meta):
-#         """
-#         Validate input image format.
-#         """
-#         if isinstance(batched_img, np.ndarray):
-#             if batched_img.ndim not in [3, 4]:
-#                 raise ValueError("NumPy input must have shape (H, W, C) or (B, H, W, C).")
-#         elif isinstance(batched_img, torch.Tensor):
-#             if batched_img.dim() not in [3, 4]:
-#                 raise ValueError("PyTorch input must have shape (C, H, W) or (B, C, H, W).")
-#         else:
-#             raise TypeError("Input must be either a NumPy array or a PyTorch tensor.")
+    def forward_one_img(self, batched_img, meta={}):
+        """
+        Splits an image into sliding windows.
+
+        Returns:
+            windows: NumPy array or PyTorch tensor with shape:
+                     - NumPy: (num_windows, window_height, window_width, C)
+                     - PyTorch: (num_windows, C, window_height, window_width)
+            offsets_xyxy: List of bounding boxes (x1, y1, x2, y2) for each window.
+        """
+        if isinstance(batched_img, np.ndarray):
+            imgs,offs = self._split_numpy(batched_img,meta)
+        elif isinstance(batched_img, torch.Tensor):
+            imgs,offs = self._split_torch(batched_img,meta)
+        else:
+            raise TypeError("Input must be either a NumPy array or a PyTorch tensor.")
         
-#         return self.forward_one_img(batched_img)
+        res = []
+        for i in imgs:
+            res += i
+        return res,offs
 
-#     def forward_one_img(self, batched_img):
-#         """
-#         Splits an image into sliding windows.
-
-#         Returns:
-#             windows: NumPy array or PyTorch tensor with shape:
-#                      - NumPy: (num_windows, window_height, window_width, C)
-#                      - PyTorch: (num_windows, C, window_height, window_width)
-#             offsets_xyxy: List of bounding boxes (x1, y1, x2, y2) for each window.
-#         """
-#         if isinstance(batched_img, np.ndarray):
-#             imgs,offs = self._split_numpy(batched_img)
-#         elif isinstance(batched_img, torch.Tensor):
-#             imgs,offs = self._split_torch(batched_img)
-#         else:
-#             raise TypeError("Input must be either a NumPy array or a PyTorch tensor.")
-#         return imgs,offs
-
-#     def _split_numpy(self, data):
-#         """
-#         Split a NumPy array into sliding windows.
-#         """
-#         if data.ndim == 4:  # If batched, process each image
-#             batch_windows = []
-#             batch_offsets = []
-#             for i in range(data.shape[0]):
-#                 windows, offsets = self._split_numpy_single(data[i])
-#                 batch_windows.append(windows)
-#                 batch_offsets.append(offsets)
-#             batch_windows, batch_offsets = np.concatenate(batch_windows, axis=0), batch_offsets
-#             return batch_windows, batch_offsets
-#         else:
-#             windows, offsets = self._split_numpy_single(data)
-#         return windows, offsets
+    def _split_numpy(self, data, meta={}):
+        """
+        Split a NumPy array into sliding windows.
+        """
+        if data.ndim == 4:  # If batched, process each image
+            batch_windows = []
+            batch_offsets = []
+            for i in range(data.shape[0]):
+                windows, offsets = self._split_numpy_single(data[i],meta)
+                batch_windows.append(windows)
+                batch_offsets.append(offsets)
+            batch_windows, batch_offsets = np.concatenate(batch_windows, axis=0), batch_offsets
+            return batch_windows, batch_offsets
+        else:
+            windows, offsets = self._split_numpy_single(data,meta)
+        return windows, offsets
 
 
-#     def _split_torch(self, data):
-#         """
-#         Split a PyTorch tensor into sliding windows.
-#         """
-#         if data.dim() == 4:  # If batched, process each image
-#             batch_windows = []
-#             batch_offsets = []
-#             for i in range(data.shape[0]):
-#                 windows, offsets = self._split_torch_single(data[i])
-#                 batch_windows.append(windows)
-#                 batch_offsets.append(offsets)
-#             return torch.cat(batch_windows, dim=0), batch_offsets
-#         else:
-#             return self._split_torch_single(data)
+    def _split_torch(self, data, meta={}):
+        """
+        Split a PyTorch tensor into sliding windows.
+        """
+        if data.dim() == 4:  # If batched, process each image
+            batch_windows = []
+            batch_offsets = []
+            for i in range(data.shape[0]):
+                windows, offsets = self._split_torch_single(data[i],meta)
+                batch_windows.append(windows)
+                batch_offsets.append(offsets)
+            return batch_windows, batch_offsets
+        else:
+            return self._split_torch_single(data,meta)
 
-#     def _split_numpy_single(self, data):
-#         """
-#         Split a single NumPy image (H, W, C) into sliding windows.
-#         """
-#         H, W, C = data.shape
-#         wH, wW = self.window_size
-#         sH, sW = self.stride
+    def _split_numpy_single(self, data, meta={}):
+        """
+        Split a single NumPy image (H, W, C) into sliding windows.
+        """
+        H, W, C = data.shape
+        wH, wW = self.window_size
+        sH, sW = self.stride
+        
+        meta[StaticWords.sliding_window_input_img_w_h] = (W,H)
+        if wH > H or wW > W:
+            raise ValueError(f"Window size ({wH}, {wW}) must be <= image size ({H}, {W}).")
 
-#         if wH > H or wW > W:
-#             raise ValueError(f"Window size ({wH}, {wW}) must be <= image size ({H}, {W}).")
+        windows_list = []
+        offsets_xyxy = []
 
-#         windows_list = []
-#         offsets_xyxy = []
+        for row_start in range(0, H - wH + 1, sH):
+            for col_start in range(0, W - wW + 1, sW):
+                window = data[row_start: row_start + wH, col_start: col_start + wW, :]
+                windows_list.append(window)
+                # offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))
+                offsets_xyxy.append((col_start, row_start, col_start, row_start))
 
-#         for row_start in range(0, H - wH + 1, sH):
-#             for col_start in range(0, W - wW + 1, sW):
-#                 window = data[row_start: row_start + wH, col_start: col_start + wW, :]
-#                 windows_list.append(window)
-#                 # offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))
-#                 offsets_xyxy.append((col_start, row_start, col_start, row_start))
-
-#         return windows_list, offsets_xyxy
+        return windows_list, offsets_xyxy
     
-#     def _split_torch_single(self, data):
-#         """
-#         Split a single PyTorch image (C, H, W) into sliding windows.
-#         """
-#         C, H, W = data.shape
-#         wH, wW = self.window_size
-#         sH, sW = self.stride
+    def _split_torch_single(self, data, meta={}):
+        """
+        Split a single PyTorch image (C, H, W) into sliding windows.
+        """
+        C, H, W = data.shape
+        wH, wW = self.window_size
+        sH, sW = self.stride
+        
+        meta[StaticWords.sliding_window_input_img_w_h] = (W,H)
+        if wH > H or wW > W:
+            raise ValueError(f"Window size ({wH}, {wW}) must be <= image size ({H}, {W}).")
 
-#         if wH > H or wW > W:
-#             raise ValueError(f"Window size ({wH}, {wW}) must be <= image size ({H}, {W}).")
+        windows_list = []
+        offsets_xyxy = []
 
-#         windows_list = []
-#         offsets_xyxy = []
+        for row_start in range(0, H - wH + 1, sH):
+            for col_start in range(0, W - wW + 1, sW):
+                window = data[:, row_start: row_start + wH, col_start: col_start + wW]
+                windows_list.append(window.unsqueeze(0))
+                # offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))
+                offsets_xyxy.append((col_start, row_start, col_start, row_start))
+        return windows_list, offsets_xyxy 
 
-#         for row_start in range(0, H - wH + 1, sH):
-#             for col_start in range(0, W - wW + 1, sW):
-#                 window = data[:, row_start: row_start + wH, col_start: col_start + wW]
-#                 windows_list.append(window)
-#                 # offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))
-#                 offsets_xyxy.append((col_start, row_start, col_start, row_start))
+class SlidingWindowMergeBlock(PipeBlock):
+    def __init__(self):
+        """
+        Merges YOLO detections from sliding windows back into the original image coordinates.
+        """
+        self.title = "sliding_window_merge"
 
-#         return torch.cat(windows_list, dim=0), offsets_xyxy 
+    def _extract_preds(self, preds):
+        """
+        Extracts YOLO-style detections from various possible data structures.
 
-# class SlidingWindowMergeBlock(PipeBlock):
-#     def __init__(self):
-#         """
-#         Merges YOLO detections from sliding windows back into the original image coordinates.
-#         """
-#         self.title = "sliding_window_merge"
+        :param preds: Detection results, potentially in different formats.
+        :return: NumPy array of shape (N, 6) -> [x1, y1, x2, y2, confidence, class]
+        """
+        if hasattr(preds, 'pred'):
+            preds = preds.pred
+            preds = np.vstack([d.cpu().numpy() for d in preds])
+        elif hasattr(preds, 'boxes'):
+            # Extract boxes, confidence scores, and class labels
+            bs = preds.boxes
+            xyxy = bs.xyxy.cpu().numpy()
+            conf = bs.conf.cpu().numpy()
+            cls = bs.cls.cpu().numpy()
+            preds = np.hstack([xyxy, conf.reshape(-1, 1), cls.reshape(-1, 1)])
+        return preds
 
-#     def _extract_preds(self, preds):
-#         """
-#         Extracts YOLO-style detections from various possible data structures.
-
-#         :param preds: Detection results, potentially in different formats.
-#         :return: NumPy array of shape (N, 6) -> [x1, y1, x2, y2, confidence, class]
-#         """
-#         if hasattr(preds, 'pred'):
-#             preds = preds.pred
-#             preds = np.vstack([d.cpu().numpy() for d in preds])
-#         elif hasattr(preds, 'boxes'):
-#             # Extract boxes, confidence scores, and class labels
-#             bs = preds.boxes
-#             xyxy = bs.xyxy.cpu().numpy()
-#             conf = bs.conf.cpu().numpy()
-#             cls = bs.cls.cpu().numpy()
-#             preds = np.hstack([xyxy, conf.reshape(-1, 1), cls.reshape(-1, 1)])
-#         return preds
-
-#     def test_forward(self, batched_img, meta):
-#         return self.forward(batched_img, meta)
+    def test_forward(self, batched_img, meta):
+        return self.forward(batched_img, meta)
     
-#     def forward(self, imgs, meta:dict={}):
-#         """
-#         Merges sliding window detections back into the original image space.
+    def forward(self, imgs, meta:dict={}):
+        """
+        Merges sliding window detections back into the original image space.
 
-#         :param imgs: List of split image windows.
-#         :param meta: Metadata dictionary containing detection results and window offsets.
-#         :return: Tuple (original_images, updated_meta)
-#         """
-#         # Retrieve detections and transformations from metadata
-#         multi_dets = meta[StaticWords.yolo_results]
-#         yolo_results = []
-#         trans = meta[StaticWords.sliding_window_output_offsets]        
-#         splits = len(trans[0])
-#         multi_dets = [multi_dets[i:i+splits] for i in range(0,len(multi_dets),splits)]
-#         for ii, (img, preds) in enumerate(zip(imgs, multi_dets)):
-#             if len(preds) == 0: continue
-#             trans_xyxy = trans[ii]
-#             preds = [self._extract_preds(p) for p in preds]
-#             # Adjust detection bounding boxes based on window offsets
-#             for i, p in enumerate(preds):
-#                 if len(p) == 0: continue
-#                 if isinstance(p, torch.Tensor):
-#                     p = p.cpu().numpy()
-#                 p[:,:4] += trans_xyxy[i]  # Shift bounding boxes back to original image space
-#                 preds[i] = p
+        :param imgs: List of split image windows.
+        :param meta: Metadata dictionary containing detection results and window offsets.
+        :return: Tuple (original_images, updated_meta)
+        """
+        # Retrieve detections and transformations from metadata
+        
+        raw_imgs_idx = meta[StaticWords.sliding_window_imgs_idx]
+        multi_dets = meta[StaticWords.yolo_results]
+        trans = meta[StaticWords.sliding_window_output_offsets]
+        raw_imgs = meta[StaticWords.sliding_window_input_imgs]        
+        window_size = meta[StaticWords.sliding_window_size]
+        W, H = meta[StaticWords.sliding_window_input_img_w_h]
+        wH, wW = window_size
 
-#             # Stack detections into a single array
-#             preds = np.vstack(preds)
+        if raw_imgs[0].dim()==4 and raw_imgs[0].shape[0]==1 and len(trans[0])==1:
+            trans = [t[0] for t in trans]
 
-#             # ---------- Apply Non-Maximum Suppression (NMS) ----------
-#             boxes = torch.tensor(preds[:, :4])  # (x1, y1, x2, y2)
-#             scores = torch.tensor(preds[:, 4])  # Confidence scores
-#             class_ids = torch.tensor(preds[:, 5])  # Class labels
+        splits = len(raw_imgs_idx)
+        yolo_results = []        
+        multi_dets = [[np.asarray(multi_dets[ii]).reshape(-1,6) for ii in raw_imgs_idx[i]] for i in range(splits)]
 
-#             # Perform NMS using PyTorch
-#             keep_indices = torch.ops.torchvision.nms(boxes, scores, 0.15)
-#             preds = preds[keep_indices.numpy()]  # Keep only high-confidence, non-overlapping detections
+        for ii, (img, preds) in enumerate(zip(raw_imgs, multi_dets)):
+            if len(preds) == 0:
+                yolo_results.append([])
+                continue
 
-#             yolo_results.append(preds)
+            trans_xyxy = trans[ii]
+            preds = [self._extract_preds(p) for p in preds]
+            # Adjust detection bounding boxes based on window offsets
+            for i, p in enumerate(preds):
+                if len(p) == 0: continue              
+                # (x1, y1, x2, y2)  
+                p[:, 0] = (p[:, 0]*(wW/W) + trans_xyxy[i][0]/W)
+                p[:, 1] = (p[:, 1]*(wH/H) + trans_xyxy[i][1]/H)
+                p[:, 2] = (p[:, 2]*(wW/W) + trans_xyxy[i][2]/W)
+                p[:, 3] = (p[:, 3]*(wH/H) + trans_xyxy[i][3]/H)
+                preds[i] = p
 
-#         meta[StaticWords.yolo_results] = yolo_results
-#         raw_imgs = meta[StaticWords.sliding_window_input_imgs]
-#         meta[StaticWords.yolo_input_imgs] = raw_imgs
-#         return raw_imgs,meta
+            # Stack detections into a single array
+            preds = np.vstack(preds)
+            # # ---------- Apply Non-Maximum Suppression (NMS) ----------
+            boxes = torch.tensor(preds[:, :4])  # (x1, y1, x2, y2)
+            scores = torch.tensor(preds[:, 4])  # Confidence scores
+            class_ids = torch.tensor(preds[:, 5])  # Class labels
+
+            # Perform NMS using PyTorch
+            keep_indices = torch.ops.torchvision.nms(boxes, scores, 0.15)
+            preds = preds[keep_indices.numpy()]  # Keep only high-confidence, non-overlapping detections
+
+            yolo_results.append(preds)
+
+        meta[StaticWords.yolo_results] = yolo_results
+        raw_imgs = meta[StaticWords.sliding_window_input_imgs]
+        meta[StaticWords.yolo_input_imgs] = raw_imgs
+        return raw_imgs,meta
     
 # class OriginalDetectionResults(ultralytics.engine.results.Results):
 #   def __init__(self, results):
@@ -994,7 +1018,7 @@ def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     alpha = int(hex_color[6:8], 16) if len(hex_color) == 8 else 255
     return rgba + (alpha,)
 
-class NumpyImageMask:
+class NumpyImageMask(PipeBlock):
     def __init__(
         self,
         mask_image_path: Optional[str],
@@ -1002,10 +1026,10 @@ class NumpyImageMask:
         mask_split: Tuple[int, int] = (1, 1),
     ):
         """Initialize the NumpyImageMask class."""
-        self.title = "numpy_image_mask"
+        super().__init__("numpy_image_mask")
         self._masks = self._make_mask_images(mask_image_path, mask_split, mask_color)
         if self._masks is None:
-            print('Warning: no mask image loaded. This NumpyImageMask bloack will do nothing.')
+            print('[NumpyImageMask] Warning: no mask image loaded. This NumpyImageMask bloack will do nothing.')
 
     def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
         """Convert a grayscale mask to an RGBA image with the specified color."""
@@ -1119,8 +1143,7 @@ class NumpyImageMask:
 
 class DrawPredictionsBlock(PipeBlock):
     def __init__(self, class_names=None, class_colors=None):
-        super().__init__()
-        self.title = 'draw_predictions'
+        super().__init__('draw_predictions')
         
         # Assign class names
         self.class_names = class_names or list(range(100000))
@@ -1191,18 +1214,15 @@ class DrawPredictionsBlock(PipeBlock):
                         (0, 0, 0), thickness)
 
         return image_with_boxes
-
+    
     def _extract_preds(self, preds):
         """Extracts predictions from YOLO output."""
-        if hasattr(preds, 'pred'):
-            preds = preds.pred
-            preds = np.vstack([d.cpu().numpy() for d in preds])
-        elif hasattr(preds, 'boxes'):
+        if hasattr(preds, 'boxes'):
             bs = preds.boxes
-            xyxy = bs.xyxy.cpu().numpy()
+            xyxyn = bs.xyxyn.cpu().numpy()
             conf = bs.conf.cpu().numpy()
             cls = bs.cls.cpu().numpy()
-            preds = np.hstack([xyxy, conf.reshape(-1, 1), cls.reshape(-1, 1)])
+            preds = np.hstack([xyxyn, conf.reshape(-1, 1), cls.reshape(-1, 1)])
         return preds
 
     def _generate_class_colors(self, num_classes):
