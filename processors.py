@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 from ultralytics.utils import ops
 import numpy as np
-from typing import List, Any, Dict, Tuple, Union
+from typing import List, Any, Dict, Tuple
 import numpy as np
 import cv2
 from PIL import Image
@@ -178,6 +178,31 @@ class DummyDebayer5x5(torch.nn.Module):
         return x.repeat(1, 3, 1, 1)  # Shape: (N, 3, H, W)
 
 class ImageVerifier:
+    def _img_w_h_c(self,im):
+        
+        if isinstance(im, np.ndarray):
+            if len(im.shape)==2:
+                height,width = im.shape
+                channel = 1
+            elif len(im.shape)==3:
+                height,width,channel = im.shape
+            else:
+                raise ValueError('numpy image shape must be H,W or H,W,C')
+
+        if isinstance(im, torch.Tensor):
+            if len(im.shape)==3:
+                # C, H, W = x.shape
+                channel,height,width = im.shape
+            elif len(im.shape)==4:
+                # B, C, H, W = x.shape
+                b,channel,height,width = im.shape
+            else:
+                raise ValueError('torch image shape must be C,H,W or B,C,H,W')
+        if channel not in [1,3]:
+            raise ValueError(f'image channel is not 1 or 3, it is {channel}')
+
+        return width,height,channel
+
     """A class for verifying NumPy and Torch image types, shapes, and value ranges."""
 
     def _raise_error(self, message: str, strict: bool) -> bool:
@@ -308,7 +333,8 @@ class PipeBlock(ImageVerifier):
 class StaticWords(enum.Enum):
     yolo_results = 'yolo_results'
     yolo_input_imgs ='yolo_input_imgs'
-    yolo_input_img_w_h ='yolo_input_img_w_h'
+    
+    before_resize_img_w_h ='before_resize_img_w_h'
 
     sliding_window_input_img_w_h ='sliding_window_input_img_w_h'
     sliding_window_size = 'sliding_window_size'
@@ -340,7 +366,7 @@ class CvDebayerBlock(PipeBlock):
         return debayered_imgs, meta
 
 class TorchDebayerBlock(PipeBlock):
-    def __init__(self, dtype=torch.float16):
+    def __init__(self, dtype=torch_img_dtype):
         """
         Converts a batched Bayer image (B, 1, H, W) into an RGB image (B, 3, H, W) using Torch's Debayer5x5.
 
@@ -369,7 +395,6 @@ class TorchDebayerBlock(PipeBlock):
             model,device = self.debayer_models[i%self.num_gpus]
             torch_imgs.append(model(img.unsqueeze(0)))
         return torch_imgs, meta
-    
 
 class TorchRGBToNumpyBGRBlock(PipeBlock):
     def __init__(self):
@@ -392,14 +417,15 @@ class TorchRGBToNumpyBGRBlock(PipeBlock):
         self.test_forward_torch_rgb(imgs, meta)
         return self.forward(imgs, meta)
     
-class NumpyRGBToTorchBlock(PipeBlock):
-    def __init__(self,dtype=torch.float16):
+class NumpyBGRToTorchRGBBlock(PipeBlock):
+    def __init__(self,dtype=torch_img_dtype):
         super().__init__("numpy_rgb_to_torch")
         self.num_gpus = self.gpu_info()
         self.dtype = dtype
 
         def get_model(device,dtype=dtype):
-            return lambda img:torch.tensor(img, dtype=dtype, device=device).div(255.0).permute(2, 0, 1)
+            return lambda img:torch.tensor(img[:,:,::-1].copy(),
+                        dtype=dtype, device=device).div(255.0).permute(2, 0, 1).unsqueeze(0)
         
         self.tensor_models = []
         for i in range(self.num_gpus):
@@ -409,6 +435,7 @@ class NumpyRGBToTorchBlock(PipeBlock):
 
 
     def forward(self, imgs: List[np.ndarray], meta={}):
+        # print([i.shape for i in imgs])
         torch_imgs = [
             self.tensor_models[i%self.num_gpus][0](img)
             for i,img in enumerate(imgs)
@@ -422,7 +449,7 @@ class NumpyRGBToTorchBlock(PipeBlock):
         return self.forward(imgs, meta)
 
 class NumpyBayerToTorchBlock(PipeBlock):
-    def __init__(self,dtype=torch.float16):
+    def __init__(self,dtype=torch_img_dtype):
         super().__init__("numpy_bayer_to_torch")
         self.num_gpus = self.gpu_info()
         self.dtype = dtype
@@ -455,16 +482,15 @@ class TorchResizeBlock(PipeBlock):
 
     def forward(self, imgs: List[torch.Tensor], meta={}):
         resized_imgs: List[torch.Tensor] = []
-        b,c,height,width = imgs[0].shape
-        meta[StaticWords.yolo_input_img_w_h] = width,height
         for img_tensor in imgs:
-            # img_tensor = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
             resized_tensor = F.interpolate(img_tensor,
                     size=self.output_size, mode=self.mode, align_corners=self.align_corners)
             resized_imgs.append(resized_tensor)
         return resized_imgs, meta    
 
     def test_forward(self, imgs: List[Any], meta: Dict = {}):
+        width,height,c = self._img_w_h_c(imgs[0])
+        meta[StaticWords.before_resize_img_w_h] = width,height
         return self.test_forward_torch_rgb(imgs,meta) # B,C,H,W
 
 class CVResizeBlock(PipeBlock):
@@ -475,17 +501,15 @@ class CVResizeBlock(PipeBlock):
 
     def forward(self, imgs, meta={}):
         resized_imgs = []
-        # Store the original size
-        width,height = imgs[0].shape[:2]        
-        meta[StaticWords.yolo_input_img_w_h] = width,height
-
         for img in imgs:
-            # Resize the image
-            resized_img = cv2.resize(img, self.output_size, interpolation=self.interpolation)
+            resized_img = cv2.resize(
+                img, self.output_size, interpolation=self.interpolation)
             resized_imgs.append(resized_img)
         return resized_imgs, meta
 
-    def test_forward(self, imgs: List[Any], meta: Dict = {}):
+    def test_forward(self, imgs: List[Any], meta: Dict = {}):        
+        width,height,c = self._img_w_h_c(imgs[0])
+        meta[StaticWords.before_resize_img_w_h] = width,height
         return self.test_forward_numpy_rgb(imgs,meta)
 
 class TileImagesBlock(PipeBlock):
@@ -571,7 +595,7 @@ class YOLOPredictor(PipeBlock):
         non_notify_classes=None,
         conf_thres_per_class=None,
         conf_thres_per_class_rlfb=None,
-        dtype=torch.float16
+        dtype=torch_img_dtype
     ):
         super().__init__('yolo_predictor')
         self.dtype = dtype
@@ -632,7 +656,6 @@ class YOLOPredictor(PipeBlock):
         return results
 
 class YOLOPredictorGPU(YOLOPredictor):
-
     def test_forward(self, imgs, meta = {}):
         self.gpu_info()
         # Load models onto separate GPUs
@@ -652,7 +675,7 @@ class YOLOPredictorGPU(YOLOPredictor):
             batch = [i.astype(np.uint8) for i in batch]
             if len(batch)==0:continue
 
-            half= self.dtype == torch.float16
+            half= self.dtype == torch_img_dtype
             
             # run one time and init
             yolo_model(batch, imgsz=self.imgsz, conf=self.conf, half=half)
@@ -668,6 +691,7 @@ class YOLOPredictorGPU(YOLOPredictor):
         self.imgs_device_dict = {d:[] for d in set([i.device.index for i in imgs])}
         for i,img in enumerate(imgs):
             self.imgs_device_dict[img.device.index].append(i)
+        print(self.imgs_device_dict)
 
         return self.forward(imgs,meta)
     
@@ -691,7 +715,8 @@ class YOLOPredictorGPU(YOLOPredictor):
                 res.append([yolo_model.model(tmp),h, w])
 
         # do it later for parallel GPU infer
-        for r in res:
+        for i,r in enumerate(res):
+            batch_indices = np.asarray(self.imgs_device_dict[i])
             (preds, feature_maps), h, w = r
             preds = ops.non_max_suppression(
                 preds,
@@ -715,6 +740,7 @@ class YOLOPredictorGPU(YOLOPredictor):
                     pred[:, 3] /= h  # Normalize y2
                 
                 predictions[batch_indices[j]] = pred  # Store at the original index
+            
 
         results = [r.cpu().numpy() if r is not None else [] for r in predictions]
         return results
@@ -964,6 +990,7 @@ class SlidingWindowMergeBlock(PipeBlock):
             yolo_results.append(preds)
 
         meta[StaticWords.yolo_results] = yolo_results
+        
         raw_imgs = meta[StaticWords.sliding_window_input_imgs]
         meta[StaticWords.yolo_input_imgs] = raw_imgs
         return raw_imgs,meta
@@ -1023,26 +1050,16 @@ class NumpyImageMask(PipeBlock):
         self,
         mask_image_path: Optional[str],
         mask_color: str = "#00000080",
-        mask_split: Tuple[int, int] = (1, 1),
+        mask_split: Tuple[int, int] = (2, 2),
     ):
         """Initialize the NumpyImageMask class."""
         super().__init__("numpy_image_mask")
-        self._masks = self._make_mask_images(mask_image_path, mask_split, mask_color)
+        self._masks = self._read_mask_images(mask_image_path, mask_split, mask_color)
+        self._resized_masks = None
         if self._masks is None:
             print('[NumpyImageMask] Warning: no mask image loaded. This NumpyImageMask bloack will do nothing.')
 
-    def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
-        """Convert a grayscale mask to an RGBA image with the specified color."""
-        select_color = np.array(hex2rgba(hex_color), dtype=np.uint8)
-        background = np.array([255, 255, 255, 0], dtype=np.uint8)
-
-        condition = gray_mask_img == 0
-        condition = condition[..., None]  # Expand dims for broadcasting
-        color_mask_img = np.where(condition, select_color, background)
-
-        return Image.fromarray(cv2.cvtColor(color_mask_img, cv2.COLOR_BGRA2RGBA))
-
-    def _make_mask_images(
+    def _read_mask_images(
         self, mask_image_path: Optional[str], mask_split: Tuple[int, int], preview_color: str
     ) -> Optional[Dict[str, List[Any]]]:
         """Load and process the mask images."""
@@ -1063,84 +1080,84 @@ class NumpyImageMask(PipeBlock):
         except ValueError:
             print("Error: Invalid mask split configuration.")
             return None
-
         # Convert to grayscale and apply preview color
         gray_masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
-        preview_masks = [self.gray2rgba_mask_image(gray, preview_color) for gray in gray_masks]
+        # preview_masks = []
+        return gray_masks
 
-        return {"original": mask_images, "preview": preview_masks}
+    def _adjust_mask(self, images: List[np.ndarray]):
+        w,h,c = self._img_w_h_c(images[0])
+            
+        self._resized_masks = [
+            cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST)
+            for mask in self._masks
+        ]
+        # print([i.shape for i in self._resized_masks])
 
-    def __call__(self, imgs: List[np.ndarray], meta: Optional[Dict] = None) -> Tuple[List[np.ndarray], Dict]:
-        """Call forward method."""
-        return self.forward(imgs, meta)
-
-    def forward(self, imgs: List[np.ndarray], meta: Optional[Dict] = None) -> Tuple[List[np.ndarray], Dict]:
-        """Forward pass applying masks."""
-        return self.mask_images(imgs), meta or {}
-
-    def test_forward(self, imgs: List[np.ndarray], meta: Optional[Dict] = None) -> Tuple[List[np.ndarray], Dict]:
-        """Test forward pass applying masks."""
-        if self._masks is None:
-            return imgs, meta or {}
+        self._resized_masks = [
+            mask if len(mask.shape) >= len(image.shape) else
+            np.expand_dims(mask, axis=-1)
+            for image, mask in zip(images, self._resized_masks)
+        ]
+        # print([i.shape for i in self._resized_masks])
         
-        if len(imgs) != len(self._masks["original"]):
-            raise ValueError("Number of imgs and masks do not match.")
+        self._resized_masks = [
+            mask if mask.shape[-1] == c else
+            mask.repeat(c, axis=-1) 
+            for mask in self._resized_masks
+        ]
         
-        return self.mask_images(imgs), meta or {}
-
-    def mask_images(self, images: List[np.ndarray]) -> List[np.ndarray]:
+        self._resized_masks = [
+            mask // 255
+            for mask in self._resized_masks
+        ]
+        # Ensures values are 0 or 1
+        
+    def forward(self, imgs: List[np.ndarray], meta: dict = None):
         """Apply mask images to input images."""
-        if self._masks is None:
-            return images
-        if self._masks.get("resized_masks") is None:
-            self._masks["resized_masks"] = [
-            cv2.resize(mask, image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
-            for image, mask in zip(images, self._masks["original"])
+        imgs = [i * mask for i, mask in zip(imgs, self._resized_masks)]
+        # print([i.shape for i in self._resized_masks])
+        # for i,m in zip(imgs,self._resized_masks):
+        #     i[..., 2] = np.clip(i[..., 2] + 20 * m[..., 2], 0, 255)
+        # meta[] = [imgs]
+        return imgs,meta
+    
+    def test_forward(self, imgs: List[np.ndarray], meta: dict = None):
+        self._adjust_mask(imgs)
+        return self.forward(imgs,meta)
+
+class TorchImageMask(NumpyImageMask):
+    def __init__(
+        self,
+        mask_image_path: Optional[str],
+        mask_color: str = "#00000080",
+        mask_split: Tuple[int, int] = (2, 2),
+    ):
+        """Initialize the TorchImageMask class."""
+        super().__init__(mask_image_path,mask_color,mask_split)
+        self.title = "torch_image_mask"
+        self._torch_masks = [
+            torch.from_numpy(i).unsqueeze(0).unsqueeze(0
+                ).to(torch_img_dtype)/255.0 for i in self._masks]
+        self._torch_resized_masks = None
+    
+    def _adjust_mask(self, images: List[torch.Tensor]):
+        # print([i.shape for i in images])
+        super()._adjust_mask(images)
+        # print([i.shape for i in self._resized_masks])
+        self._torch_resized_masks = [
+            torch.from_numpy(mask.copy())
+            for image, mask in zip(images, self._resized_masks)
         ]
-        resized_masks = self._masks["resized_masks"]
-        return [
-            cv2.bitwise_and(image, mask) for image, mask in zip(images, resized_masks)
+        # print([i.shape for i in self._torch_resized_masks])
+        self._torch_resized_masks = [
+            mask.permute(2, 0, 1).to(torch_img_dtype).to(image.device)/255.0
+            for image, mask in zip(images, self._torch_resized_masks)
         ]
 
-    def alpha_composite_mask_image(self, img: np.ndarray, mask_img: Image.Image) -> np.ndarray:
-        """Apply alpha compositing to blend the mask with the image."""
-        source_img = Image.fromarray(img)
-        source_img.putalpha(255)
-
-        mask = mask_img.resize(source_img.size, Image.Resampling.NEAREST)
-        blended_img = Image.alpha_composite(source_img, mask).convert("RGB")
-
-        return np.array(blended_img)
-
-    def mask_previews(self, images: List[np.ndarray]) -> List[np.ndarray]:
-        """Apply preview masks to images."""
-        if self._masks is None:
-            return images
-
-        if len(images) != len(self._masks["preview"]):
-            print("Error: Number of images and masks do not match.")
-            return images
-
-        return [
-            self.alpha_composite_mask_image(image, mask.resize(image.shape[1::-1], Image.Resampling.NEAREST))
-            for image, mask in zip(images, self._masks["preview"])
-        ]
-
-    def mask_yolo_result(self, results: List[Any]) -> List[Any]:
-        """Apply mask filtering to results."""
-        if self._masks is None:
-            return results
-        for res, mask_image in zip(results, self._masks["original"]):
-            mask_array = mask_image.max(2)
-            shape = mask_array.shape
-            yx = (res.boxes.xywhn[:, :2].cpu().numpy()[:, ::-1] * shape).astype(int)
-            pos = yx[:, 0].clip(0, shape[0] - 1), yx[:, 1].clip(0, shape[1] - 1)
-            keep = mask_array[pos] > 0
-            res.update(boxes=res.boxes.data[keep])
-
-        return results
-
-
+        self._resized_masks = self._torch_resized_masks
+           
+    
 class DrawPredictionsBlock(PipeBlock):
     def __init__(self, class_names=None, class_colors=None):
         super().__init__('draw_predictions')
