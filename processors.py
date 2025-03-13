@@ -3,6 +3,7 @@
 import enum
 import math
 import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 # Third-Party Library Imports
@@ -343,6 +344,8 @@ class Processors:
         yolo_input_imgs ='yolo_input_imgs'
         
         before_resize_img_w_h ='before_resize_img_w_h'
+        
+        debayer_imgs ='debayer_imgs'
 
         red_mask_imgs ='red_mask_imgs'
 
@@ -373,6 +376,7 @@ class Processors:
         
         def forward(self, imgs, meta={}):
             debayered_imgs = [cv2.cvtColor(img,self.formart) for img in imgs]
+            meta[Processors.StaticWords.debayer_imgs] = [i.copy() for i in debayered_imgs]
             return debayered_imgs, meta
 
     class TorchDebayerBlock(PipeBlock):
@@ -405,6 +409,7 @@ class Processors:
             for i,img in enumerate(imgs):
                 model,device = self.debayer_models[i%self.num_gpus]
                 torch_imgs.append(model(img.unsqueeze(0)))
+            meta[Processors.StaticWords.debayer_imgs] = [i.clone() for i in torch_imgs]
             return torch_imgs, meta
 
     class TorchRGBToNumpyBGRBlock(PipeBlock):
