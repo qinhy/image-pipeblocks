@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 from ultralytics.utils import ops
 
+
 class Processors:
     torch_img_dtype = torch.float16
     numpy_img_dtype = np.uint8
@@ -625,6 +626,7 @@ class Processors:
             self.conf_thres_per_class = conf_thres_per_class or {}
             self.conf_thres_per_class_rlfb = conf_thres_per_class_rlfb or [[], [], [], []]
             
+            conf_thres_per_class = [i.split('=') for i in conf_thres_per_class]
             self.conf_thres_per_class = {k: v for k, v in conf_thres_per_class}
             self.conf_thres_per_class_rlfb = [
                 {k: v for k, v in conf_thres} for conf_thres in conf_thres_per_class_rlfb
@@ -691,9 +693,7 @@ class Processors:
 
                 batch = [i.astype(np.uint8) for i in batch]
                 if len(batch)==0:continue
-
-                half= self.dtype == Processors.torch_img_dtype
-                
+                half = self.dtype == torch.float16
                 # run one time and init
                 yolo_model(batch, imgsz=self.imgsz, conf=self.conf, half=half)
 
@@ -1072,27 +1072,45 @@ class Processors:
             """Initialize the NumpyImageMask class."""
             super().__init__("numpy_image_mask")
             self.mask_split=mask_split
-            data = self._read_mask_image_file(mask_image_path)
+            
+            if type(mask_image_path) is str:
+                data = self._read_mask_image_file(mask_image_path)
+
+            if type(mask_image_path) is np.ndarray:
+                data = mask_image_path
+
             self._masks = self.set_mask_image_data(data)
             self._resized_masks = None
+            self.need_adjust_mask = True
             if self._masks is None:
                 print('[NumpyImageMask] Warning: no mask image loaded. This NumpyImageMask bloack will do nothing.')
 
-        def set_mask_image_data(self,mask_image):
-            # mask_image = np.array([[0,1,],[1,0]])
+        def set_mask_image_data(self,mask_image):                
             mask_split = self.mask_split
             # Split mask into sub-masks
-            try:
+            try:                
+                if len(mask_image.shape) == 1:
+                    num_imgs = len(mask_image)                
+                    # mask_image = np.array([0,0,0,0])
+                    mask_image = np.asarray(mask_image[:num_imgs])
+                    mask_image = mask_image.reshape(int(num_imgs**0.5),int(num_imgs**0.5))
+                    # mask_image = np.array([[0,1,],[1,0]])
+
                 mask_images = [
                     sub_mask
                     for row in np.split(mask_image, mask_split[0], axis=0)
                     for sub_mask in np.split(row, mask_split[1], axis=1)
                 ]
-            except ValueError:
-                print("Error: Invalid mask split configuration.")
-                return None
+            except Exception as e:
+                print(e)
+                self._masks = []
+                return self._masks 
+
             # Convert to grayscale and apply preview color
-            return [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
+            self._masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) 
+                    if len(mask.shape)>2 and mask.shape[-1]>1 else mask
+                    for mask in mask_images]
+            return self._masks 
 
         def _read_mask_image_file(self, mask_image_path: Optional[str]):
             """Load and process the mask images."""
@@ -1128,20 +1146,26 @@ class Processors:
                 for mask in self._resized_masks
             ]
             
-            # self._resized_masks = [
-            #     mask // 255
-            #     for mask in self._resized_masks
-            # ]
-            # Ensures values are 0 or 1
+            self._resized_masks = [
+                ((mask > 0) * 255).astype(np.uint8)
+                for mask in self._resized_masks
+            ]
 
         def clip(self,im,l=0,h=255):
             return np.clip(im,l,h).astype(np.uint8)
 
         def forward(self, imgs: List[np.ndarray], meta: dict = None, channel=2, h=255):
+            if self.need_adjust_mask:
+                self._adjust_mask(imgs)
+                self.need_adjust_mask = False
+
+            if len(self._resized_masks)==0:
+                return imgs,meta
+            
             """Apply mask images to input images."""
             if Processors.StaticWords.red_mask_imgs not in meta:
                 meta[Processors.StaticWords.red_mask_imgs] = [i.copy() if hasattr(i,'copy') else i.clone() for i in imgs]
-
+            
             for i,m in zip(meta[Processors.StaticWords.red_mask_imgs],self._resized_masks):
                 i[:,channel,:,:] = self.clip(i[:,channel,:,:] + (h*0.2) *(h - m[:,channel,:,:]))
 
@@ -1151,9 +1175,8 @@ class Processors:
             return imgs,meta
         
         def test_forward(self, imgs: List[np.ndarray], meta: dict = None):
-            if len(imgs)!=len(self._masks):
+            if len(imgs)!=len(self._masks) and len(self._masks)>0:
                 raise ValueError('mask images numbers is not the same. len(imgs)!=len(masks)')
-            self._adjust_mask(imgs)
             return self.forward(imgs,meta)
 
     class TorchImageMask(NumpyImageMask):
@@ -1219,10 +1242,18 @@ class Processors:
                 self.class_colors = {i:v for i,v in enumerate(class_colors)}
             else:
                 self.class_colors = class_colors
+                  
+            self.start = time.time()
+            self.count = 0
+            self.fps = 0
 
         def forward(self, imgs, meta={}):
             preds = meta.get(Processors.StaticWords.yolo_results, [])
-            imgs = [self.draw_predictions(i, self._extract_preds(p)) for i, p in zip(imgs, preds)]
+            imgs = [self.draw_predictions(
+                i, self._extract_preds(p),f"FPS: {self.fps:.1f}, No.{ii}"
+                ) for ii,(i, p) in enumerate(zip(imgs, preds))]            
+            self.count += 1
+            self.fps = self.count/(time.time()-self.start)
             return imgs, meta
 
         def test_forward(self, imgs: List[Any], meta: Dict = {}):
@@ -1234,49 +1265,92 @@ class Processors:
                 raise ValueError('yolo input raw imgs and yolo_results must be of the same size.')
             return self.test_forward_numpy_rgb(imgs, meta)
 
-        def draw_predictions(self, image, predictions):
+        def draw_predictions(self, image, predictions, info_text=None):
             """Draw bounding boxes with class-specific colors."""
             image_with_boxes = image.copy()
             img_height, img_width = image.shape[:2]
+
             # Dynamically scale font size based on image size
-            font_scale = max(0.5, min(img_width, img_height) / 600)  # Scales with image size
-            thickness = max(1, int(font_scale * 2))  # Adjust thickness based on scale
+            font_scale = max(0.5, min(img_width, img_height) / 600)
+            thickness = max(1, int(font_scale * 2))
+
+            if info_text:
+                ### ---- Draw info at Bottom-Left ---- ###
+                info_size, _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                info_w, info_h = info_size
+
+                # Position info at the bottom-left corner
+                info_x = 10
+                info_y = img_height - 10  # Place it slightly above the bottom edge
+
+                # Background for info text
+                cv2.rectangle(image_with_boxes, 
+                            (info_x - 5, info_y - info_h - 5), 
+                            (info_x + info_w + 5, info_y), 
+                            (0, 0, 0), -1)  # Black background
+
+                # Put info text
+                cv2.putText(image_with_boxes, info_text, 
+                            (info_x, info_y - 2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, 
+                            (255, 255, 255), thickness)  # White text
+            
+            if len(predictions) == 0:
+                return image_with_boxes  # No predictions, return original image
 
             for pred in predictions:
-                if len(predictions) == 0: continue
-
                 x1, y1, x2, y2, confidence, class_id = pred[:6]
-                x1, y1, x2, y2 = map(int, [x1*img_width, y1*img_width, x2*img_width, y2*img_width])
-                
-                # Get color for the class
-                color = self.class_colors.get(int(class_id), (255, 255, 255))  # Default to white
-                
-                
-                # Draw rectangle
+
+                # Corrected scaling
+                x1, y1, x2, y2 = map(int, [x1 * img_width, y1 * img_height, x2 * img_width, y2 * img_height])
+
+                # Get color for the class (default white if class not found)
+                color = self.class_colors.get(int(class_id), (255, 255, 255))
+
+                # Draw bounding box
                 cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), color, thickness)
 
-                # Label text
-                label = f"{self.class_names.get(int(class_id), 'null')}: {confidence:.2f}"
+                # Class label
+                class_label = f"{self.class_names.get(int(class_id), 'null')}"
+                score_label = f"{confidence:.2f}"
+
+                # Get text sizes
+                class_size, _ = cv2.getTextSize(class_label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                score_size, _ = cv2.getTextSize(score_label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
                 
-                # Get text size and adjust padding
-                text_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                text_w, text_h = text_size
-                text_x, text_y = x1, max(0, y1 - 10)  # Adjust y position to avoid going out of frame
-                
-                # Draw filled rectangle for text background
+                class_w, class_h = class_size
+                score_w, score_h = score_size
+
+                text_x = x1
+                text_y = max(class_h + 5, y1)  # Prevent out-of-bounds issues
+
+                # Background for class label
                 cv2.rectangle(image_with_boxes, 
-                            (text_x, text_y - text_h - 5), 
-                            (text_x + text_w + 5, text_y), 
-                            color, 
-                            -1)
-                
-                # Put text
-                cv2.putText(image_with_boxes, label, 
-                            (text_x + 2, text_y - 2),  # Slight offset for better visibility
+                            (text_x, text_y - class_h - 5), 
+                            (text_x + class_w + 5, text_y), 
+                            color, -1)
+
+                # Put class name
+                cv2.putText(image_with_boxes, class_label, 
+                            (text_x + 2, text_y - 2), 
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, 
                             (0, 0, 0), thickness)
 
+                # Background for confidence score (below class label)
+                score_y = text_y + score_h + 5
+                cv2.rectangle(image_with_boxes, 
+                            (text_x, score_y - score_h - 5), 
+                            (text_x + score_w + 5, score_y), 
+                            color, -1)
+
+                # Put confidence score
+                cv2.putText(image_with_boxes, score_label, 
+                            (text_x + 2, score_y - 2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, 
+                            (0, 0, 0), thickness)
+                
             return image_with_boxes
+
         
         def _extract_preds(self, preds):
             """Extracts predictions from YOLO output."""
@@ -1291,8 +1365,6 @@ class Processors:
         def _generate_class_colors(self, num_classes):
             """Generates distinct colors for each class."""
             return {i: tuple(random.randint(0, 255) for _ in range(3)) for i in range(num_classes)}
-
-
 
 
 
