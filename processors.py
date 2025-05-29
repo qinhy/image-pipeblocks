@@ -12,108 +12,162 @@ from pydantic import BaseModel
 import torch
 import torch.nn.functional as F
 
+class ShapeType(str, enum.Enum):
+    HWC = 'HWC'
+    HW = 'HW'
+    BCHW = 'BCHW'
+
+class ColorType(str, enum.Enum):
+    BAYER = 'bayer'
+    GRAYSCALE = 'grayscale'
+    RGB = 'RGB'
+    BGR = 'BGR'
+    JPEG = 'jpeg'
+
+COLOR_TYPE_CHANNELS = {
+    ColorType.BAYER: [1],
+    ColorType.GRAYSCALE: [1],
+    ColorType.RGB: [3],
+    ColorType.BGR: [3],
+}
+
 class ImageMatInfo(BaseModel):
-    type: Optional[Union[np.ndarray, torch.Tensor]] = None
+    type: Optional[str] = None
     dtype: Optional[Union[np.dtype, torch.dtype]] = None
-    device: str = ''  # 'cpu' or 'cuda:n' , numpy is only cpu and torch.Tensor is only GPU
-    shape_type: str = ''  # 'HWC' or 'HW' for numpy, 'BCHW' for torch
-    max_value: Optional[Union[int, float]] = None # 255 for np, 1.0 for torch
-    B: Optional[int] = None  # Batch dimension (only for torch)
-    C: Optional[int] = None  # Channel dimension
-    H: int = 0  # Height
-    W: int = 0  # Width
-    color_type: Optional[str] = None  # "Only 'bayer', 'grayscale', 'RGB', or 'BGR', 'jpeg'"
+    device: str = ''
+    shape_type: Optional[ShapeType] = None
+    max_value: Optional[Union[int, float]] = None
+    B: Optional[int] = None
+    C: Optional[int] = None
+    H: int = 0
+    W: int = 0
+    color_type: Optional[ColorType] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
-    def __init__(self, img_data: Union[np.ndarray, torch.Tensor], color_type: str, *args, **kwargs):        
-        super().__init__(*args,**kwargs)
-        self.type = str(type(img_data)).replace("<class '","").replace("'>","")
+    def __init__(self, img_data: Union[np.ndarray, torch.Tensor],
+                  color_type: Union[str, ColorType], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Parse color_type to Enum
+        try:
+            color_type = ColorType(color_type)
+        except ValueError:
+            raise ValueError(
+                f"Invalid color type: {color_type}. Must be one of {[c.value for c in ColorType]}")
+
+        self.type = type(img_data).__name__
 
         if isinstance(img_data, np.ndarray):
             self.dtype = img_data.dtype
-            self.device = "cpu"  # NumPy only runs on CPU
+            self.device = "cpu"
             self.max_value = 255 if img_data.dtype == np.uint8 else 1.0
 
             if img_data.ndim == 3:
-                self.shape_type = "HWC"
+                self.shape_type = ShapeType.HWC
                 self.H, self.W, self.C = img_data.shape
             elif img_data.ndim == 2:
-                self.shape_type = "HW"
+                self.shape_type = ShapeType.HW
                 self.H, self.W = img_data.shape
                 self.C = 1
             else:
-                raise ValueError("NumPy array must be HW or HWC format")
+                raise ValueError("NumPy array must be 2D (HW) or 3D (HWC).")
 
         elif isinstance(img_data, torch.Tensor):
             self.dtype = img_data.dtype
             self.device = str(img_data.device)
-            self.max_value = 1.0  # Torch tensors are assumed to be normalized
+            self.max_value = 1.0
 
             if img_data.ndim == 4:
-                self.shape_type = "BCHW"
+                self.shape_type = ShapeType.BCHW
                 self.B, self.C, self.H, self.W = img_data.shape
             else:
-                raise ValueError("Torch tensor must be in BCHW format")
+                raise ValueError("Torch tensor must be 4D (BCHW).")
 
         else:
-            raise TypeError(f"img_data must be a numpy array or torch tensor, got {type(img_data)}")
+            raise TypeError(f"img_data must be np.ndarray or torch.Tensor, got {type(img_data)}")
 
-
-        # Validate color type with channel count
-        valid_color_types = {
-            "bayer": [1],
-            "grayscale": [1],
-            "RGB": [3],
-            "BGR": [3],
-        }
-
-        if color_type not in valid_color_types:
-            raise ValueError(f"Invalid color type: {color_type}. Must be one of {list(valid_color_types.keys())}")
-
-        if self.C not in valid_color_types[color_type]:
-            raise ValueError(
-                f"Invalid color type '{color_type}' for image with {self.C} channels."
-                f" Expected {valid_color_types[color_type]} channels."
-                f" Data shape is {img_data.shape}."
-            )
-
+        # Channel count validation
+        if color_type in COLOR_TYPE_CHANNELS:
+            expected_channels = COLOR_TYPE_CHANNELS[color_type]
+            if self.C not in expected_channels:
+                raise ValueError(
+                    f"Invalid color type '{color_type.value}' for image with {self.C} channels. "
+                    f"Expected {expected_channels} channels. Data shape: {img_data.shape}"
+                )
         self.color_type = color_type
-        
+
 class ImageMat:
-    def __init__(self, img_data: Optional[Union[np.ndarray, torch.Tensor]], color_type: str, info=None):
+    def __init__(self, img_data: Union[np.ndarray, torch.Tensor], 
+                 color_type: Union[str, ColorType], info: Optional[ImageMatInfo] = None):
         if img_data is None:
             raise ValueError("img_data cannot be None")
-        if info is None:
-            self.info = ImageMatInfo(img_data, color_type=color_type)
-        self.img_data = img_data 
-        
+        self.info = info or ImageMatInfo(img_data, color_type=color_type)
+        self._img_data = img_data
+
+    def copy(self) -> 'ImageMat':
         """Return a deep copy of the ImageMat object."""
-        if isinstance(self.img_data, np.ndarray):            
-            self._copy = lambda : ImageMat(self.data().copy(),color_type=self.info.color_type)
-        elif isinstance(self.img_data, torch.Tensor):
-            self._copy = lambda : ImageMat(self.data().clone(),color_type=self.info.color_type)
+        if isinstance(self._img_data, np.ndarray):
+            return ImageMat(self._img_data.copy(), color_type=self.info.color_type)
+        elif isinstance(self._img_data, torch.Tensor):
+            return ImageMat(self._img_data.clone(), color_type=self.info.color_type)
         else:
-            raise TypeError("img_data must be a numpy array or torch tensor")
+            raise TypeError("img_data must be np.ndarray or torch.Tensor")
 
-    def copy(self):
-        """Return a deep copy of the ImageMat object."""
-        return self._copy()
-
-    def update_mat(self, img_data: Union[np.ndarray, torch.Tensor]):
-        """Update the image data and refresh metadata."""
-        self.img_data = img_data
-        self.info = ImageMatInfo(img_data, color_type=self.info.color_type)  # Preserve color type        
+    def update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
+        """Update image data and refresh metadata."""
+        self._img_data = img_data
+        self.info = ImageMatInfo(img_data, color_type=self.info.color_type)
         return self
 
-    def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]):
+    def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
         """Update the image data without updating metadata (use with caution)."""
-        self.img_data = img_data
+        self._img_data = img_data
         return self
-    
+
     def data(self) -> Union[np.ndarray, torch.Tensor]:
         """Return the image data."""
-        return self.img_data
+        return self._img_data
+
+    # --- Type/Shape/Color Requirement Methods ---
+
+    def require_ndarray(self):
+        if not isinstance(self._img_data, np.ndarray):
+            raise TypeError(f"Expected np.ndarray, got {type(self._img_data)}")
+        self.require_HW_or_HWC()
+
+    def require_np_uint(self):
+        self.require_ndarray()
+        if self._img_data.dtype not in (np.uint8, np.uint16):
+            raise TypeError("Image data must be np.uint8 or np.uint16.")
+
+    def require_torch_tensor(self):
+        if not isinstance(self._img_data, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor, got {type(self._img_data)}")
+        self.require_BCHW()
+
+    def require_shape_type(self, shape_type: ShapeType):
+        if self.info.shape_type != shape_type:
+            raise TypeError(f"Expected {shape_type.value} format, got {self.info.shape_type}")
+
+    def require_color_type(self, color_type: ColorType):
+        if self.info.color_type != color_type:
+            raise TypeError(f"Expected {color_type.value} image, got {self.info.color_type}")
+
+    def require_BAYER(self):      self.require_color_type(ColorType.BAYER)
+    def require_GRAYSCALE(self):  self.require_color_type(ColorType.GRAYSCALE)
+    def require_RGB(self):        self.require_color_type(ColorType.RGB)
+    def require_BGR(self):        self.require_color_type(ColorType.BGR)
+    def require_JPEG(self):       self.require_color_type(ColorType.JPEG)
+
+    def require_HWC(self):        self.require_shape_type(ShapeType.HWC)
+    def require_HW(self):         self.require_shape_type(ShapeType.HW)
+    def require_HW_or_HWC(self):
+        if self.info.shape_type not in {ShapeType.HWC, ShapeType.HW}:
+            raise TypeError(f"Expected HWC or HW format, got {self.info.shape_type}")
+
+    def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
+
 
 class ImageMatProcessor:    
     class MetaData(BaseModel):        
@@ -133,10 +187,17 @@ class ImageMatProcessor:
     def off(self):
         self._enable = False
         
-    def gpu_info(self):        
-        self.num_gpus = torch.cuda.device_count()
-        # print(f'[{self.__class__.__name__}] Number of GPUs available: {self.num_gpus}')
-        return self.num_gpus
+    def devices_info(self,gpu=True,multi_gpu=-1):
+        self.num_devices = ['cpu']
+        if gpu and torch.cuda.is_available():
+            self.num_gpus = torch.cuda.device_count()
+            if multi_gpu <= 0 or multi_gpu > self.num_gpus:
+                # Use all available GPUs
+                self.num_devices = [f"cuda:{i}" for i in range(self.num_gpus)]
+            else:
+                # Use specified number of GPUs
+                self.num_devices = [f"cuda:{i}" for i in range(multi_gpu)]
+        return self.num_devices
     
     def __call__(self, imgs: List[ImageMat], meta: dict = {}):    
         if self._enable:
@@ -191,25 +252,17 @@ class CvDebayerBlock(ImageMatProcessor):
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
-        Validates input images before debayering. Ensures that the color type is 'bayer' and the images have 1 channel.
+        Validates input images before debayering. Ensures that the color type is 'bayer' 
+        and the images have 1 channel.
         Also updates input_mat_infos and out_mat_infos.
         """
         self.input_mats = [i for i in imgs]
 
         validated_imgs: List[ImageMat] = []
         for img in imgs:
-            if img.info.color_type != "bayer":
-                raise ValueError(f"Image color type must be 'bayer' but got '{img.info.color_type}'")
-
-            if img.info.C != 1:
-                raise ValueError(f"Image must have 1 channel for debayering, but got {img.info.C} channels.")
-
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError("CvDebayerBlock only supports NumPy array images.")
-
-            if img.img_data.dtype not in [np.uint8, np.uint16]:
-                raise TypeError("Image data must be of type np.uint8 or np.uint16 for debayering.")
-
+            img.require_BAYER()
+            # img.require_ndarray()
+            img.require_np_uint()
             validated_imgs.append(img)
 
         # Perform debayering after validation
@@ -223,7 +276,8 @@ class CvDebayerBlock(ImageMatProcessor):
 
 class TorchDebayerBlock(ImageMatProcessor):
     ### Define the `Debayer5x5` PyTorch Model
-    # The `Debayer5x5` model applies a **5x5 convolution filter** to interpolate missing color information from a Bayer pattern.
+    # The `Debayer5x5` model applies a **5x5 convolution filter** to interpolate missing 
+    # color information from a Bayer pattern.
 
     class Debayer5x5(torch.nn.Module):
         # from https://github.com/cheind/pytorch-debayer
@@ -382,7 +436,7 @@ class TorchDebayerBlock(ImageMatProcessor):
 
     def __init__(self, save_results_to_meta=False):
         super().__init__('torch_debayer',save_results_to_meta)
-        self.num_gpus = self.gpu_info()  # Number of GPUs available for processing
+        self.num_devices = self.devices_info()  # Number of GPUs available for processing
         self.save_results_to_meta = save_results_to_meta
         self.debayer_models:List[TorchDebayerBlock.Debayer5x5] = []
         self.input_devices = []  # To track device of each input tensor
@@ -392,27 +446,16 @@ class TorchDebayerBlock(ImageMatProcessor):
         self.input_mats = [i for i in imgs]
         self.input_devices = []
 
-        for i, info in enumerate([ii.info for ii in self.input_mats]):
-            if 'torch.Tensor' != info.type:
-                raise ValueError(f"Unsupported image type at index {i}: {info.type}. Expected torch.Tensor.")
-            if info.shape_type != "BCHW":
-                raise ValueError(f"Invalid shape type at index {i}: {info.shape_type}. Expected 'BCHW'.")
-            if info.color_type != "bayer":
-                raise ValueError(f"Invalid color type at index {i}: {info.color_type}. Expected 'bayer'.")
-
-            # Ensure the tensor is already on the correct device
-            device = torch.device(f'cuda:{i % self.num_gpus}' if torch.cuda.is_available() and self.num_gpus > 0 else 'cpu')
-            if str(info.device) != str(device):
-                raise ValueError(
-                    f"Image at index {i} is on {info.device}, expected {device}. "
-                    "Move it to the correct device before passing to forward()."
-                )
+        for img in self.input_mats:
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_BAYER()
 
             # Save input device for tracking
-            self.input_devices.append(device)
+            self.input_devices.append(img.info.device)
 
             # Initialize and store model on the corresponding device
-            model = TorchDebayerBlock.Debayer5x5().to(device).to(info.dtype)  # Assuming Processors.Debayer5x5() is defined elsewhere
+            model = TorchDebayerBlock.Debayer5x5().to(img.info.device).to(img.info.dtype)
             self.debayer_models.append(model)
     
     
@@ -432,7 +475,7 @@ class TorchDebayerBlock(ImageMatProcessor):
 class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
     def __init__(self, save_results_to_meta=False):
         super().__init__('torch_rgb_to_numpy_bgr',save_results_to_meta)
-        self.num_gpus = self.gpu_info()  # Number of available GPUs
+        self.num_devices = self.devices_info()  # Number of available GPUs
         self.save_results_to_meta = save_results_to_meta
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
@@ -444,15 +487,9 @@ class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, torch.Tensor):
-                raise TypeError(f"Expected torch.Tensor, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "BCHW":
-                raise ValueError(f"Expected BCHW format, but got {img.info.shape_type}.")
-
-            if img.info.color_type != "RGB":
-                raise ValueError(f"Expected RGB image, but got {img.info.color_type}.")
-
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_RGB()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
@@ -470,25 +507,26 @@ class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
                 img = img.cpu()  # Move tensor to CPU before conversion
 
             img = img.squeeze(0).permute(1, 2, 0).numpy()  # Convert BCHW to HWC
-            img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)  # Normalize if needed
+            img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)  
+            # Normalize if needed
             img = img[:, :, ::-1]  # Convert RGB to BGR
             bgr_images.append(img)
         return bgr_images
 
 class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
-    def __init__(self, dtype=None, save_results_to_meta=False):
+    def __init__(self, dtype=None, save_results_to_meta=False,gpu=True,multi_gpu=-1):
         super().__init__('numpy_bgr_to_torch_rgb',save_results_to_meta)
-        self.num_gpus = self.gpu_info()
+        self.num_devices = self.devices_info(gpu=gpu,multi_gpu=multi_gpu)
         self.dtype = dtype if dtype else torch.float32
         self.save_results_to_meta = save_results_to_meta
 
         # Model function to convert BGR numpy to Torch RGB tensor
         def get_model(device, dtype=self.dtype):
-            return lambda img: torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device).div(255.0).permute(2, 0, 1).unsqueeze(0)
+            return lambda img: torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device
+                                            ).div(255.0).permute(2, 0, 1).unsqueeze(0)
 
         self.tensor_models = []
-        for i in range(self.num_gpus):
-            device = f"cuda:{i}"
+        for device in self.num_devices:
             model = get_model(device)
             self.tensor_models.append((model, device))
 
@@ -501,15 +539,9 @@ class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError(f"Expected np.ndarray, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "HWC":
-                raise ValueError(f"Expected HWC format, but got {img.info.shape_type}.")
-
-            if img.info.color_type != "BGR":
-                raise ValueError(f"Expected BGR image, but got {img.info.color_type}.")
-
+            img.require_ndarray()
+            img.require_HWC()
+            img.require_BGR()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
@@ -524,24 +556,25 @@ class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
         torch_images = []
         for i, img in enumerate(imgs_data):
             device = self.tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self.dtype, device=device).div(255.0).permute(2, 0, 1).unsqueeze(0)
+            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self.dtype, device=device
+                                      ).div(255.0).permute(2, 0, 1).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
 class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
-    def __init__(self, dtype=None, save_results_to_meta=False):
+    def __init__(self, dtype=None, save_results_to_meta=False,gpu=True,multi_gpu=-1):
         super().__init__('numpy_bayer_to_torch_bayer',save_results_to_meta)
-        self.num_gpus = self.gpu_info()
+        self.num_devices = self.devices_info(gpu=gpu,multi_gpu=multi_gpu)
         self.dtype = dtype if dtype else torch.float32
         self.save_results_to_meta = save_results_to_meta
 
         # Model function to convert Bayer numpy to Torch Bayer tensor
         def get_model(device, dtype=self.dtype):
-            return lambda img: torch.tensor(img.copy(), dtype=dtype, device=device).div(255.0).unsqueeze(0).unsqueeze(0)
+            return lambda img: torch.tensor(img.copy(), dtype=dtype, device=device
+                                    ).div(255.0).unsqueeze(0).unsqueeze(0)
 
         self.tensor_models = []
-        for i in range(self.num_gpus):
-            device = f"cuda:{i}"
+        for device in self.num_devices:
             model = get_model(device)
             self.tensor_models.append((model, device))
 
@@ -554,15 +587,9 @@ class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError(f"Expected np.ndarray, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "HW":
-                raise ValueError(f"Expected HW format, but got {img.info.shape_type}.")
-
-            if img.info.color_type != "bayer":
-                raise ValueError(f"Expected Bayer image, but got {img.info.color_type}.")
-
+            img.require_ndarray()
+            img.require_HW()
+            img.require_BAYER()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
@@ -577,7 +604,8 @@ class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
         torch_images = []
         for i, img in enumerate(imgs_data):
             device = self.tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img.copy(), dtype=self.dtype, device=device).div(255.0).unsqueeze(0).unsqueeze(0)
+            tensor_img = torch.tensor(img.copy(), dtype=self.dtype, device=device
+                                    ).div(255.0).unsqueeze(0).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
@@ -605,12 +633,8 @@ class TorchResizeBlock(ImageMatProcessor):
         validated_imgs:List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, torch.Tensor):
-                raise TypeError(f"Expected torch.Tensor, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "BCHW":
-                raise ValueError(f"Expected BCHW format, but got {img.info.shape_type}.")
-
+            img.require_torch_tensor()
+            img.require_BCHW()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
@@ -629,7 +653,8 @@ class TorchResizeBlock(ImageMatProcessor):
         return resized_images
 
 class CVResizeBlock(ImageMatProcessor):
-    def __init__(self, target_size: Tuple[int, int], interpolation=cv2.INTER_LINEAR, save_results_to_meta=False):
+    def __init__(self, target_size: Tuple[int, int], interpolation=cv2.INTER_LINEAR,
+                  save_results_to_meta=False):
         """
         Initializes the CVResizeBlock for resizing images using OpenCV.
 
@@ -652,17 +677,14 @@ class CVResizeBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError(f"Expected np.ndarray, but got {type(img.img_data)}.")
-
-            if img.info.shape_type not in ["HWC", "HW"]:
-                raise ValueError(f"Expected HWC or HW format, but got {img.info.shape_type}.")
-
+            img.require_ndarray()
+            img.require_HW_or_HWC()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type=validated_imgs[i].info.color_type) for i,img in enumerate(converted_imgs)]
+        self.out_mats = [ImageMat(img, color_type=validated_imgs[i].info.color_type
+                                  ) for i,img in enumerate(converted_imgs)]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
@@ -671,7 +693,8 @@ class CVResizeBlock(ImageMatProcessor):
         """
         resized_images = []
         for img in imgs_data:
-            resized_img = cv2.resize(img, (self.target_size[1], self.target_size[0]), interpolation=self.interpolation)
+            resized_img = cv2.resize(img, (self.target_size[1], self.target_size[0]),
+                                      interpolation=self.interpolation)
             resized_images.append(resized_img)
         return resized_images
 
@@ -697,12 +720,8 @@ class TileNumpyImagesBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError(f"Expected np.ndarray, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "HWC":
-                raise ValueError(f"Expected HWC format, but got {img.info.shape_type}.")
-
+            img.require_ndarray()
+            img.require_HWC()
             validated_imgs.append(img)
 
         # Create new ImageMat instance for output
@@ -751,12 +770,8 @@ class EncodeNumpyToJpegBlock(ImageMatProcessor):
         validated_imgs: List[ImageMat] = []
 
         for img in imgs:
-            if not isinstance(img.img_data, np.ndarray):
-                raise TypeError(f"Expected np.ndarray, but got {type(img.img_data)}.")
-
-            if img.info.shape_type != "HWC":
-                raise ValueError(f"Expected HWC format, but got {img.info.shape_type}.")
-
+            img.require_ndarray()
+            img.require_HWC()
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
@@ -764,7 +779,7 @@ class EncodeNumpyToJpegBlock(ImageMatProcessor):
         self.out_mats = [i.copy() for i in validated_imgs]
         for i,d in zip(self.out_mats,encoded_imgs):
             i.info.color_type = 'jpeg'
-            i.img_data = d
+            i._img_data = d
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
@@ -774,7 +789,8 @@ class EncodeNumpyToJpegBlock(ImageMatProcessor):
         encoded_images = []
         for img in imgs_data:
             if self.quality is not None:
-                success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.quality)])
+                success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
+                                                                int(self.quality)])
             else:
                 success, encoded = cv2.imencode('.jpeg', img)
             
@@ -817,3 +833,4 @@ class MergeYoloResultsBlock(ImageMatProcessor):
         # Update meta with merged results
         meta[self.uuid] = result
         return imgs, meta
+    

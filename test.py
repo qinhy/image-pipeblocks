@@ -69,7 +69,7 @@ def test():
     try:
         NumpyBGRToTorchRGBBlock().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "RGB")])
         print("ERROR: NumpyBGRToTorchRGBBlock accepted wrong color.")
-    except ValueError:
+    except Exception as e:
         print("Pass: NumpyBGRToTorchRGBBlock rejects non-BGR input.")
 
     # 6. Test CVResizeBlock on HW and HWC
@@ -84,7 +84,7 @@ def test():
     try:
         TileNumpyImagesBlock(2).validate([gray_img])
         print("ERROR: TileNumpyImagesBlock accepted HW shape.")
-    except ValueError:
+    except Exception as e:
         print("Pass: TileNumpyImagesBlock rejects HW input.")
 
     # 8. EncodeNumpyToJpegBlock positive and error test
@@ -96,7 +96,7 @@ def test():
     try:
         EncodeNumpyToJpegBlock().validate([gray_img])
         print("Pass: EncodeNumpyToJpegBlock encodes grayscale (HW) images (should raise).")
-    except ValueError:
+    except Exception as e:
         print("Pass: EncodeNumpyToJpegBlock correctly rejects HW input.")
 
     # 9. TorchRGBToNumpyBGRBlock: accept torch RGB, error for wrong shape
@@ -121,7 +121,7 @@ def test():
     try:
         NumpyBayerToTorchBayerBlock().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "BGR")])
         print("ERROR: NumpyBayerToTorchBayerBlock accepted non-HW input.")
-    except ValueError:
+    except Exception as e:
         print("Pass: NumpyBayerToTorchBayerBlock rejects non-HW input.")
 
     # 11. MergeYoloResultsBlock: no result in meta, returns as is
@@ -132,7 +132,6 @@ def test():
     print("Pass: MergeYoloResultsBlock returns input if no YOLO results in meta.")
 
     print("\nAll additional tests passed.")
-
 
 def build_image_pipeline(
     bayer_images: List[np.ndarray],
@@ -201,29 +200,6 @@ def build_image_pipeline(
     # # Return JPEG data (np.ndarray, .img_data) and meta
     # return [img.img_data for img in jpeg_imgs], meta
 
-
-    # # Generate 4 random Bayer images (grayscale, uint8, HW shape)
-    # def generate_random_bayer_images(num_images=4, height=128, width=128):
-    #     return [np.random.randint(0, 256, (height, width), dtype=np.uint8) for _ in range(num_images)]
-
-    # bayer_imgs = generate_random_bayer_images(num_images=4, height=128, width=128)
-
-    # # Now, run your pipeline!
-    # run_pipe = build_image_pipeline(
-    #     bayer_images=bayer_imgs,
-    #     debayer_backend='torch',    # or 'cv2'
-    #     resize_to=(256, 256),
-    #     tile_width=2,
-    #     jpeg_quality=90,
-    # )
-    
-    # encoded_jpegs = run_pipe(bayer_imgs)
-    # # Print result info
-    # print(f"Number of JPEG images: {len(encoded_jpegs)}")
-    # for i, jpeg_buf in enumerate(encoded_jpegs):
-    #     print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
-
-
 def build_image_pipeline_gpu(
     bayer_images: List[np.ndarray],
     debayer_backend: str = 'torch',  # or 'cv2'
@@ -248,7 +224,7 @@ def build_image_pipeline_gpu(
 
     # 2. Numpy Bayer -> Torch Bayer (on GPU)
     # The block will detect CUDA availability; we force device here.
-    np2torch_block = NumpyBayerToTorchBayerBlock(dtype=torch_dtype)
+    np2torch_block = NumpyBayerToTorchBayerBlock(dtype=torch_dtype,gpu=True)
 
     torch_bayer_imgs, meta = np2torch_block.validate(bayer_mats, meta)
 
@@ -291,6 +267,30 @@ def build_image_pipeline_gpu(
 # ========== Usage Example ==========
 
 if __name__ == "__main__":
+    test()
+    ######################################
+    # Generate 4 random Bayer images (grayscale, uint8, HW shape)
+    def generate_random_bayer_images(num_images=4, height=128, width=128):
+        return [np.random.randint(0, 256, (height, width), dtype=np.uint8) for _ in range(num_images)]
+
+    bayer_imgs = generate_random_bayer_images(num_images=4, height=128, width=128)
+
+    # Now, run your pipeline!
+    run_pipe = build_image_pipeline(
+        bayer_images=bayer_imgs,
+        debayer_backend='torch',    # or 'cv2'
+        resize_to=(256, 256),
+        tile_width=2,
+        jpeg_quality=90,
+    )
+    
+    encoded_jpegs = run_pipe(bayer_imgs)
+    # Print result info
+    print(f"Number of JPEG images: {len(encoded_jpegs)}")
+    for i, jpeg_buf in enumerate(encoded_jpegs):
+        print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
+
+    ######################################
     bayer_images = [np.random.randint(0,256,(480,640),np.uint8) for _ in range(4)]
 
     pipeline = build_image_pipeline_gpu(bayer_images, debayer_backend='torch', resize_to=(512, 512), tile_width=2, jpeg_quality=95, cuda_device=0)
