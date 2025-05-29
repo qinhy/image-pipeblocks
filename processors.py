@@ -11,6 +11,7 @@ import numpy as np
 from pydantic import BaseModel
 import torch
 import torch.nn.functional as F
+from ultralytics import YOLO
 
 class ShapeType(str, enum.Enum):
     HWC = 'HWC'
@@ -130,6 +131,11 @@ class ImageMat:
         return self._img_data
 
     # --- Type/Shape/Color Requirement Methods ---
+    def is_ndarray(self):
+        return isinstance(self._img_data, np.ndarray)
+    
+    def is_torch_tensor(self):
+        return isinstance(self._img_data, torch.Tensor)
 
     def require_ndarray(self):
         if not isinstance(self._img_data, np.ndarray):
@@ -167,7 +173,6 @@ class ImageMat:
             raise TypeError(f"Expected HWC or HW format, got {self.info.shape_type}")
 
     def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
-
 
 class ImageMatProcessor:    
     class MetaData(BaseModel):        
@@ -833,4 +838,131 @@ class MergeYoloResultsBlock(ImageMatProcessor):
         # Update meta with merged results
         meta[self.uuid] = result
         return imgs, meta
-    
+
+
+# TODO
+class YOLOBlock(ImageMatProcessor):
+    def __init__(
+        self, 
+        modelname: str = 'yolov5s6u.pt', 
+        conf: float = 0.6, 
+        cpu: bool = False, 
+        names: Optional[Dict[int, str]] = None,
+        save_results_to_meta: bool = False
+    ):
+        super().__init__('YOLO_detections', save_results_to_meta=save_results_to_meta)
+        self.modelname = modelname
+        self.conf = conf
+        self.cpu = cpu
+
+        default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
+        self.models = []
+        # self.model = YOLO(modelname, task='detect')
+        # if cpu:
+        #     self.model = self.model.cpu()
+        # if not hasattr(self.model, 'names'):
+        #     self.names = names if names is not None else default_names
+        # else:
+        #     self.names = self.model.names
+
+    def validate(self, imgs: List[ImageMat], meta: Optional[Dict] = None):
+        if meta is None:
+            meta = {}
+        self.input_mats = [i for i in imgs]
+        models = set([i.info.device for i in imgs])
+        models = {i:YOLO(self.modelname, task='detect').to(i) for i in models}
+        self.models = []
+        
+        for i,img in enumerate(imgs):
+
+            if img.is_ndarray():                
+                img.require_ndarray()
+                img.require_HWC()
+                img.require_RGB()
+                model = models[img.info.device]
+                # img is ndarray HWC RGB
+                det_fn = lambda img:model(img, conf=self.conf, verbose=False)[0]
+                self.models.append(det_fn)
+
+
+            if img.is_torch_tensor():
+                img.require_torch_tensor()
+                img.require_BCHW()
+                img.require_RGB()
+                # img is torch_tensor BCHW RGB put [CHW ...]
+                det_fn = lambda img:model([*img], conf=self.conf, verbose=False)
+                self.models.append(det_fn)
+
+            self.models.append(models[img.info.device])
+
+        self.out_mats = [img.copy() for img in imgs]
+        validated_imgs, meta = self.forward(imgs, meta)
+        return self.forward(validated_imgs, meta)
+
+    def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]]):
+        for i,img in enumerate(imgs_data):
+            # Run YOLO model (works for both batch and single)
+            if isinstance(img, torch.Tensor) and img.ndim == 4:
+                dets = self.models[i]([*img], conf=self.conf, verbose=False)
+            else:
+                dets = self.models[i](img, conf=self.conf, verbose=False)
+            if isinstance(dets, list) and len(dets) == 1:
+                dets = dets[0]
+        return dets
+
+    def forward(self, imgs: List[ImageMat], meta: Optional[Dict] = None):
+        if meta is None:
+            meta = {}
+        meta['class_names'] = self.names
+        meta[self.title] = []
+
+        for imgmat in imgs:
+            img_data = imgmat.data()
+            detections = self.forward_raw(img_data)
+            meta[self.title].append(detections)
+
+        return imgs, meta
+
+    def _torch_transform(self, img: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        # Accept np.ndarray or torch.Tensor
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        if img.max() > 1.0:
+            img = img / 255.0
+        if img.ndim == 3 and img.shape[-1] == 3:
+            img = img.permute(2, 0, 1)  # HWC -> CHW
+        elif img.ndim == 4 and img.shape[-1] == 3:
+            img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
+        return img
+
+    def _infer(self, img: Union[np.ndarray, torch.Tensor]):
+        assert hasattr(img, 'shape'), 'image is not a valid array or tensor!'
+        img = self._torch_transform(img)
+        # Run YOLO model (works for both batch and single)
+        if isinstance(img, torch.Tensor) and img.ndim == 4:
+            dets = self.model([*img], conf=self.conf, verbose=False)
+        else:
+            dets = self.model(img, conf=self.conf, verbose=False)
+        if isinstance(dets, list) and len(dets) == 1:
+            dets = dets[0]
+        return dets
+
+# TODO
+class YoloRTBlock(YOLOBlock):
+    def __init__(
+        self, 
+        modelname: str = 'yolov5s6u.engine', 
+        conf: float = 0.6, 
+        cpu: bool = False, 
+        names: Optional[Dict[int, str]] = None,
+        save_results_to_meta: bool = False
+    ):
+        super().__init__(modelname, conf, cpu, names, save_results_to_meta)
+        self.title = 'YOLO_RT_detections'
+
+    def _torch_transform(self, img: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        img = super()._torch_transform(img)
+        # Use float16 for TensorRT models
+        if isinstance(img, torch.Tensor):
+            img = img.to(torch.float16)
+        return img
