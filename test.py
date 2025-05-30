@@ -1,6 +1,7 @@
+from generator import CvMultiVideoMatGenerator
 from processors import *
 
-def test():
+def test1():
     # Test ImageMat creation for a Bayer numpy image
     bayer_image = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
     img_mat = ImageMat(bayer_image, color_type="bayer")
@@ -32,7 +33,7 @@ def test():
     print("Tiled image shape:", tiled_imgs[0].data().shape)
     print("All tests passed.")
 
-    print("\n--- Additional Unit Tests ---")
+    print("/n--- Additional Unit Tests ---")
     # 1. Test error on None input for ImageMat
     try:
         ImageMat(None, color_type="bayer")
@@ -131,7 +132,7 @@ def test():
     assert out == input_imgs
     print("Pass: MergeYoloResultsBlock returns input if no YOLO results in meta.")
 
-    print("\nAll additional tests passed.")
+    print("/nAll additional tests passed.")
 
 def build_image_pipeline(
     bayer_images: List[np.ndarray],
@@ -264,11 +265,7 @@ def build_image_pipeline_gpu(
 
     return run
 
-# ========== Usage Example ==========
-
-if __name__ == "__main__":
-    test()
-    ######################################
+def test_build_image_pipeline():
     # Generate 4 random Bayer images (grayscale, uint8, HW shape)
     def generate_random_bayer_images(num_images=4, height=128, width=128):
         return [np.random.randint(0, 256, (height, width), dtype=np.uint8) for _ in range(num_images)]
@@ -290,7 +287,7 @@ if __name__ == "__main__":
     for i, jpeg_buf in enumerate(encoded_jpegs):
         print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
 
-    ######################################
+def test_build_image_pipeline_gpu():
     bayer_images = [np.random.randint(0,256,(480,640),np.uint8) for _ in range(4)]
 
     pipeline = build_image_pipeline_gpu(bayer_images, debayer_backend='torch', resize_to=(512, 512), tile_width=2, jpeg_quality=95, cuda_device=0)
@@ -298,3 +295,47 @@ if __name__ == "__main__":
     for i, jpeg_buf in enumerate(encoded_jpegs):
         print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
 
+
+def test_vid_show(mp4s=[]):
+    if len(mp4s)==0:return print('Not tests.')
+    pipes = []
+    # Create multi-video generator
+    gen = multi_video_gen = CvMultiVideoMatGenerator(
+        video_paths=mp4s,
+        color_type=ColorType.BGR,  # Or ColorType.RGB, as needed
+        # scale=0.5,                 # Resize frames for speed, optional
+        # step=1,                    # No frame skipping
+        # max_frames=10              # Limit to 10 frames for quick testing
+    )
+    # Create a simple viewer
+    viewer = CvImageViewer(
+        window_name_prefix="MultiVideoTest",
+        resizable=False,
+        scale=0.25,
+        # overlay_texts=None
+    )
+    pipes.append(viewer)
+
+    # validate
+    for i, frame_list in enumerate(multi_video_gen):
+        print(f"Step {i}: showing {len(frame_list)} frames")
+        viewer.validate(frame_list,{})
+
+        print("validate complete.")
+        break
+    # return gen, pipes
+
+    def run(imgs,meta={}):
+        imgs,meta = viewer(imgs,meta)
+        return imgs,meta
+    for imgs in gen:run(imgs)
+
+# ========== Usage Example ==========
+
+if __name__ == "__main__":
+    test_vid_show(['g:/Archive/yolotest/my_video.1.mp4',
+                   ])
+
+    test1()
+    test_build_image_pipeline()
+    test_build_image_pipeline_gpu()

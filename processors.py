@@ -2,234 +2,19 @@
 # Standard Library Imports
 import enum
 import math
+from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 # Third-Party Library Imports
 import cv2
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
-
-class ShapeType(str, enum.Enum):
-    HWC = 'HWC'
-    HW = 'HW'
-    BCHW = 'BCHW'
-
-class ColorType(str, enum.Enum):
-    BAYER = 'bayer'
-    GRAYSCALE = 'grayscale'
-    RGB = 'RGB'
-    BGR = 'BGR'
-    JPEG = 'jpeg'
-
-COLOR_TYPE_CHANNELS = {
-    ColorType.BAYER: [1],
-    ColorType.GRAYSCALE: [1],
-    ColorType.RGB: [3],
-    ColorType.BGR: [3],
-}
-
-class ImageMatInfo(BaseModel):
-    type: Optional[str] = None
-    dtype: Optional[Union[np.dtype, torch.dtype]] = None
-    device: str = ''
-    shape_type: Optional[ShapeType] = None
-    max_value: Optional[Union[int, float]] = None
-    B: Optional[int] = None
-    C: Optional[int] = None
-    H: int = 0
-    W: int = 0
-    color_type: Optional[ColorType] = None
-
-    model_config = {"arbitrary_types_allowed": True}
-
-    def __init__(self, img_data: Union[np.ndarray, torch.Tensor],
-                  color_type: Union[str, ColorType], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Parse color_type to Enum
-        try:
-            color_type = ColorType(color_type)
-        except ValueError:
-            raise ValueError(
-                f"Invalid color type: {color_type}. Must be one of {[c.value for c in ColorType]}")
-
-        self.type = type(img_data).__name__
-
-        if isinstance(img_data, np.ndarray):
-            self.dtype = img_data.dtype
-            self.device = "cpu"
-            self.max_value = 255 if img_data.dtype == np.uint8 else 1.0
-
-            if img_data.ndim == 3:
-                self.shape_type = ShapeType.HWC
-                self.H, self.W, self.C = img_data.shape
-            elif img_data.ndim == 2:
-                self.shape_type = ShapeType.HW
-                self.H, self.W = img_data.shape
-                self.C = 1
-            else:
-                raise ValueError("NumPy array must be 2D (HW) or 3D (HWC).")
-
-        elif isinstance(img_data, torch.Tensor):
-            self.dtype = img_data.dtype
-            self.device = str(img_data.device)
-            self.max_value = 1.0
-
-            if img_data.ndim == 4:
-                self.shape_type = ShapeType.BCHW
-                self.B, self.C, self.H, self.W = img_data.shape
-            else:
-                raise ValueError("Torch tensor must be 4D (BCHW).")
-
-        else:
-            raise TypeError(f"img_data must be np.ndarray or torch.Tensor, got {type(img_data)}")
-
-        # Channel count validation
-        if color_type in COLOR_TYPE_CHANNELS:
-            expected_channels = COLOR_TYPE_CHANNELS[color_type]
-            if self.C not in expected_channels:
-                raise ValueError(
-                    f"Invalid color type '{color_type.value}' for image with {self.C} channels. "
-                    f"Expected {expected_channels} channels. Data shape: {img_data.shape}"
-                )
-        self.color_type = color_type
-
-class ImageMat:
-    def __init__(self, img_data: Union[np.ndarray, torch.Tensor], 
-                 color_type: Union[str, ColorType], info: Optional[ImageMatInfo] = None):
-        if img_data is None:
-            raise ValueError("img_data cannot be None")
-        self.info = info or ImageMatInfo(img_data, color_type=color_type)
-        self._img_data = img_data
-
-    def copy(self) -> 'ImageMat':
-        """Return a deep copy of the ImageMat object."""
-        if isinstance(self._img_data, np.ndarray):
-            return ImageMat(self._img_data.copy(), color_type=self.info.color_type)
-        elif isinstance(self._img_data, torch.Tensor):
-            return ImageMat(self._img_data.clone(), color_type=self.info.color_type)
-        else:
-            raise TypeError("img_data must be np.ndarray or torch.Tensor")
-
-    def update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
-        """Update image data and refresh metadata."""
-        self._img_data = img_data
-        self.info = ImageMatInfo(img_data, color_type=self.info.color_type)
-        return self
-
-    def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
-        """Update the image data without updating metadata (use with caution)."""
-        self._img_data = img_data
-        return self
-
-    def data(self) -> Union[np.ndarray, torch.Tensor]:
-        """Return the image data."""
-        return self._img_data
-
-    # --- Type/Shape/Color Requirement Methods ---
-    def is_ndarray(self):
-        return isinstance(self._img_data, np.ndarray)
-    
-    def is_torch_tensor(self):
-        return isinstance(self._img_data, torch.Tensor)
-
-    def require_ndarray(self):
-        if not isinstance(self._img_data, np.ndarray):
-            raise TypeError(f"Expected np.ndarray, got {type(self._img_data)}")
-        self.require_HW_or_HWC()
-
-    def require_np_uint(self):
-        self.require_ndarray()
-        if self._img_data.dtype not in (np.uint8, np.uint16):
-            raise TypeError("Image data must be np.uint8 or np.uint16.")
-
-    def require_torch_tensor(self):
-        if not isinstance(self._img_data, torch.Tensor):
-            raise TypeError(f"Expected torch.Tensor, got {type(self._img_data)}")
-        self.require_BCHW()
-
-    def require_shape_type(self, shape_type: ShapeType):
-        if self.info.shape_type != shape_type:
-            raise TypeError(f"Expected {shape_type.value} format, got {self.info.shape_type}")
-
-    def require_color_type(self, color_type: ColorType):
-        if self.info.color_type != color_type:
-            raise TypeError(f"Expected {color_type.value} image, got {self.info.color_type}")
-
-    def require_BAYER(self):      self.require_color_type(ColorType.BAYER)
-    def require_GRAYSCALE(self):  self.require_color_type(ColorType.GRAYSCALE)
-    def require_RGB(self):        self.require_color_type(ColorType.RGB)
-    def require_BGR(self):        self.require_color_type(ColorType.BGR)
-    def require_JPEG(self):       self.require_color_type(ColorType.JPEG)
-
-    def require_HWC(self):        self.require_shape_type(ShapeType.HWC)
-    def require_HW(self):         self.require_shape_type(ShapeType.HW)
-    def require_HW_or_HWC(self):
-        if self.info.shape_type not in {ShapeType.HWC, ShapeType.HW}:
-            raise TypeError(f"Expected HWC or HW format, got {self.info.shape_type}")
-
-    def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
-
-class ImageMatProcessor:    
-    class MetaData(BaseModel):        
-        model_config = {"arbitrary_types_allowed": True}
-
-    def __init__(self,title='ImageMatProcessor', save_results_to_meta=False):
-        self.title = title
-        self.uuid = uuid.uuid4()
-        self.save_results_to_meta = save_results_to_meta
-        self._enable = True
-        self.input_mats: List[ImageMat] = []
-        self.out_mats: List[ImageMat] = []
-
-    def on(self):
-        self._enable = True
-
-    def off(self):
-        self._enable = False
-        
-    def devices_info(self,gpu=True,multi_gpu=-1):
-        self.num_devices = ['cpu']
-        if gpu and torch.cuda.is_available():
-            self.num_gpus = torch.cuda.device_count()
-            if multi_gpu <= 0 or multi_gpu > self.num_gpus:
-                # Use all available GPUs
-                self.num_devices = [f"cuda:{i}" for i in range(self.num_gpus)]
-            else:
-                # Use specified number of GPUs
-                self.num_devices = [f"cuda:{i}" for i in range(multi_gpu)]
-        return self.num_devices
-    
-    def __call__(self, imgs: List[ImageMat], meta: dict = {}):    
-        if self._enable:
-            output_imgs, meta = self.forward(imgs, meta)
-            
-        if self.save_results_to_meta:
-            meta[self.uuid] = [i.copy() for i in output_imgs]
-
-        return output_imgs, meta
-    
-    def validate(self, imgs: List[ImageMat], meta: dict = {}):
-        self.input_mats = [i for i in imgs]
-        imgs, meta = self.forward(imgs, meta)
-        self.out_mats = [i for i in imgs]
-        return imgs, meta
-    
-    def forward_raw(self, imgs: List[Any]) -> List["Any"]:
-        raise NotImplementedError()
-    
-    def forward(self, imgs: List["ImageMat"], meta: Dict) -> Tuple[List["ImageMat"],Dict]:
-        forwarded_imgs = self.forward_raw([img.data() for img in imgs])
-        output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]        
-        return output_imgs, meta
-
-    def get_converted_imgs(self, meta: Dict = {}):
-        """Retrieve forwarded images from metadata if stored."""
-        return meta.get(self.uuid, None)
+from shmIO import NumpyUInt8SharedMemoryStreamIO
+from ImageMat import *
 
 class CvDebayerBlock(ImageMatProcessor):
     def __init__(self, format=cv2.COLOR_BAYER_BG2BGR, save_results_to_meta=False):
@@ -839,7 +624,6 @@ class MergeYoloResultsBlock(ImageMatProcessor):
         meta[self.uuid] = result
         return imgs, meta
 
-
 # TODO
 class YOLOBlock(ImageMatProcessor):
     def __init__(
@@ -857,17 +641,15 @@ class YOLOBlock(ImageMatProcessor):
 
         default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
         self.models = []
-        # self.model = YOLO(modelname, task='detect')
-        # if cpu:
-        #     self.model = self.model.cpu()
-        # if not hasattr(self.model, 'names'):
-        #     self.names = names if names is not None else default_names
-        # else:
-        #     self.names = self.model.names
+
+        tmp_model = YOLO(modelname, task='detect')        
+        if not hasattr(tmp_model, 'names'):
+            self.names = names if names is not None else default_names
+        else:
+            self.names = tmp_model.names
 
     def validate(self, imgs: List[ImageMat], meta: Optional[Dict] = None):
-        if meta is None:
-            meta = {}
+        if meta is None: meta = {}
         self.input_mats = [i for i in imgs]
         models = set([i.info.device for i in imgs])
         models = {i:YOLO(self.modelname, task='detect').to(i) for i in models}
@@ -883,7 +665,6 @@ class YOLOBlock(ImageMatProcessor):
                 # img is ndarray HWC RGB
                 det_fn = lambda img:model(img, conf=self.conf, verbose=False)[0]
                 self.models.append(det_fn)
-
 
             if img.is_torch_tensor():
                 img.require_torch_tensor()
@@ -935,18 +716,6 @@ class YOLOBlock(ImageMatProcessor):
             img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
         return img
 
-    def _infer(self, img: Union[np.ndarray, torch.Tensor]):
-        assert hasattr(img, 'shape'), 'image is not a valid array or tensor!'
-        img = self._torch_transform(img)
-        # Run YOLO model (works for both batch and single)
-        if isinstance(img, torch.Tensor) and img.ndim == 4:
-            dets = self.model([*img], conf=self.conf, verbose=False)
-        else:
-            dets = self.model(img, conf=self.conf, verbose=False)
-        if isinstance(dets, list) and len(dets) == 1:
-            dets = dets[0]
-        return dets
-
 # TODO
 class YoloRTBlock(YOLOBlock):
     def __init__(
@@ -966,3 +735,109 @@ class YoloRTBlock(YOLOBlock):
         if isinstance(img, torch.Tensor):
             img = img.to(torch.float16)
         return img
+
+class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
+    def __init__(self, stream_key_prefix: str):
+        super().__init__('np_uint8_shm_writer')
+        self.writers:list[NumpyUInt8SharedMemoryStreamIO.StreamWriter] = []
+        self.stream_key_prefix = stream_key_prefix
+
+    def validate_img(self, img_idx, img: ImageMat):
+        img.require_ndarray()
+        img.require_np_uint()
+        stream_key = f'{self.stream_key_prefix}:{i}'
+        wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
+        wt.build_buffer()
+
+    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
+        for wt,img in zip(self.writers,imgs_data):
+            wt.write(img)
+        return imgs_data
+
+class CvImageViewer(ImageMatProcessor):
+    def __init__(self, window_name_prefix: str = 'ImageViewer',
+                 resizable: bool = True,    
+                 scale: Optional[float] = None,
+                 overlay_texts: Optional[List[str]] = None,
+                 save_on_key: Optional[int] = ord('s'),
+                 ):
+        super().__init__('cv_image_viewer')
+        self.window_name_prefix = f'{window_name_prefix}:{uuid.uuid4()}'
+        self.resizable = cv2.WINDOW_NORMAL if resizable else cv2.WINDOW_AUTOSIZE
+        self.scale = scale
+        self.overlay_texts = overlay_texts or []
+        self.save_on_key = save_on_key
+        self.window_names = []
+        self.mouse_pos = (0, 0)  # for showing mouse coords
+
+    def validate_img(self, img_idx, img: ImageMat):
+        img.require_ndarray()
+        img.require_np_uint()
+        win_name = f'{self.window_name_prefix}:{img_idx}'
+        self.window_names.append(win_name)
+        cv2.namedWindow(win_name, self.resizable)
+    #     cv2.setMouseCallback(win_name, self._mouse_callback)
+
+    # def _mouse_callback(self, event, x, y, flags, param):
+    #     if event == cv2.EVENT_MOUSEMOVE:
+    #         self.mouse_pos = (x, y)
+
+    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
+        scale = self.scale
+        overlay_texts = self.overlay_texts
+        save_on_key = self.save_on_key
+
+        for idx,img in enumerate(imgs_data):            
+            img = imgs_data[idx].copy()
+            if scale is not None:
+                img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+
+            # Overlay text
+            text = overlay_texts[idx] if idx < len(overlay_texts) else ""
+            cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # # Mouse position overlay
+            # cv2.putText(img, f"({self.mouse_pos[0]}, {self.mouse_pos[1]})", (10, img.shape[0]-10),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+
+            win_name = self.window_names[idx]
+            cv2.imshow(win_name, img)
+            key = cv2.waitKey(1) & 0xFF
+
+            # if key == 27 or key == ord('q'):  # ESC or q = quit
+            #     break
+            if save_on_key and key == save_on_key:
+                filename = f'image_{idx}.png'
+                cv2.imwrite(filename, img)
+                print(f'Saved {filename}')
+            # elif key == 81 or key == ord('a'):  # left arrow or 'a'
+            #     idx = max(0, idx - 1)
+            # elif key == 83 or key == ord('d'):  # right arrow or 'd'
+            #     idx = min(len(imgs_data) - 1, idx + 1)
+            # elif key == ord('+'):  # Zoom in
+            #     self.scale = (self.scale or 1.0) * 1.2
+            # elif key == ord('-'):  # Zoom out
+            #     self.scale = (self.scale or 1.0) / 1.2
+            # elif key == ord('x'):  # Delete (skip) this image
+            #     print(f"Deleted image at index {idx}")
+            #     imgs_data.pop(idx)
+            #     self.window_names.pop(idx)
+            #     if idx >= len(imgs_data): idx = len(imgs_data) - 1
+            elif key == ord('e'):  # Edit overlay text
+                new_text = input(f"Enter new overlay text for image {idx}: ")
+                if idx < len(overlay_texts):
+                    overlay_texts[idx] = new_text
+                else:
+                    overlay_texts.append(new_text)
+
+        return imgs_data
+
+    def __del__(self):
+        try:
+            [cv2.destroyWindow(n) for n in self.window_names]
+        except Exception:
+            pass
+
+
+
+
