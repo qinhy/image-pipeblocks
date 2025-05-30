@@ -140,8 +140,8 @@ class ImageMat:
 
     def require_np_uint(self):
         self.require_ndarray()
-        if self._img_data.dtype not in (np.uint8, np.uint16):
-            raise TypeError("Image data must be np.uint8 or np.uint16.")
+        if self._img_data.dtype != np.uint8:
+            raise TypeError(f"Image data must be np.uint8. Got {self._img_data.dtype}")
 
     def require_torch_tensor(self):
         if not isinstance(self._img_data, torch.Tensor):
@@ -170,9 +170,21 @@ class ImageMat:
 
     def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
 
-class ImageMatProcessor:    
+class ImageMatProcessor:
     class MetaData(BaseModel):        
         model_config = {"arbitrary_types_allowed": True}
+
+    @staticmethod    
+    def run_once(imgs,meta={},
+            pipes:list['ImageMatProcessor']=[],
+            validate=False):
+        if validate:
+            for fn in pipes:
+                imgs,meta = fn.validate(imgs,meta)
+        else:
+            for fn in pipes:
+                imgs,meta = fn(imgs,meta)
+        return imgs,meta
 
     def __init__(self,title='ImageMatProcessor', save_results_to_meta=False):
         self.title = title
@@ -229,7 +241,7 @@ class ImageMatProcessor:
     def forward_raw(self, imgs: List[Any]) -> List["Any"]:
         raise NotImplementedError()
     
-    def forward(self, imgs: List["ImageMat"], meta: Dict) -> Tuple[List["ImageMat"],Dict]:
+    def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
         forwarded_imgs = self.forward_raw([img.data() for img in imgs])
         output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]        
         return output_imgs, meta
@@ -242,11 +254,8 @@ class ImageMatGenerator:
     """
     Abstract generator for List[ImageMat].
     """
-    def __init__(self, 
-                 meta: Optional[Dict[str, Any]] = None, 
-                 color_type: Union[str, ColorType] = ColorType.RGB):
-        self.meta = meta or {}
-        self.color_type = color_type
+    def __init__(self, imgs: List[ImageMat]=None, meta: Dict=None):
+        pass
 
     def __iter__(self):
         raise NotImplementedError()

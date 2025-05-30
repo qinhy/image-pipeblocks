@@ -1,4 +1,4 @@
-from generator import CvMultiVideoMatGenerator
+from generator import CvMultiVideoMatGenerator, XVSdkRGBDGenerator
 from processors import *
 
 def test1():
@@ -295,7 +295,6 @@ def test_build_image_pipeline_gpu():
     for i, jpeg_buf in enumerate(encoded_jpegs):
         print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
 
-
 def test_vid_show(mp4s=[]):
     if len(mp4s)==0:return print('Not tests.')
     pipes = []
@@ -323,19 +322,48 @@ def test_vid_show(mp4s=[]):
 
         print("validate complete.")
         break
-    # return gen, pipes
+    return gen, pipes
 
     def run(imgs,meta={}):
         imgs,meta = viewer(imgs,meta)
         return imgs,meta
     for imgs in gen:run(imgs)
 
+
+def test_xvsdk_show():
+    pipes = [
+        # Create a simple viewer
+        TileNumpyImagesBlock(tile_width=1),        
+        CvImageViewer(
+            window_name_prefix="MultiVideoTest",
+            resizable=False,
+            scale=0.5,
+            # overlay_texts=None
+        ),
+        CvVideoRecorder(
+            output_filename="output.mp4",
+            fps=30,
+        ),
+    ]
+
+    # Create multi-video generator
+    gen =  XVSdkRGBDGenerator(
+        color_resolution=XVSdkRGBDGenerator.RGBresolution.RGB_1280x720,
+    )
+
+    # validate
+    for i, imgs in enumerate(gen):
+        ImageMatProcessor.run_once(imgs,pipes=pipes,validate=True)
+        print("validate complete.")
+        break
+
+    # return gen, pipes
+    for imgs in gen:ImageMatProcessor.run_once(imgs,pipes=pipes)
+
 # ========== Usage Example ==========
-
 if __name__ == "__main__":
-    test_vid_show(['g:/Archive/yolotest/my_video.1.mp4',
-                   ])
-
-    test1()
-    test_build_image_pipeline()
-    test_build_image_pipeline_gpu()
+    test_xvsdk_show()
+    # test_vid_show(['g:/Archive/yolotest/my_video.1.mp4',])
+    # test1()
+    # test_build_image_pipeline()
+    # test_build_image_pipeline_gpu()

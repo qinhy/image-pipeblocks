@@ -487,56 +487,104 @@ class CVResizeBlock(ImageMatProcessor):
                                       interpolation=self.interpolation)
             resized_images.append(resized_img)
         return resized_images
-
+    
 class TileNumpyImagesBlock(ImageMatProcessor):
     def __init__(self, tile_width: int, save_results_to_meta=False):
-        """
-        Initializes the TileNumpyImagesBlock for tiling images.
-
-        Args:
-            tile_width (int): Number of images per row in the tiled output.
-            save_results_to_meta (bool): Whether to store tiled images in metadata.
-        """
-        super().__init__('tile_numpy_images',save_results_to_meta)
+        super().__init__('tile_numpy_images', save_results_to_meta)
         self.tile_width = tile_width
         self.save_results_to_meta = save_results_to_meta
+        self.layout = {}
 
-    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
+    def _init_layout(self, imgs_data):
         """
-        Validates input images before tiling.
-        Ensures they are NumPy images in HWC format.
+        Calculate tiling grid parameters and create canvas.
+        Returns:
+            dict with keys: tile_width, tile_height, col_widths, row_heights,
+            total_width, total_height, channels, canvas
         """
-        self.input_mats = [i for i in imgs]
-        validated_imgs: List[ImageMat] = []
+        num_images = len(imgs_data)
+        tile_width = self.tile_width
+        tile_height = math.ceil(num_images / tile_width)
 
+        # Compute max width for each column, max height for each row
+        col_widths = [0] * tile_width
+        row_heights = [0] * tile_height
+
+        for idx, img in enumerate(imgs_data):
+            row, col = divmod(idx, tile_width)
+            h, w = img.shape[:2]
+            if w > col_widths[col]:
+                col_widths[col] = w
+            if h > row_heights[row]:
+                row_heights[row] = h
+
+        total_width = sum(col_widths)
+        total_height = sum(row_heights)
+        channels = imgs_data[0].shape[2] if imgs_data[0].ndim == 3 else 1
+
+        if channels == 1:
+            canvas = np.zeros((total_height, total_width), dtype=imgs_data[0].dtype)
+        else:
+            canvas = np.zeros((total_height, total_width, channels), dtype=imgs_data[0].dtype)
+
+        return {
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+            "col_widths": col_widths,
+            "row_heights": row_heights,
+            "total_width": total_width,
+            "total_height": total_height,
+            "channels": channels,
+            "canvas": canvas
+        }
+
+    def validate(self, imgs: list[ImageMat], meta: dict = {}):
+        if len(imgs) == 0:
+            raise ValueError("No images to tile.")
+
+        color_types = {i.info.color_type for i in imgs}
+        if len(color_types) != 1:
+            raise ValueError(f"All images must have the same color_type, got {color_types}")
+
+        validated_imgs:list[ImageMat] = []
         for img in imgs:
-            img.require_ndarray()
+            img.require_np_uint()
             img.require_HWC()
             validated_imgs.append(img)
 
-        # Create new ImageMat instance for output
-        tiled_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(tiled_imgs[0], color_type=validated_imgs[0].info.color_type)]
+        imgs_data = [img.data() for img in validated_imgs]
+        self.layout = self._init_layout(imgs_data)
+        tiled_imgs = self.forward_raw(imgs_data)
+        self.out_mats = [ImageMat(tiled_imgs[0], color_type=imgs[0].info.color_type)]
         return self.forward(validated_imgs, meta)
 
-    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
-        """
-        Tiles a batch of NumPy images into a single large image.
-        """
-        # Get image dimensions
-        h, w = imgs_data[0].shape[:2]
+    def forward_raw(self, imgs_data: list[np.ndarray]) -> list[np.ndarray]:
+        layout = self.layout
+        tile_width = layout['tile_width']
+        tile_height = layout['tile_height']
+        col_widths = layout['col_widths']
+        row_heights = layout['row_heights']
+        channels = layout['channels']
+        canvas = layout['canvas']
+
         num_images = len(imgs_data)
-        tile_height = math.ceil(num_images / self.tile_width)  # Number of rows needed
+        y_offset = 0
+        for row in range(tile_height):
+            x_offset = 0
+            for col in range(tile_width):
+                idx = row * tile_width + col
+                if idx >= num_images:
+                    break
+                img:np.ndarray = imgs_data[idx]
+                h, w = img.shape[:2]
+                if channels == 1:
+                    canvas[y_offset:y_offset + h, x_offset:x_offset + w] = img
+                else:
+                    canvas[y_offset:y_offset + h, x_offset:x_offset + w, :channels] = img
+                x_offset += col_widths[col]
+            y_offset += row_heights[row]
+        return [canvas]
 
-        # Create a blank canvas
-        tile = np.zeros((tile_height * h, self.tile_width * w, 3), dtype=imgs_data[0].dtype)
-
-        # Place images in the tile
-        for i, img in enumerate(imgs_data):
-            r, c = divmod(i, self.tile_width)
-            tile[r * h:(r + 1) * h, c * w:(c + 1) * w] = img
-
-        return [tile]
 
 class EncodeNumpyToJpegBlock(ImageMatProcessor):
     def __init__(self, quality: int = None, save_results_to_meta=False):
@@ -776,11 +824,6 @@ class CvImageViewer(ImageMatProcessor):
         win_name = f'{self.window_name_prefix}:{img_idx}'
         self.window_names.append(win_name)
         cv2.namedWindow(win_name, self.resizable)
-    #     cv2.setMouseCallback(win_name, self._mouse_callback)
-
-    # def _mouse_callback(self, event, x, y, flags, param):
-    #     if event == cv2.EVENT_MOUSEMOVE:
-    #         self.mouse_pos = (x, y)
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
         scale = self.scale
@@ -796,33 +839,14 @@ class CvImageViewer(ImageMatProcessor):
             text = overlay_texts[idx] if idx < len(overlay_texts) else ""
             cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # # Mouse position overlay
-            # cv2.putText(img, f"({self.mouse_pos[0]}, {self.mouse_pos[1]})", (10, img.shape[0]-10),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
-
             win_name = self.window_names[idx]
             cv2.imshow(win_name, img)
             key = cv2.waitKey(1) & 0xFF
 
-            # if key == 27 or key == ord('q'):  # ESC or q = quit
-            #     break
             if save_on_key and key == save_on_key:
                 filename = f'image_{idx}.png'
                 cv2.imwrite(filename, img)
                 print(f'Saved {filename}')
-            # elif key == 81 or key == ord('a'):  # left arrow or 'a'
-            #     idx = max(0, idx - 1)
-            # elif key == 83 or key == ord('d'):  # right arrow or 'd'
-            #     idx = min(len(imgs_data) - 1, idx + 1)
-            # elif key == ord('+'):  # Zoom in
-            #     self.scale = (self.scale or 1.0) * 1.2
-            # elif key == ord('-'):  # Zoom out
-            #     self.scale = (self.scale or 1.0) / 1.2
-            # elif key == ord('x'):  # Delete (skip) this image
-            #     print(f"Deleted image at index {idx}")
-            #     imgs_data.pop(idx)
-            #     self.window_names.pop(idx)
-            #     if idx >= len(imgs_data): idx = len(imgs_data) - 1
             elif key == ord('e'):  # Edit overlay text
                 new_text = input(f"Enter new overlay text for image {idx}: ")
                 if idx < len(overlay_texts):
@@ -835,6 +859,75 @@ class CvImageViewer(ImageMatProcessor):
     def __del__(self):
         try:
             [cv2.destroyWindow(n) for n in self.window_names]
+        except Exception:
+            pass
+
+class CvVideoRecorder(ImageMatProcessor):
+    def __init__(self, 
+                 output_filename: str = "output.avi",
+                 codec: str = 'XVID',
+                 fps: int = 30,
+                 scale: Optional[float] = None,
+                 overlay_text: Optional[str] = None):
+        super().__init__('cv_video_recorder')        
+        self.output_filename = output_filename
+        self.codec = codec
+        self.fps = fps
+        self.scale = scale
+        self.overlay_text = overlay_text or ""
+
+        self.writer = None
+        self.recording = False
+        self.frame_size = None
+
+    def validate_img(self, img_idx, img: ImageMat):
+        if img_idx>0:
+            raise RuntimeError("CvVideoRecorder cannot process multiple images at once")
+        img.require_ndarray()
+        img.require_np_uint()
+        self.start(img.data().shape)
+
+    def forward_raw(self, imgs: list[np.ndarray])->list[np.ndarray]:
+        for img in imgs:self.write_frame(img)
+        return imgs
+    
+    def start(self, frame_shape: Tuple[int, int]):
+        fourcc = cv2.VideoWriter_fourcc(*self.codec)
+        self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
+        self.writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
+        self.recording = True
+        print(f"Started recording to {self.output_filename}")
+
+    def stop(self):
+        if self.writer:
+            self.writer.release()
+            self.writer = None
+        self.recording = False
+        print("Stopped recording.")
+
+    def write_frame(self, frame: np.ndarray):
+        if not self.recording:
+            raise RuntimeError("Recording has not started. Call start() first.")
+
+        # Resize frame if needed
+        if self.scale is not None:
+            frame = cv2.resize(frame, (0, 0), fx=self.scale, fy=self.scale)
+
+        # Overlay text
+        if self.overlay_text:
+            cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
+
+        # Ensure frame matches output size and type
+        if self.frame_size is not None and (frame.shape[1], frame.shape[0]) != self.frame_size:
+            frame = cv2.resize(frame, self.frame_size)
+        if frame.dtype != np.uint8 or (frame.ndim != 3 or frame.shape[2] != 3):
+            raise ValueError("Frame must be uint8 BGR for VideoWriter")
+
+        self.writer.write(frame)
+
+    def __del__(self):
+        try:
+            self.stop()
         except Exception:
             pass
 
