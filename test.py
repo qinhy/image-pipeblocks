@@ -330,7 +330,7 @@ def test_vid_show(mp4s=[]):
     for imgs in gen:run(imgs)
 
 
-def test_xvsdk_show():
+def test_xvsdk_show(output_filename="./out.mp4"):
     pipes = [
         # Create a simple viewer
         TileNumpyImagesBlock(tile_width=1),        
@@ -339,12 +339,15 @@ def test_xvsdk_show():
             resizable=False,
             scale=0.5,
             # overlay_texts=None
-        ),
-        CvVideoRecorder(
-            output_filename="output.mp4",
-            fps=30,
-        ),
-    ]
+        ),]
+    
+    if output_filename:
+        pipes += [
+            CvVideoRecorder(
+                output_filename=output_filename,
+                fps=30,
+            ),
+        ]
 
     # Create multi-video generator
     gen =  XVSdkRGBDGenerator(
@@ -363,7 +366,7 @@ def test_xvsdk_show():
 # ========== Usage Example ==========
 if __name__ == "__main__":
     test_xvsdk_show()
-    # test_vid_show(['g:/Archive/yolotest/my_video.1.mp4',])
+    # test_vid_show(['./bottom.center.mp4',])
     # test1()
     # test_build_image_pipeline()
     # test_build_image_pipeline_gpu()

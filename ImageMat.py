@@ -268,3 +268,56 @@ class ImageMatGenerator:
 
     def __len__(self):
         return None
+    
+    def __next_one_raw__(self) -> Any:
+        raise NotImplementedError()
+
+class ImageMatGenerator:
+    """
+    Abstract base class for generating lists of ImageMat objects from various sources.
+    Manages shared resource lifecycle.
+    """
+
+    def __init__(self, sources: list = None, color_modes: list = None):
+        self.sources = sources or []
+        self.color_modes = color_modes or []
+        self._resources = []  # General-purpose resource registry
+        self.source_generators = [self.create_source_generator(src) for src in self.sources]
+
+    def register_resource(self, resource):
+        self._resources.append(resource)
+
+    def release_resources(self):
+        """
+        Calls .release() on all registered resources if available.
+        """
+        for res in self._resources:
+            if hasattr(res, "release") and callable(res.release):
+                res.release()
+        self._resources.clear()
+
+    def create_source_generator(self, source):
+        raise NotImplementedError("Subclasses must implement `create_source_generator`")
+
+    def iterate_raw_images(self):
+        for generator in self.source_generators:
+            yield from generator
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        for raw_image, color_mode in zip(self.iterate_raw_images(), self.color_modes):
+            yield ImageMat(raw_image, color_mode)
+
+    def reset_generators(self):
+        pass
+
+    def release(self):
+        self.release_resources()
+
+    def __del__(self):
+        self.release()
+
+    def __len__(self):
+        return None
