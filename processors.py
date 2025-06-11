@@ -793,7 +793,7 @@ class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
     def validate_img(self, img_idx, img: ImageMat):
         img.require_ndarray()
         img.require_np_uint()
-        stream_key = f'{self.stream_key_prefix}:{i}'
+        stream_key = f"{self.stream_key_prefix}:{img_idx}"
         wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
         wt.build_buffer()
 
