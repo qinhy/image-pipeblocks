@@ -1,0 +1,7 @@
+numpy
+opencv-python
+pydantic
+# Optional packages
+# torch
+# ultralytics
+# xvsdk

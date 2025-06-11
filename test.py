@@ -141,14 +141,14 @@ def build_image_pipeline(
     tile_width: int = 2,
     jpeg_quality: int = 90,
 ) -> Tuple[List[np.ndarray], dict]:
-    """
-    Processes a list of Bayer images (numpy) through the pipeline:
-    Bayer (np) -> Torch -> Debayer -> Resize -> Numpy -> Tile -> JPEG
+"""
+Build the CPU image pipeline and return a callable.
 
-    Returns:
-        encoded_jpeg_imgs: List[np.ndarray] of JPEG-encoded images
-        meta: Metadata dictionary (for intermediate results)
-    """
+The returned callable accepts a list of Bayer numpy arrays and
+processes them through the steps:
+Bayer (np) -> Torch -> Debayer -> Resize -> Numpy -> Tile -> JPEG.
+It yields JPEG-encoded numpy buffers for each processed frame.
+"""
     def init(bayer_images):
         meta = {}
         # 1. Wrap Bayer images as ImageMat objects
