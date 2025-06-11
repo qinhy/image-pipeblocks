@@ -697,58 +697,50 @@ class YOLOBlock(ImageMatProcessor):
             self.names = tmp_model.names
 
     def validate(self, imgs: List[ImageMat], meta: Optional[Dict] = None):
-        if meta is None: meta = {}
-        self.input_mats = [i for i in imgs]
-        models = set([i.info.device for i in imgs])
-        models = {i:YOLO(self.modelname, task='detect').to(i) for i in models}
-        self.models = []
-        
-        for i,img in enumerate(imgs):
+        if meta is None:
+            meta = {}
 
-            if img.is_ndarray():                
+        self.input_mats = [i for i in imgs]
+        devices = {i.info.device for i in imgs}
+        models = {d: YOLO(self.modelname, task='detect').to(d) for d in devices}
+        self.models = []
+
+        for img in imgs:
+            if img.is_ndarray():
                 img.require_ndarray()
                 img.require_HWC()
                 img.require_RGB()
                 model = models[img.info.device]
-                # img is ndarray HWC RGB
-                det_fn = lambda img:model(img, conf=self.conf, verbose=False)[0]
+                det_fn = lambda x, m=model: m(x, conf=self.conf, verbose=False)
                 self.models.append(det_fn)
-
-            if img.is_torch_tensor():
+            elif img.is_torch_tensor():
                 img.require_torch_tensor()
                 img.require_BCHW()
                 img.require_RGB()
-                # img is torch_tensor BCHW RGB put [CHW ...]
-                det_fn = lambda img:model([*img], conf=self.conf, verbose=False)
+                model = models[img.info.device]
+                det_fn = lambda x, m=model: m([*x], conf=self.conf, verbose=False)
                 self.models.append(det_fn)
-
-            self.models.append(models[img.info.device])
+            else:
+                raise TypeError("Unsupported image type for YOLOBlock")
 
         self.out_mats = [img.copy() for img in imgs]
-        validated_imgs, meta = self.forward(imgs, meta)
-        return self.forward(validated_imgs, meta)
+        return self.forward(imgs, meta)
 
     def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]]):
-        for i,img in enumerate(imgs_data):
-            # Run YOLO model (works for both batch and single)
-            if isinstance(img, torch.Tensor) and img.ndim == 4:
-                dets = self.models[i]([*img], conf=self.conf, verbose=False)
-            else:
-                dets = self.models[i](img, conf=self.conf, verbose=False)
+        results = []
+        for fn, img in zip(self.models, imgs_data):
+            dets = fn(img)
             if isinstance(dets, list) and len(dets) == 1:
                 dets = dets[0]
-        return dets
+            results.append(dets)
+        return results
 
     def forward(self, imgs: List[ImageMat], meta: Optional[Dict] = None):
         if meta is None:
             meta = {}
         meta['class_names'] = self.names
-        meta[self.title] = []
-
-        for imgmat in imgs:
-            img_data = imgmat.data()
-            detections = self.forward_raw(img_data)
-            meta[self.title].append(detections)
+        img_data = [imgmat.data() for imgmat in imgs]
+        meta[self.title] = self.forward_raw(img_data)
 
         return imgs, meta
 
