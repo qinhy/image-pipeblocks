@@ -202,6 +202,7 @@ class ImageMatProcessor:
         
     def devices_info(self,gpu=True,multi_gpu=-1):
         self.num_devices = ['cpu']
+        self.num_gpus = 0
         if gpu and torch.cuda.is_available():
             self.num_gpus = torch.cuda.device_count()
             if multi_gpu <= 0 or multi_gpu > self.num_gpus:
