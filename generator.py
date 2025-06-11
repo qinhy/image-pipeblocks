@@ -302,7 +302,7 @@ class NumpyUInt8SharedMemoryReader(ImageMatGenerator):
     def validate_img(self, img_idx, img: ImageMat):
         img.require_ndarray()
         img.require_np_uint()
-        stream_key = f'{self.stream_key_prefix}:{i}'
+        stream_key = f'{self.stream_key_prefix}:{img_idx}'
         rd = NumpyUInt8SharedMemoryStreamIO.reader(stream_key, img.data().shape)
         rd.build_buffer()
         self.readers.append(rd)
