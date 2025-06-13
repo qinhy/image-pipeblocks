@@ -279,9 +279,9 @@ class ImageMatGenerator:
     Manages shared resource lifecycle.
     """
 
-    def __init__(self, sources: list = None, color_modes: list = None):
+    def __init__(self, sources: list = None, color_types: list = None):
         self.sources = sources or []
-        self.color_modes = color_modes or []
+        self.color_types = color_types or []
         self._resources = []  # General-purpose resource registry
         self.source_generators = [self.create_source_generator(src) for src in self.sources]
 
@@ -308,8 +308,8 @@ class ImageMatGenerator:
         return self
 
     def __next__(self):
-        for raw_image, color_mode in zip(self.iterate_raw_images(), self.color_modes):
-            yield ImageMat(raw_image, color_mode)
+        for raw_image, color_type in zip(self.iterate_raw_images(), self.color_types):
+            yield ImageMat(raw_image, color_type)
 
     def reset_generators(self):
         pass

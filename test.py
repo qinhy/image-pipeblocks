@@ -1,5 +1,6 @@
-from generator import CvMultiVideoMatGenerator, XVSdkRGBDGenerator
+from generator import VideoFrameGenerator, XVSdkRGBDGenerator
 from processors import *
+from ImageMat import ImageMat, ColorType
 
 def test1():
     # Test ImageMat creation for a Bayer numpy image
@@ -296,12 +297,12 @@ def test_build_image_pipeline_gpu():
         print(f"JPEG {i}: shape={jpeg_buf.shape}, dtype={jpeg_buf.dtype}, first 10 bytes={jpeg_buf[:10].flatten()}")
 
 def test_vid_show(mp4s=[]):
-    if len(mp4s)==0:return print('Not tests.')
+    if len(mp4s)==0:return print('Not mp4s.')
     pipes = []
     # Create multi-video generator
-    gen = multi_video_gen = CvMultiVideoMatGenerator(
-        video_paths=mp4s,
-        color_type=ColorType.BGR,  # Or ColorType.RGB, as needed
+    gen = multi_video_gen = VideoFrameGenerator(
+        sources=mp4s,
+        color_types=[ColorType.BGR for _ in mp4s],  # Or ColorType.RGB, as needed
         # scale=0.5,                 # Resize frames for speed, optional
         # step=1,                    # No frame skipping
         # max_frames=10              # Limit to 10 frames for quick testing
@@ -319,15 +320,11 @@ def test_vid_show(mp4s=[]):
     for i, frame_list in enumerate(multi_video_gen):
         print(f"Step {i}: showing {len(frame_list)} frames")
         viewer.validate(frame_list,{})
-
         print("validate complete.")
         break
-    return gen, pipes
-
-    def run(imgs,meta={}):
-        imgs,meta = viewer(imgs,meta)
-        return imgs,meta
-    for imgs in gen:run(imgs)
+    
+    # return gen, pipes
+    for imgs in gen:ImageMatProcessor.run_once(imgs,pipes=pipes)
 
 
 def test_xvsdk_show(output_filename="./out.mp4"):
@@ -351,7 +348,7 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 
     # Create multi-video generator
     gen =  XVSdkRGBDGenerator(
-        color_resolution=XVSdkRGBDGenerator.RGBresolution.RGB_1280x720,
+        color_resolution=XVSdkRGBDGenerator.RGBResolution.RGB_1280x720,
     )
 
     # validate
@@ -365,8 +362,8 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 
 # ========== Usage Example ==========
 if __name__ == "__main__":
-    test_xvsdk_show()
-    # test_vid_show(['./bottom.center.mp4',])
+    # test_xvsdk_show()
+    test_vid_show(['./data/Serene Valley Vista.mp4',])
     # test1()
     # test_build_image_pipeline()
     # test_build_image_pipeline_gpu()
