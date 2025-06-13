@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
 from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import *
+from ImageMat import ImageMat, ImageMatProcessor
 
 class CvDebayerBlock(ImageMatProcessor):
     def __init__(self, format=cv2.COLOR_BAYER_BG2BGR, save_results_to_meta=False):
