@@ -1,15 +1,11 @@
-from typing import Iterator, Optional, Dict, Any, List, Union
-from typing import Optional, Iterator, Tuple, Any
-import numpy as np
-import cv2
-import cv2
-from ImageMat import *
-from shmIO import NumpyUInt8SharedMemoryStreamIO
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from enum import IntEnum
 
 import cv2
 import numpy as np
-from enum import IntEnum
-from typing import Optional, Iterator
+
+from ImageMat import ColorType, ImageMat, ImageMatGenerator
+from shmIO import NumpyUInt8SharedMemoryStreamIO
 
 class VideoFrameGenerator(ImageMatGenerator):
     """
