@@ -1,6 +1,7 @@
 
 # Standard Library Imports
 import enum
+import json
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
@@ -207,19 +208,7 @@ class ImageMatProcessor(BaseModel):
             self.title = self.__class__.__name__
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
         return super().model_post_init(context)
-
-    @staticmethod    
-    def run_once(imgs,meta={},
-            pipes:list['ImageMatProcessor']=[],
-            validate=False):
-        if validate:
-            for fn in pipes:
-                imgs,meta = fn.validate(imgs,meta)
-        else:
-            for fn in pipes:
-                imgs,meta = fn(imgs,meta)
-        return imgs,meta
-
+    
     def on(self):
         self._enable = True
 
@@ -276,57 +265,49 @@ class ImageMatProcessor(BaseModel):
         """Retrieve forwarded images from metadata if stored."""
         return meta.get(self.uuid, None)
 
-class ImageMatGenerator:
-    """
-    Abstract generator for List[ImageMat].
-    """
-    def __init__(self, imgs: List[ImageMat]=None, meta: Dict=None):
-        pass
 
-    def __iter__(self):
-        raise NotImplementedError()
+class ImageMatGenerator(BaseModel):
+    sources: list[str] = str
+    color_types: list[ColorType] = []
+    _resources = []  # General-purpose resource registry
+    _source_generators = []  # General-purpose resource registry
 
-    def __next__(self) -> List['ImageMat']:
-        raise NotImplementedError()
-
-    def reset(self):
-        pass
-
-    def __len__(self):
-        return None
-    
-    def __next_one_raw__(self) -> Any:
-        raise NotImplementedError()
-
-class ImageMatGenerator:
-    """
-    Abstract base class for generating lists of ImageMat objects from various sources.
-    Manages shared resource lifecycle.
-    """
-
-    def __init__(self, sources: list = None, color_types: list = None):
-        self.sources = sources or []
-        self.color_types = color_types or []
-        self._resources = []  # General-purpose resource registry
-        self.source_generators = [self.create_source_generator(src) for src in self.sources]
+    def model_post_init(self, context):
+        self._source_generators = [self.create_source_generator(src) for src in self.sources]
+        return super().model_post_init(context)
 
     def register_resource(self, resource):
         self._resources.append(resource)
 
+    @staticmethod
+    def has_func(obj, name):
+        return callable(getattr(obj, name, None))
+
     def release_resources(self):
-        """
-        Calls .release() on all registered resources if available.
-        """
+        cleanup_methods = [
+            "exit", "end", "teardown",
+            "stop", "shutdown", "terminate",
+            "join", "cleanup", "deactivate",
+            "release", "close", "disconnect",
+            "destroy",
+        ]
+
         for res in self._resources:
-            if hasattr(res, "release") and callable(res.release):
-                res.release()
+            for method in cleanup_methods:
+                if self.has_func(res, method):
+                    try:
+                        getattr(res, method)()
+                    except Exception as e:
+                        print(f"Error during {method} on {res}: {e}")
+
         self._resources.clear()
+
 
     def create_source_generator(self, source):
         raise NotImplementedError("Subclasses must implement `create_source_generator`")
 
     def iterate_raw_images(self):
-        for generator in self.source_generators:
+        for generator in self._source_generators:
             yield from generator
 
     def __iter__(self):

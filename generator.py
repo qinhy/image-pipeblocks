@@ -1,41 +1,59 @@
+import json
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 from enum import IntEnum
+import uuid
 
 import cv2
 import numpy as np
+from pydantic import BaseModel
 
 from ImageMat import ColorType, ImageMat, ImageMatGenerator
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 
-class ImageMatGenerator:
-    """
-    Abstract base class for generating lists of ImageMat objects from various sources.
-    Manages shared resource lifecycle.
-    """
+class ImageMatGenerator(BaseModel):
+    sources: list[str] = str
+    color_types: list[ColorType] = []
+    uuid:str = ''
+    _resources = []  # General-purpose resource registry
+    _source_generators = []  # General-purpose resource registry
 
-    def __init__(self, sources: list = None, color_types: list = None):
-        self.sources = sources or []
-        self.color_types = color_types or []
-        self._resources = []  # General-purpose resource registry
-        self.source_generators = [self.create_source_generator(src) for src in self.sources]
+    def model_post_init(self, context):
+        self._source_generators = [self.create_source_generator(src) for src in self.sources]        
+        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
+        return super().model_post_init(context)
 
     def register_resource(self, resource):
         self._resources.append(resource)
 
+    @staticmethod
+    def has_func(obj, name):
+        return callable(getattr(obj, name, None))
+
     def release_resources(self):
-        """
-        Calls .release() on all registered resources if available.
-        """
+        cleanup_methods = [
+            "exit", "end", "teardown",
+            "stop", "shutdown", "terminate",
+            "join", "cleanup", "deactivate",
+            "release", "close", "disconnect",
+            "destroy",
+        ]
+
         for res in self._resources:
-            if hasattr(res, "release") and callable(res.release):
-                res.release()
+            for method in cleanup_methods:
+                if self.has_func(res, method):
+                    try:
+                        getattr(res, method)()
+                    except Exception as e:
+                        print(f"Error during {method} on {res}: {e}")
+
         self._resources.clear()
+
 
     def create_source_generator(self, source):
         raise NotImplementedError("Subclasses must implement `create_source_generator`")
 
     def iterate_raw_images(self):
-        for generator in self.source_generators:
+        for generator in self._source_generators:
             yield from generator
 
     def __iter__(self):
@@ -43,7 +61,7 @@ class ImageMatGenerator:
 
     def __next__(self):
         for raw_image, color_type in zip(self.iterate_raw_images(), self.color_types):
-            yield ImageMat(raw_image, color_type)
+            yield ImageMat(color_type=color_type).build(raw_image)
 
     def reset_generators(self):
         pass
@@ -98,10 +116,13 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
     """
     Generator that produces synchronized [depth, rgb] ImageMat frames from an XVSDK RGB-D camera.
     """
+    sources:list[str]=[]
+    color_types:list[str]=["bgr", "bgr"]
+    max_frames: Optional[int] = None
 
-    def __init__(self, color_resolution: int = RGBResolution.RGB_1280x720, max_frames: Optional[int] = None):
-        self.color_resolution = color_resolution
-        self.max_frames = max_frames
+    def model_post_init(self, context):
+        
+        self.color_resolution = XVSdkRGBDGenerator.RGBResolution.RGB_1280x720
         self._frame_idx = 0
         self._running = False
         self.rgb_image: Optional[ImageMat] = None
@@ -113,7 +134,7 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
 
         self._start_device()
 
-        super().__init__(sources=[], color_types=["bgr", "bgr"])
+        return super().model_post_init(context)
 
     def _start_device(self):
         """Starts RGB and TOF streams."""
@@ -200,7 +221,6 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
         norm = depth_colored[..., 1].astype(np.float32)
         return norm / 255.0 * (depth_max - depth_min) + depth_min
 
-
 class NumpyUInt8SharedMemoryReader(ImageMatGenerator):
     def __init__(self, stream_key_prefix: str, color_type, array_shapes=[]):
         super().__init__(color_type=color_type)
@@ -218,5 +238,23 @@ class NumpyUInt8SharedMemoryReader(ImageMatGenerator):
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
         return [rd.read() for rd in self.readers]
 
+class ImageMatGenerators(BaseModel):
+    
+    @staticmethod    
+    def dumps(gen:ImageMatGenerator):
+        return json.dumps(gen.model_dump())
+    
+    @staticmethod
+    def loads(gen_json:str)->ImageMatGenerator:
+        gen = {
+            'VideoFrameGenerator':VideoFrameGenerator,
+            'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
+            'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
+        }
+        g = json.loads(gen_json)
+        return gen[f'{g["uuid"].split(":")[0]}'](**g) 
+    
 
+
+    
 

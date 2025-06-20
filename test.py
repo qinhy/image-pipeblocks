@@ -1,5 +1,5 @@
 import json
-from generator import VideoFrameGenerator, XVSdkRGBDGenerator
+from generator import ImageMatGenerators, VideoFrameGenerator, XVSdkRGBDGenerator
 import processors
 from processors import *
 from ImageMat import ImageMat, ColorType
@@ -319,24 +319,24 @@ def test_vid_show(mp4s=[]):
     pipes.append(viewer)
 
     # validate
-    for i, frame_list in enumerate(multi_video_gen):
-        print(f"Step {i}: showing {len(frame_list)} frames")
-        viewer.validate(frame_list,{})
+    for i, imgs in enumerate(multi_video_gen):
+        ImageMatProcessors.run_once(imgs,pipes=pipes,validate=True)
         print("validate complete.")
         break
 
     # dumps
-    print([p.model_dump() for p in pipes])
-    pipes_json = json.dumps([p.model_dump() for p in pipes])
-    del pipes
+    gen_json = ImageMatGenerators.dumps(gen)
+    pipes_json = ImageMatProcessors.dumps(pipes)
+    del pipes,gen
+    print(gen_json)
     print(pipes_json)
 
     # loads
-    pipes = [processors.__dict__[f'{p["uuid"].split(":")[0]}'](**p) 
-             for p in json.loads(pipes_json)]
+    pipes = ImageMatProcessors.loads(pipes_json)
+    gen = ImageMatGenerators.loads(gen_json)
 
     # return gen, pipes
-    for imgs in gen:ImageMatProcessor.run_once(imgs,pipes=pipes)
+    for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
 
 
 def test_xvsdk_show(output_filename="./out.mp4"):
@@ -365,12 +365,12 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 
     # validate
     for i, imgs in enumerate(gen):
-        ImageMatProcessor.run_once(imgs,pipes=pipes,validate=True)
+        ImageMatProcessors.run_once(imgs,pipes=pipes,validate=True)
         print("validate complete.")
         break
 
     # return gen, pipes
-    for imgs in gen:ImageMatProcessor.run_once(imgs,pipes=pipes)
+    for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
 
 # ========== Usage Example ==========
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 
 # Standard Library Imports
 import enum
+import json
 import math
 from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -794,7 +795,6 @@ class CvVideoRecorder(ImageMatProcessor):
         except Exception:
             pass
 
-
 # TODO
 class YOLOBlock(ImageMatProcessor):
     def __init__(
@@ -902,3 +902,40 @@ class YoloRTBlock(YOLOBlock):
         return img
 
 
+
+class ImageMatProcessors(BaseModel):
+    @staticmethod    
+    def dumps(pipes:list[ImageMatProcessor]):
+        return json.dumps([p.model_dump() for p in pipes])
+    
+    @staticmethod
+    def loads(pipes_json:str)->list[ImageMatProcessor]:
+        processors = {
+            'CvDebayerBlock':CvDebayerBlock,
+            'TorchDebayerBlock':TorchDebayerBlock,
+            'TorchRGBToNumpyBGRBlock':TorchRGBToNumpyBGRBlock,
+            'NumpyBGRToTorchRGBBlock':NumpyBGRToTorchRGBBlock,
+            'NumpyBayerToTorchBayerBlock':NumpyBayerToTorchBayerBlock,
+            'TorchResizeBlock':TorchResizeBlock,
+            'CVResizeBlock':CVResizeBlock,
+            'TileNumpyImagesBlock':TileNumpyImagesBlock,
+            'EncodeNumpyToJpegBlock':EncodeNumpyToJpegBlock,
+            'MergeYoloResultsBlock':MergeYoloResultsBlock,
+            'NumpyUInt8SharedMemoryWriter':NumpyUInt8SharedMemoryWriter,
+            'CvImageViewer':CvImageViewer,
+            'CvVideoRecorder':CvVideoRecorder,
+        }
+        return [processors[f'{p["uuid"].split(":")[0]}'](**p) 
+                for p in json.loads(pipes_json)]
+
+    @staticmethod    
+    def run_once(imgs,meta={},
+            pipes:list['ImageMatProcessor']=[],
+            validate=False):
+        if validate:
+            for fn in pipes:
+                imgs,meta = fn.validate(imgs,meta)
+        else:
+            for fn in pipes:
+                imgs,meta = fn(imgs,meta)
+        return imgs,meta
