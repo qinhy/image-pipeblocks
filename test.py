@@ -7,7 +7,7 @@ from ImageMat import ImageMat, ColorType
 def test1():
     # Test ImageMat creation for a Bayer numpy image
     bayer_image = np.random.randint(0, 255, (100, 100), dtype=np.uint8)
-    img_mat = ImageMat(bayer_image, color_type="bayer")
+    img_mat = ImageMat(color_type="bayer").build(bayer_image)
     print("ImageMat created:", img_mat.info)
 
     # Test CvDebayerBlock
@@ -17,21 +17,21 @@ def test1():
 
     # Test TorchResizeBlock
     torch_image = torch.rand(1, 3, 100, 100)
-    img_mat_torch = ImageMat(torch_image, color_type="RGB")
+    img_mat_torch = ImageMat(color_type="RGB").build(torch_image)
     resize_block = TorchResizeBlock(target_size=(50, 50))
     resized_imgs, _ = resize_block.validate([img_mat_torch])
     print("Resized torch image shape:", resized_imgs[0].data().shape)
 
     # Test NumpyBGRToTorchRGBBlock
     bgr_image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
-    img_mat_bgr = ImageMat(bgr_image, color_type="BGR")
+    img_mat_bgr = ImageMat(color_type="BGR").build(bgr_image)
     bgr_to_rgb_block = NumpyBGRToTorchRGBBlock()
     rgb_imgs, _ = bgr_to_rgb_block.validate([img_mat_bgr])
     print("Converted torch RGB image shape:", rgb_imgs[0].data().shape)
 
     # Test TileNumpyImagesBlock
     tile_block = TileNumpyImagesBlock(tile_width=2)
-    images = [ImageMat(np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8), color_type="BGR") for _ in range(4)]
+    images = [ImageMat(color_type="BGR").build(np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)) for _ in range(4)]
     tiled_imgs, _ = tile_block.validate(images)
     print("Tiled image shape:", tiled_imgs[0].data().shape)
     print("All tests passed.")
@@ -39,25 +39,25 @@ def test1():
     print("/n--- Additional Unit Tests ---")
     # 1. Test error on None input for ImageMat
     try:
-        ImageMat(None, color_type="bayer")
+        ImageMat(color_type="bayer").build(None)
         print("ERROR: None input did not raise.")
     except ValueError as e:
-        print("Pass: ImageMat(None, ...) raised ValueError:", str(e))
+        print("Pass: ImageMat(...) raised ValueError:", str(e))
 
     # 2. Test error for unsupported color type in ImageMatInfo
     try:
-        ImageMat(np.zeros((10, 10), dtype=np.uint8), color_type="foo")
+        ImageMat(color_type="foo").build(np.zeros((10, 10), dtype=np.uint8))
         print("ERROR: Unsupported color_type did not raise.")
     except ValueError as e:
         print("Pass: Unsupported color_type raised ValueError:", str(e))
 
     # 3. Test copy for numpy and torch
-    a = ImageMat(np.ones((5, 5), dtype=np.uint8), color_type="grayscale")
+    a = ImageMat(color_type="grayscale").build(np.ones((5, 5), dtype=np.uint8))
     b = a.copy()
     assert np.array_equal(a.data(), b.data()), "Copy failed for numpy"
     print("Pass: ImageMat.copy() for numpy array")
 
-    torch_a = ImageMat(torch.ones(1, 3, 4, 4), color_type="RGB")
+    torch_a = ImageMat(color_type="RGB").build(torch.ones(1, 3, 4, 4))
     torch_b = torch_a.copy()
     assert torch.equal(torch_a.data(), torch_b.data()), "Copy failed for torch"
     print("Pass: ImageMat.copy() for torch tensor")
@@ -77,8 +77,8 @@ def test1():
         print("Pass: NumpyBGRToTorchRGBBlock rejects non-BGR input.")
 
     # 6. Test CVResizeBlock on HW and HWC
-    gray_img = ImageMat(np.random.randint(0, 255, (8, 8), dtype=np.uint8), color_type="grayscale")
-    color_img = ImageMat(np.random.randint(0, 255, (8, 8, 3), dtype=np.uint8), color_type="BGR")
+    gray_img = ImageMat(color_type="grayscale").build(np.random.randint(0, 255, (8, 8), dtype=np.uint8))
+    color_img = ImageMat(color_type="BGR").build(np.random.randint(0, 255, (8, 8, 3), dtype=np.uint8))
     cvresize = CVResizeBlock(target_size=(4, 4))
     imgs, _ = cvresize.validate([gray_img, color_img])
     assert imgs[0].data().shape == (4, 4) or imgs[0].data().shape == (4, 4, 3)
@@ -105,7 +105,7 @@ def test1():
 
     # 9. TorchRGBToNumpyBGRBlock: accept torch RGB, error for wrong shape
     rgb_tensor = torch.rand(1, 3, 20, 20)
-    rgb_img = ImageMat(rgb_tensor, "RGB")
+    rgb_img = ImageMat(color_type="RGB").build(rgb_tensor)
     out, _ = TorchRGBToNumpyBGRBlock().validate([rgb_img])
     assert out[0].data().shape == (20, 20, 3)
     print("Pass: TorchRGBToNumpyBGRBlock converts to numpy BGR.")
@@ -117,7 +117,7 @@ def test1():
         print("Pass: TorchRGBToNumpyBGRBlock rejects numpy input.")
 
     # 10. NumpyBayerToTorchBayerBlock works and errors
-    bayer_np = ImageMat(np.random.randint(0, 255, (10, 10), dtype=np.uint8), "bayer")
+    bayer_np = ImageMat(color_type="bayer").build(np.random.randint(0, 255, (10, 10), dtype=np.uint8))
     result, _ = NumpyBayerToTorchBayerBlock().validate([bayer_np])
     assert isinstance(result[0].data(), torch.Tensor)
     print("Pass: NumpyBayerToTorchBayerBlock converts Bayer.")
@@ -130,7 +130,7 @@ def test1():
 
     # 11. MergeYoloResultsBlock: no result in meta, returns as is
     merge = MergeYoloResultsBlock(yolo_results_uuid="not-in-meta")
-    input_imgs = [ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "BGR")]
+    input_imgs = [ImageMat(color_type="BGR").build(np.zeros((10, 10, 3), dtype=np.uint8))]
     out, meta = merge(input_imgs, {})
     assert out == input_imgs
     print("Pass: MergeYoloResultsBlock returns input if no YOLO results in meta.")
@@ -155,7 +155,7 @@ def build_image_pipeline(
     def init(bayer_images):
         meta = {}
         # 1. Wrap Bayer images as ImageMat objects
-        bayer_mats = [ImageMat(img, color_type="bayer") for img in bayer_images]
+        bayer_mats = [ImageMat(color_type="bayer").build(img) for img in bayer_images]
         return bayer_mats,meta
     
     bayer_mats,meta = init(bayer_images)
@@ -221,7 +221,7 @@ def build_image_pipeline_gpu(
 
     def init(bayer_images):
         meta = {}
-        bayer_mats = [ImageMat(img, color_type="bayer") for img in bayer_images]
+        bayer_mats = [ImageMat(color_type="bayer").build(img) for img in bayer_images]
         return bayer_mats, meta
 
     bayer_mats, meta = init(bayer_images)
@@ -376,6 +376,6 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 if __name__ == "__main__":
     # test_xvsdk_show()
     test_vid_show(['./data/Serene Valley Vista.avi',])
-    # test1()
-    # test_build_image_pipeline()
-    # test_build_image_pipeline_gpu()
+    test1()
+    test_build_image_pipeline()
+    test_build_image_pipeline_gpu()

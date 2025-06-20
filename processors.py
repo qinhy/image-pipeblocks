@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 from ImageMat import ImageMat, ImageMatProcessor
 from pydantic import BaseModel, Field
+from PIL import Image
 
 class CvDebayerBlock(ImageMatProcessor):
     title:str='cv_debayer'
@@ -56,7 +57,7 @@ class CvDebayerBlock(ImageMatProcessor):
         # Perform debayering after validation
         output_color_type = self.get_output_color_type()        
         debayered_imgs = self.forward_raw([img.data() for img in imgs])
-        self.out_mats = [ImageMat(i, color_type=output_color_type) for i in debayered_imgs]
+        self.out_mats = [ImageMat(color_type=output_color_type).build(i) for i in debayered_imgs]
         return self.forward(validated_imgs, meta)
     
     def forward_raw(self,imgs_data)->List[np.ndarray]:
@@ -245,7 +246,7 @@ class TorchDebayerBlock(ImageMatProcessor):
     
         # Perform debayering after validation
         debayered_imgs = self.forward_raw([img.data() for img in imgs])
-        self.out_mats = [ImageMat(i, color_type="RGB") for i in debayered_imgs]
+        self.out_mats = [ImageMat(color_type="RGB").build(i) for i in debayered_imgs]
         processed_imgs, meta = self.forward(imgs, meta)
         return processed_imgs, meta
     
@@ -278,7 +279,7 @@ class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type="BGR") for img in converted_imgs]
+        self.out_mats = [ImageMat(color_type="BGR").build(img) for img in converted_imgs]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[torch.Tensor]) -> List[np.ndarray]:
@@ -351,7 +352,7 @@ class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type="RGB") for img in converted_imgs]
+        self.out_mats = [ImageMat(color_type="RGB").build(img) for img in converted_imgs]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[torch.Tensor]:
@@ -402,7 +403,7 @@ class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type="bayer") for img in converted_imgs]
+        self.out_mats = [ImageMat(color_type="bayer").build(img) for img in converted_imgs]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[torch.Tensor]:
@@ -437,7 +438,7 @@ class TorchResizeBlock(ImageMatProcessor):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type=validated_imgs[i].info.color_type) for i,img in enumerate(converted_imgs)]
+        self.out_mats = [ImageMat(color_type=validated_imgs[i].info.color_type).build(img) for i,img in enumerate(converted_imgs)]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -470,7 +471,7 @@ class CVResizeBlock(ImageMatProcessor):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type=validated_imgs[i].info.color_type
+        self.out_mats = [ImageMat(color_type=validated_imgs[i].info.color_type).build(img
                                   ) for i,img in enumerate(converted_imgs)]
         return self.forward(validated_imgs, meta)
 
@@ -557,7 +558,7 @@ class TileNumpyImagesBlock(ImageMatProcessor):
         imgs_data = [img.data() for img in validated_imgs]
         self.layout = self._init_layout(imgs_data)
         tiled_imgs = self.forward_raw(imgs_data)
-        self.out_mats = [ImageMat(tiled_imgs[0], color_type=imgs[0].info.color_type)]
+        self.out_mats = [ImageMat(color_type=imgs[0].info.color_type).build(tiled_imgs[0])]
         return self.forward(validated_imgs, meta)
 
     def forward_raw(self, imgs_data: list[np.ndarray]) -> list[np.ndarray]:
@@ -794,6 +795,100 @@ class CvVideoRecorder(ImageMatProcessor):
             self.stop()
         except Exception:
             pass
+
+
+class NumpyImageMaskBlock(ImageMatProcessor):
+    title: str = "numpy_image_mask"
+    mask_image_path: Optional[str] = None
+    mask_color: str = "#00000080"
+    mask_split: Tuple[int, int] = (2, 2)
+
+    def model_post_init(self, context: Any) -> None:
+        self._masks = self._make_mask_images(self.mask_image_path, self.mask_split, self.mask_color)
+        if self._masks is None:
+            print('[NumpyImageMaskBlock] Warning: no mask image loaded. This block will do nothing.')
+        return super().model_post_init(context)
+
+    def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
+        """Convert a grayscale mask to an RGBA image with the specified color."""
+        select_color = np.array(hex2rgba(hex_color), dtype=np.uint8)
+        background = np.array([255, 255, 255, 0], dtype=np.uint8)
+
+        condition = gray_mask_img == 0
+        condition = condition[..., None]
+        color_mask_img = np.where(condition, select_color, background)
+
+        return Image.fromarray(cv2.cvtColor(color_mask_img, cv2.COLOR_BGRA2RGBA))
+
+    def _make_mask_images(self, mask_image_path: Optional[str], mask_split: Tuple[int, int], preview_color: str):
+        if mask_image_path is None:
+            return None
+
+        mask_image = cv2.imread(mask_image_path, cv2.IMREAD_COLOR)
+        if mask_image is None:
+            raise ValueError(f"Unable to read mask image from {mask_image_path}")
+
+        # Split mask into sub-masks
+        try:
+            mask_images = [
+                sub_mask
+                for row in np.split(mask_image, mask_split[0], axis=0)
+                for sub_mask in np.split(row, mask_split[1], axis=1)
+            ]
+        except ValueError:
+            print("Error: Invalid mask split configuration.")
+            return None
+
+        # Convert to grayscale and apply preview color
+        gray_masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
+        preview_masks = [self.gray2rgba_mask_image(gray, preview_color) for gray in gray_masks]
+
+        return {"original": gray_masks, "preview": preview_masks}
+
+    def _adjust_mask(self, images: List[np.ndarray]):
+        w,h,c = self._img_w_h_c(images[0])
+            
+        self._masks["resized_masks"] = [
+            cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST)
+            for mask in self._masks["original"]
+        ]
+        # print([i.shape for i in self._masks["resized_masks"]])
+
+        self._masks["resized_masks"] = [
+            mask if len(mask.shape) > len(image.shape) else
+            np.expand_dims(mask, axis=-1)
+            for image, mask in zip(images, self._masks["resized_masks"])
+        ]
+        # print([i.shape for i in self._masks["resized_masks"]])
+        
+        self._masks["resized_masks"] = [
+            mask if mask.shape[-1] == c else
+            mask.repeat(c, axis=-1) 
+            for mask in self._masks["resized_masks"]
+        ]
+        # print([i.shape for i in self._masks["resized_masks"]])
+
+    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
+        self.input_mats = [i for i in imgs]
+        validated_imgs:List[ImageMat] = []
+
+        for img in imgs:
+            img.require_ndarray()
+            img.require_np_uint()
+            validated_imgs.append(img)
+
+        self._adjust_mask([img.data() for img in validated_imgs])
+        masked_imgs = self.forward_raw([img.data() for img in validated_imgs])
+        self.out_mats = [ImageMat(color_type=old.info.color_type).build(img) for img, old in zip(masked_imgs, validated_imgs)]
+
+        return self.forward(validated_imgs, meta)
+
+    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
+        if self._masks is None:
+            return imgs_data
+
+        masks = self._masks["resized_masks"]
+        return [cv2.bitwise_and(image, mask) for image, mask in zip(imgs_data, masks)]
 
 # TODO
 class YOLOBlock(ImageMatProcessor):
