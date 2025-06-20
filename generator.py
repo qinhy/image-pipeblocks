@@ -1,7 +1,11 @@
 import json
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
-from enum import IntEnum
+import os
+import sys
+import glob
 import uuid
+import platform
+from enum import IntEnum
+from typing import Iterator, List, Optional
 
 import cv2
 import numpy as np
@@ -10,20 +14,25 @@ from pydantic import BaseModel, Field
 from ImageMat import ColorType, ImageMat, ImageMatGenerator
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 
+
 class ImageMatGenerator(BaseModel):
     sources: list[str] = Field(default_factory=list)
     color_types: list['ColorType'] = Field(default_factory=list)
     uuid: str = ''
-    
+
     _resources: list = []
-    _source_generators: list = []
+    _frame_generators: list = []
+    _mats:list[ImageMat] = []
 
     def model_post_init(self, __context) -> None:
-        self._source_generators = [self.create_source_generator(src) for src in self.sources]
+        self._frame_generators = [self.create_frame_generator(src) for src in self.sources]
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
+        self._mats = [ImageMat(color_type=color_type).build(next(gen))
+                      for gen,color_type in zip(self._frame_generators, self.color_types)]
 
     def register_resource(self, resource):
         self._resources.append(resource)
+        return resource
 
     @staticmethod
     def has_func(obj, name):
@@ -48,23 +57,27 @@ class ImageMatGenerator(BaseModel):
 
         self._resources.clear()
 
-
-    def create_source_generator(self, source):
-        raise NotImplementedError("Subclasses must implement `create_source_generator`")
-
-    def iterate_raw_images(self):
-        for generator in self._source_generators:
-            yield from generator
+    def create_frame_generator(self, source):
+        raise NotImplementedError("Subclasses must implement `create_frame_generator`")
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        for raw_image, color_type in zip(self.iterate_raw_images(), self.color_types):
-            yield ImageMat(color_type=color_type).build(raw_image)
-
+        try:
+            frames = [next(frame_gen)
+                      for frame_gen in self._frame_generators]
+            if not frames or any(f is None for f in frames):
+                raise StopIteration
+            for frame, mat in zip(frames, self._mats):
+                mat.unsafe_update_mat(frame)
+            return self._mats
+        except StopIteration:
+            raise StopIteration
+    
     def reset_generators(self):
-        pass
+        self.release_resources()
+        self._frame_generators = [self.create_frame_generator(src) for src in self.sources]
 
     def release(self):
         self.release_resources()
@@ -72,35 +85,18 @@ class ImageMatGenerator(BaseModel):
     def __del__(self):
         self.release()
 
-
 class VideoFrameGenerator(ImageMatGenerator):
-    """
-    Generator that uses cv2.VideoCapture to yield frames from video sources.
-    """
-    def create_source_generator(self, source):
-        cap = cv2.VideoCapture(source)
+    def create_frame_generator(self, source):
+        cap = self.register_resource(cv2.VideoCapture(source))
         if not cap.isOpened():
             raise ValueError(f"Cannot open video source: {source}")
-        self.register_resource(cap)
-        return cap
-
-    def __next__(self):
-        results = []
-        for cap, color_type in zip(self._resources, self.color_types):
-            if not cap.isOpened():
-                continue
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            results.append(ImageMat(color_type=color_type).build(frame))
-        if not results:
-            raise StopIteration
-        return results
-
-    def reset_generators(self):
-        self.release_resources()
-        self._source_generators = [self.create_source_generator(src) for src in self.sources]
-
+        def gen(cap=cap):
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: break
+                yield frame
+        return gen()
+    
 class XVSdkRGBDGenerator(ImageMatGenerator):
     class RGBResolution(IntEnum):
         RGB_1920x1080 = 0
@@ -234,6 +230,146 @@ class NumpyUInt8SharedMemoryReader(ImageMatGenerator):
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
         return [rd.read() for rd in self.readers]
 
+class BitFlowFrameGenerator(ImageMatGenerator):
+    class BitFlowCamera:
+        """
+        BitFlow Camera class for interfacing with a BitFlow frame grabber.
+        """
+
+        def __init__(self, video_src='bitflow-0', num_buffers=10):
+            """
+            Initializes the BitFlow Camera.
+
+            Args:
+                video_src (str): Video source identifier (e.g., 'bitflow-0').
+                num_buffers (int): Number of image buffers to allocate.
+            """
+            self.video_src = video_src
+            self.num_buffers = num_buffers
+            self.CirAq, self.BufArray = None, None
+            self.channel = int(self.video_src.split('-')[1]) if '-' in self.video_src else 0
+
+            self._initialize_dlls()
+            self._initialize_camera_params()
+            self._initialize_camera()
+
+        def _initialize_dlls(self):
+            """Handles DLL setup for Windows, auto-searching for SDK paths."""
+            if platform.system() != 'Windows' or sys.version_info < (3, 8):
+                return
+
+            sdk_paths = [r"C:\BitFlow SDK*", r"C:\Program Files\BitFlow SDK*"]
+            serial_paths = [r"C:\Program Files\CameraLink\Serial", r"C:\Program Files (x86)\CameraLink\Serial"]
+
+            sdk_path = next((os.path.join(path, "Bin64") for path in sorted(glob.glob(sdk_paths[0]), reverse=True) if os.path.exists(path)), None)
+            serial_path = next((path for path in serial_paths if os.path.exists(path)), None)
+
+            if sdk_path:
+                os.add_dll_directory(sdk_path)
+            else:
+                print(f"Warning: BitFlow SDK not found.")
+
+            if serial_path:
+                os.add_dll_directory(serial_path)
+            else:
+                print(f"Warning: CameraLink Serial directory not found.")
+
+        def _initialize_camera_params(self):
+            from BFModule import BFGTLUtils as BFGTL
+
+            """Initializes camera parameters."""
+            dev = BFGTL.BFGTLDevice()
+            try:
+                dev.Open(self.channel)
+                self.fps = self.get_camera_param(dev, 'AcquisitionFrameRate')
+                self.width = self.get_camera_param(dev, 'Width')
+                self.height = self.get_camera_param(dev, 'Height')
+            except Exception as e:
+                print(f"Error reading parameter: {e}")
+            finally:
+                dev.Close()
+
+        def _initialize_camera(self):
+            from BFModule import BufferAcquisition as Buf
+
+            """Initializes the BitFlow frame grabber and sets up acquisition."""
+            try:
+                self.CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                self.CirAq.Open(self.channel)
+
+                self.BufArray = self.CirAq.BufferSetup(self.num_buffers)
+                self.CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                self.CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
+            except Exception as e:
+                print(f"Error initializing BitFlow camera: {e}")
+                self.close()
+                raise
+
+
+        def get_camera_param(self, dev, param_name):
+            from BFModule import BFGTLUtils as BFGTL
+            """
+            Return the value of the requested parameter node.
+            (Assumes 'dev' is already open and accessible.)
+            """
+
+            # Attempt to retrieve the node by name
+            node = dev.getNode(param_name)
+            
+            # Check access permission
+            if node.NodeAccess not in (BFGTL.BFGTLAccess.RO, BFGTL.BFGTLAccess.RW):
+                raise RuntimeError(f"Node '{param_name}' is not readable.")
+
+            # Check node type and return the appropriate value
+            node_type = node.NodeType
+            if node_type == BFGTL.BFGTLNodeType.Float:
+                return BFGTL.FloatNode(node).FloatValue
+            elif node_type == BFGTL.BFGTLNodeType.Integer:
+                return BFGTL.IntegerNode(node).IntValue
+            elif node_type == BFGTL.BFGTLNodeType.Boolean:
+                return BFGTL.BooleanNode(node).BooleanValue
+            elif node_type == BFGTL.BFGTLNodeType.String:
+                return BFGTL.StringNode(node).StrValue
+            elif node_type == BFGTL.BFGTLNodeType.Enumeration:
+                return BFGTL.EnumerationNode(node).EntrySymbolic
+            elif node_type == BFGTL.BFGTLNodeType.EnumEntry:
+                enum_entry = BFGTL.EnumEntryNode(node)
+                return (enum_entry.getValue, enum_entry.getSymbolic)
+            else:
+                raise TypeError(
+                    f"Node '{param_name}' has an unhandled node type: {node_type}")
+                    
+        def read(self):
+            """Reads the next frame from the BitFlow buffer."""
+            if self.CirAq and self.CirAq.GetAcqStatus().Start:
+                curBuf = self.CirAq.WaitForFrame(1000)
+                return self.BufArray[curBuf.BufferNumber]
+            return None
+
+        def close(self):
+            """Cleans up and closes the camera connection."""
+            if self.CirAq:
+                self.CirAq.AqCleanup()
+                self.CirAq.BufferCleanup()
+                self.CirAq.Close()
+                self.CirAq = None
+
+    """
+    Frame generator for multiple BitFlow cameras.
+    """
+    sources:list[str] = ['bitflow-0']
+    _resources:list['BitFlowFrameGenerator.BitFlowCamera'] = []
+    _frame_generators: list = []    
+    _mats:list[ImageMat] = []
+
+    def create_frame_generator(self, source):
+        try:
+            self.color_types = [ColorType.BAYER for _ in range(len(self.sources))]
+            return self.register_resource(BitFlowFrameGenerator.BitFlowCamera(source))
+        except Exception as e:
+            self.release()
+            raise e
+        
 class ImageMatGenerators(BaseModel):
     
     @staticmethod    
@@ -246,6 +382,7 @@ class ImageMatGenerators(BaseModel):
             'VideoFrameGenerator':VideoFrameGenerator,
             'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
             'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
+            'BitFlowFrameGenerator':BitFlowFrameGenerator,
         }
         g = json.loads(gen_json)
         return gen[f'{g["uuid"].split(":")[0]}'](**g) 
