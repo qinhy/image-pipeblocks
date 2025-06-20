@@ -29,8 +29,15 @@ COLOR_TYPE_CHANNELS = {
 }
 
 class ImageMatInfo(BaseModel):
+
+    class TorchDtype(BaseModel):
+        is_floating_point: bool
+        is_complex: bool
+        is_signed: bool
+        itemsize: int
+
     type: Optional[str] = None
-    dtype: Optional[Union[np.dtype, torch.dtype]] = None
+    _dtype: Optional[Union[np.dtype, TorchDtype]] = None
     device: str = ''
     shape_type: Optional[ShapeType] = None
     max_value: Optional[Union[int, float]] = None
@@ -42,10 +49,8 @@ class ImageMatInfo(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True}
 
-    def __init__(self, img_data: Union[np.ndarray, torch.Tensor],
-                  color_type: Union[str, ColorType], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
+    def build(self, img_data: Union[np.ndarray, torch.Tensor],
+                  color_type: Union[str, ColorType]):
         # Parse color_type to Enum
         try:
             color_type = ColorType(color_type)
@@ -56,7 +61,7 @@ class ImageMatInfo(BaseModel):
         self.type = type(img_data).__name__
 
         if isinstance(img_data, np.ndarray):
-            self.dtype = img_data.dtype
+            self._dtype = img_data.dtype
             self.device = "cpu"
             self.max_value = 255 if img_data.dtype == np.uint8 else 1.0
 
@@ -71,7 +76,7 @@ class ImageMatInfo(BaseModel):
                 raise ValueError("NumPy array must be 2D (HW) or 3D (HWC).")
 
         elif isinstance(img_data, torch.Tensor):
-            self.dtype = img_data.dtype
+            self._dtype = img_data.dtype
             self.device = str(img_data.device)
             self.max_value = 1.0
 
@@ -94,24 +99,32 @@ class ImageMatInfo(BaseModel):
                 )
         self.color_type = color_type
 
-class ImageMat(BaseModel):
-    info: Optional[ImageMatInfo] = None
-    color_type: Union[str, ColorType] = None
+        return self
 
-    def __init__(self, img_data: Union[np.ndarray, torch.Tensor], 
-                 color_type: Union[str, ColorType], info: Optional[ImageMatInfo] = None):
-        super().__init__(info=info,color_type=color_type)
+class ImageMat(BaseModel):
+
+    class TorchDtype(BaseModel):
+        is_floating_point: bool
+        is_complex: bool
+        is_signed: bool
+        itemsize: int
+
+    info: Optional[ImageMatInfo] = None
+    color_type: Union[str, ColorType]
+
+    def build(self, img_data: Union[np.ndarray, torch.Tensor], info: Optional[ImageMatInfo] = None):
         if img_data is None:
             raise ValueError("img_data cannot be None")
-        self.info = info or ImageMatInfo(img_data, color_type=color_type)
+        self.info = info or ImageMatInfo().build(img_data, color_type=self.color_type)
         self._img_data = img_data
+        return self
 
     def copy(self) -> 'ImageMat':
         """Return a deep copy of the ImageMat object."""
         if isinstance(self._img_data, np.ndarray):
-            return ImageMat(self._img_data.copy(), color_type=self.info.color_type)
+            return ImageMat(color_type=self.info.color_type).build(self._img_data.copy())
         elif isinstance(self._img_data, torch.Tensor):
-            return ImageMat(self._img_data.clone(), color_type=self.info.color_type)
+            return ImageMat(color_type=self.info.color_type).build(self._img_data.clone())
         else:
             raise TypeError("img_data must be np.ndarray or torch.Tensor")
 
@@ -178,16 +191,16 @@ class ImageMatProcessor(BaseModel):
     class MetaData(BaseModel):
         model_config = {"arbitrary_types_allowed": True}
         
-    title:str = ''
+    title:str
     uuid:str = ''
     save_results_to_meta:bool = False
     _enable:bool = True
     meta:dict = {}
     input_mats: List[ImageMat] = []
     out_mats: List[ImageMat] = []
-
-    def __init__(self,title='', save_results_to_meta=False):
-        super().__init__(title=title,save_results_to_meta=save_results_to_meta)
+    num_devices:list[str] = ['cpu']
+    num_gpus:int = 0
+    _enable:bool = True
 
     def model_post_init(self, context: Any, /) -> None:
         if len(self.title)==0:
@@ -248,8 +261,7 @@ class ImageMatProcessor(BaseModel):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(img, color_type=old.info.color_type
-                                  ) for old,img in zip(validated_imgs,converted_imgs)]        
+        self.out_mats = [ImageMat(color_type=old.info.color_type).build(img) for old,img in zip(validated_imgs,converted_imgs)]
         return self.forward(validated_imgs, meta)
     
     def forward_raw(self, imgs: List[Any]) -> List["Any"]:
@@ -322,7 +334,7 @@ class ImageMatGenerator:
 
     def __next__(self):
         for raw_image, color_type in zip(self.iterate_raw_images(), self.color_types):
-            yield ImageMat(raw_image, color_type)
+            yield ImageMat(color_type=color_type).build(raw_image)
 
     def reset_generators(self):
         pass

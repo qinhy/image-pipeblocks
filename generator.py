@@ -71,13 +71,13 @@ class VideoFrameGenerator(ImageMatGenerator):
     def __next__(self):
         results = []
         resources:list[cv2.VideoCapture] = self._resources
-        for cap, color_mode in zip(resources, self.color_types):
+        for cap, color_type in zip(resources, self.color_types):
             if not cap.isOpened():
                 continue
             ret, frame = cap.read()
             if not ret:
                 continue
-            results.append(ImageMat(frame, color_mode))
+            results.append(ImageMat(color_type=color_type).build(frame))
         if not results:
             raise StopIteration
         return results

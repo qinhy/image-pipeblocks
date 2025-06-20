@@ -13,13 +13,12 @@ import torch
 import torch.nn.functional as F
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 from ImageMat import ImageMat, ImageMatProcessor
+from pydantic import BaseModel, Field
 
 class CvDebayerBlock(ImageMatProcessor):
-    def __init__(self, format=cv2.COLOR_BAYER_BG2BGR, save_results_to_meta=False):
-        super().__init__('cv_debayer',save_results_to_meta)
-        self.format = format
-        self.save_results_to_meta = save_results_to_meta
-
+    title:str='cv_debayer'
+    format:int=cv2.COLOR_BAYER_BG2BGR
+        
     def get_output_color_type(self):
         """Determine output color type based on the OpenCV conversion format."""
         bayer_to_color_map = {
@@ -221,18 +220,14 @@ class TorchDebayerBlock(ImageMatProcessor):
         # - Implements **Malvar-He-Cutler** algorithm for Bayer interpolation.
         # - Supports **different Bayer layouts** (`RGGB`, `GRBG`, `GBRG`, `BGGR`).
         # - Uses **fixed convolution kernels** for demosaicing.
-
-    def __init__(self, save_results_to_meta=False):
-        super().__init__('torch_debayer',save_results_to_meta)
-        self.num_devices = self.devices_info()  # Number of GPUs available for processing
-        self.save_results_to_meta = save_results_to_meta
-        self.debayer_models:List[TorchDebayerBlock.Debayer5x5] = []
-        self.input_devices = []  # To track device of each input tensor
+    title:str='torch_debayer'
+    _debayer_models:List['TorchDebayerBlock.Debayer5x5'] = []
+    _input_devices = []  # To track device of each input tensor
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """Validate input images and initialize debayer models."""
         self.input_mats = [i for i in imgs]
-        self.input_devices = []
+        self._input_devices = []
 
         for img in self.input_mats:
             img.require_torch_tensor()
@@ -240,11 +235,11 @@ class TorchDebayerBlock(ImageMatProcessor):
             img.require_BAYER()
 
             # Save input device for tracking
-            self.input_devices.append(img.info.device)
+            self._input_devices.append(img.info.device)
 
             # Initialize and store model on the corresponding device
-            model = TorchDebayerBlock.Debayer5x5().to(img.info.device).to(img.info.dtype)
-            self.debayer_models.append(model)
+            model = TorchDebayerBlock.Debayer5x5().to(img.info.device).to(img.info._dtype)
+            self._debayer_models.append(model)
     
     
         # Perform debayering after validation
@@ -256,15 +251,15 @@ class TorchDebayerBlock(ImageMatProcessor):
     def forward_raw(self,imgs_data:List[torch.Tensor])->List[torch.Tensor]:
         debayered_imgs = []
         for i, img in enumerate(imgs_data):
-            model = self.debayer_models[i % len(self.debayer_models)]  # Fetch model from pre-assigned list
+            model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
             debayered_imgs.append(model(img))
         return debayered_imgs
 
 class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
-    def __init__(self, save_results_to_meta=False):
-        super().__init__('torch_rgb_to_numpy_bgr',save_results_to_meta)
+    title:str='torch_rgb_to_numpy_bgr'
+    def model_post_init(self, context):
         self.num_devices = self.devices_info()  # Number of available GPUs
-        self.save_results_to_meta = save_results_to_meta
+        return super().model_post_init(context)
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -302,21 +297,42 @@ class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
         return bgr_images
 
 class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
-    def __init__(self, dtype=None, save_results_to_meta=False,gpu=True,multi_gpu=-1):
-        super().__init__('numpy_bgr_to_torch_rgb',save_results_to_meta)
-        self.num_devices = self.devices_info(gpu=gpu,multi_gpu=multi_gpu)
-        self.dtype = dtype if dtype else torch.float32
-        self.save_results_to_meta = save_results_to_meta
+    title:str='numpy_bgr_to_torch_rgb'
+    gpu:bool=True
+    multi_gpu:int=-1
+    torch_dtype:ImageMat.TorchDtype = torch.float32
+    _tensor_models:list = []
 
+    def model_post_init(self, context):
+        self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
         # Model function to convert BGR numpy to Torch RGB tensor
-        def get_model(device, dtype=self.dtype):
-            return lambda img: torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device
-                                            ).div(255.0).permute(2, 0, 1).unsqueeze(0)
+        def get_model(device, dtype=self.torch_dtype):
+            def model(img:np.ndarray):
+                return torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device
+                                    ).div(255.0).permute(2, 0, 1).unsqueeze(0)
+            return model
 
-        self.tensor_models = []
+        self._tensor_models = []
         for device in self.num_devices:
             model = get_model(device)
-            self.tensor_models.append((model, device))
+            self._tensor_models.append((model, device))
+        return super().model_post_init(context)
+    
+    # def __init__(self, dtype=None, save_results_to_meta=False,gpu=True,multi_gpu=-1):
+    #     super().__init__(title='numpy_bgr_to_torch_rgb',save_results_to_meta=save_results_to_meta)
+    #     self.num_devices = self.devices_info(gpu=gpu,multi_gpu=multi_gpu)
+    #     self.torch_dtype = dtype if dtype else torch.float32
+    #     self.save_results_to_meta = save_results_to_meta
+
+    #     # Model function to convert BGR numpy to Torch RGB tensor
+    #     def get_model(device, dtype=self.torch_dtype):
+    #         return lambda img: torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device
+    #                                         ).div(255.0).permute(2, 0, 1).unsqueeze(0)
+
+    #     self._tensor_models = []
+    #     for device in self.num_devices:
+    #         model = get_model(device)
+    #         self._tensor_models.append((model, device))
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -343,28 +359,31 @@ class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
         """
         torch_images = []
         for i, img in enumerate(imgs_data):
-            device = self.tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self.dtype, device=device
+            device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
+            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self.torch_dtype, device=device
                                       ).div(255.0).permute(2, 0, 1).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
 class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
-    def __init__(self, dtype=None, save_results_to_meta=False,gpu=True,multi_gpu=-1):
-        super().__init__('numpy_bayer_to_torch_bayer',save_results_to_meta)
-        self.num_devices = self.devices_info(gpu=gpu,multi_gpu=multi_gpu)
-        self.dtype = dtype if dtype else torch.float32
-        self.save_results_to_meta = save_results_to_meta
+    title:str='numpy_bayer_to_torch_bayer'
+    gpu:bool=True
+    multi_gpu:int=-1
+    torch_dtype:ImageMat.TorchDtype = torch.float32
+    _tensor_models:list = []
 
-        # Model function to convert Bayer numpy to Torch Bayer tensor
-        def get_model(device, dtype=self.dtype):
-            return lambda img: torch.tensor(img.copy(), dtype=dtype, device=device
+    def model_post_init(self, context):
+        self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
+
+        def get_model(device, dtype=self.torch_dtype):
+            def model(img:np.ndarray):
+                return torch.tensor(img.copy(), dtype=dtype, device=device
                                     ).div(255.0).unsqueeze(0).unsqueeze(0)
-
-        self.tensor_models = []
+            return model
+        self._tensor_models = []
         for device in self.num_devices:
             model = get_model(device)
-            self.tensor_models.append((model, device))
+            self._tensor_models.append((model, device))
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -391,26 +410,16 @@ class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
         """
         torch_images = []
         for i, img in enumerate(imgs_data):
-            device = self.tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img.copy(), dtype=self.dtype, device=device
+            device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
+            tensor_img = torch.tensor(img.copy(), dtype=self.torch_dtype, device=device
                                     ).div(255.0).unsqueeze(0).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
 class TorchResizeBlock(ImageMatProcessor):
-    def __init__(self, target_size: Tuple[int, int], mode="bilinear", save_results_to_meta=False):
-        """
-        Initializes the TorchResizeBlock for resizing images.
-
-        Args:
-            target_size (Tuple[int, int]): (height, width) for the resized images.
-            mode (str): Interpolation mode ('bilinear', 'nearest', 'bicubic', etc.).
-            save_results_to_meta (bool): Whether to store resized images in metadata.
-        """
-        super().__init__('torch_resize')
-        self.target_size = target_size
-        self.mode = mode
-        self.save_results_to_meta = save_results_to_meta
+    title:str='torch_resize'
+    target_size:Tuple[int, int]
+    mode:str="bilinear"
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -441,20 +450,9 @@ class TorchResizeBlock(ImageMatProcessor):
         return resized_images
 
 class CVResizeBlock(ImageMatProcessor):
-    def __init__(self, target_size: Tuple[int, int], interpolation=cv2.INTER_LINEAR,
-                  save_results_to_meta=False):
-        """
-        Initializes the CVResizeBlock for resizing images using OpenCV.
-
-        Args:
-            target_size (Tuple[int, int]): (height, width) for the resized images.
-            interpolation (int): OpenCV interpolation method.
-            save_results_to_meta (bool): Whether to store resized images in metadata.
-        """
-        super().__init__('cv_resize')
-        self.target_size = target_size
-        self.interpolation = interpolation
-        self.save_results_to_meta = save_results_to_meta
+    title:str='cv_resize',
+    target_size: Tuple[int, int]
+    interpolation:int=cv2.INTER_LINEAR
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -487,19 +485,24 @@ class CVResizeBlock(ImageMatProcessor):
         return resized_images
     
 class TileNumpyImagesBlock(ImageMatProcessor):
-    def __init__(self, tile_width: int, save_results_to_meta=False):
-        super().__init__('tile_numpy_images', save_results_to_meta)
-        self.tile_width = tile_width
-        self.save_results_to_meta = save_results_to_meta
-        self.layout = {}
+    class Layout(BaseModel):
+        tile_width:int
+        tile_height:int
+
+        col_widths:list[int]
+        row_heights:list[int]
+
+        total_width:int
+        total_height:int
+
+        channels:int # 1, 3
+        _canvas:Any
+
+    title:str='tile_numpy_images'
+    tile_width:int
+    layout:Optional[Layout] = None
 
     def _init_layout(self, imgs_data):
-        """
-        Calculate tiling grid parameters and create canvas.
-        Returns:
-            dict with keys: tile_width, tile_height, col_widths, row_heights,
-            total_width, total_height, channels, canvas
-        """
         num_images = len(imgs_data)
         tile_width = self.tile_width
         tile_height = math.ceil(num_images / tile_width)
@@ -525,16 +528,16 @@ class TileNumpyImagesBlock(ImageMatProcessor):
         else:
             canvas = np.zeros((total_height, total_width, channels), dtype=imgs_data[0].dtype)
 
-        return {
-            "tile_width": tile_width,
-            "tile_height": tile_height,
-            "col_widths": col_widths,
-            "row_heights": row_heights,
-            "total_width": total_width,
-            "total_height": total_height,
-            "channels": channels,
-            "canvas": canvas
-        }
+        layout =  TileNumpyImagesBlock.Layout(
+            tile_width=tile_width,
+            tile_height=tile_height,
+            col_widths=col_widths,
+            row_heights=row_heights,
+            total_width=total_width,
+            total_height=total_height,
+            channels=channels)
+        layout._canvas=canvas
+        return layout
 
     def validate(self, imgs: list[ImageMat], meta: dict = {}):
         if len(imgs) == 0:
@@ -558,12 +561,12 @@ class TileNumpyImagesBlock(ImageMatProcessor):
 
     def forward_raw(self, imgs_data: list[np.ndarray]) -> list[np.ndarray]:
         layout = self.layout
-        tile_width = layout['tile_width']
-        tile_height = layout['tile_height']
-        col_widths = layout['col_widths']
-        row_heights = layout['row_heights']
-        channels = layout['channels']
-        canvas = layout['canvas']
+        tile_width = layout.tile_width
+        tile_height = layout.tile_height
+        col_widths = layout.col_widths
+        row_heights = layout.row_heights
+        channels = layout.channels
+        canvas = layout._canvas
 
         num_images = len(imgs_data)
         y_offset = 0
@@ -583,19 +586,9 @@ class TileNumpyImagesBlock(ImageMatProcessor):
             y_offset += row_heights[row]
         return [canvas]
 
-
 class EncodeNumpyToJpegBlock(ImageMatProcessor):
-    def __init__(self, quality: int = None, save_results_to_meta=False):
-        """
-        Initializes the EncodeNumpyToJpegBlock for encoding images to JPEG.
-
-        Args:
-            quality (int, optional): JPEG quality (1-100). Defaults to OpenCV's standard.
-            save_results_to_meta (bool): Whether to store encoded images in metadata.
-        """
-        super().__init__('encode_numpy_to_jpeg',save_results_to_meta)
-        self.quality = quality
-        self.save_results_to_meta = save_results_to_meta
+    title:str='encode_numpy_to_jpeg'
+    quality: int = 90
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
         """
@@ -638,9 +631,8 @@ class EncodeNumpyToJpegBlock(ImageMatProcessor):
         return encoded_images
 
 class MergeYoloResultsBlock(ImageMatProcessor):
-    def __init__(self,yolo_results_uuid):
-        super().__init__('merge_yolo_results', True)
-        self.yolo_results_uuid = yolo_results_uuid
+    title:str='merge_yolo_results'
+    yolo_results_uuid:str
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat], Dict]:
         """
@@ -670,6 +662,139 @@ class MergeYoloResultsBlock(ImageMatProcessor):
         meta[self.uuid] = result
         return imgs, meta
 
+class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
+    title:str='np_uint8_shm_writer'
+    writers:list[NumpyUInt8SharedMemoryStreamIO.StreamWriter] = []
+    stream_key_prefix:str
+
+    def validate_img(self, img_idx, img: ImageMat):
+        img.require_ndarray()
+        img.require_np_uint()
+        stream_key = f"{self.stream_key_prefix}:{img_idx}"
+        wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
+        wt.build_buffer()
+
+    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
+        for wt,img in zip(self.writers,imgs_data):
+            wt.write(img)
+        return imgs_data
+
+class CvImageViewer(ImageMatProcessor):
+    title:str = 'cv_image_viewer'
+    window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
+    resizable: bool = Field(default=True, description="Whether window is resizable")
+    scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
+    overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
+    save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
+    window_names:list[str] = []
+    mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
+
+    def validate_img(self, img_idx, img: ImageMat):
+        img.require_ndarray()
+        img.require_np_uint()
+        win_name = f'{self.window_name_prefix}:{img_idx}'
+        self.window_names.append(win_name)
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
+
+    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
+        scale = self.scale
+        overlay_texts = self.overlay_texts
+        save_on_key = self.save_on_key
+
+        for idx,img in enumerate(imgs_data):            
+            img = imgs_data[idx].copy()
+            if scale is not None:
+                img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+
+            # Overlay text
+            text = overlay_texts[idx] if idx < len(overlay_texts) else ""
+            cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+            win_name = self.window_names[idx]
+            cv2.imshow(win_name, img)
+            key = cv2.waitKey(1) & 0xFF
+
+            if save_on_key and key == save_on_key:
+                filename = f'image_{idx}.png'
+                cv2.imwrite(filename, img)
+                print(f'Saved {filename}')
+            elif key == ord('e'):  # Edit overlay text
+                new_text = input(f"Enter new overlay text for image {idx}: ")
+                if idx < len(overlay_texts):
+                    overlay_texts[idx] = new_text
+                else:
+                    overlay_texts.append(new_text)
+
+        return imgs_data
+
+    def __del__(self):
+        try:
+            [cv2.destroyWindow(n) for n in self.window_names]
+        except Exception:
+            pass
+
+class CvVideoRecorder(ImageMatProcessor):
+    output_filename: str = "output.avi",
+    codec: str = 'XVID',
+    fps: int = 30,
+    scale: Optional[float] = None,
+    overlay_text: Optional[str] = None
+    _writer = None
+    recording:bool = False
+    frame_size:Optional[Tuple[int, int]] = None
+
+    def validate_img(self, img_idx, img: ImageMat):
+        if img_idx>0:
+            raise RuntimeError("CvVideoRecorder cannot process multiple images at once")
+        img.require_ndarray()
+        img.require_np_uint()
+        self.start(img.data().shape)
+
+    def forward_raw(self, imgs: list[np.ndarray])->list[np.ndarray]:
+        for img in imgs:self.write_frame(img)
+        return imgs
+    
+    def start(self, frame_shape: Tuple[int, int]):
+        fourcc = cv2.VideoWriter_fourcc(*self.codec)
+        self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
+        self._writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
+        self.recording = True
+        print(f"Started recording to {self.output_filename}")
+
+    def stop(self):
+        if self._writer:
+            self._writer.release()
+            self._writer = None
+        self.recording = False
+        print("Stopped recording.")
+
+    def write_frame(self, frame: np.ndarray):
+        if not self.recording:
+            raise RuntimeError("Recording has not started. Call start() first.")
+
+        # Resize frame if needed
+        if self.scale is not None:
+            frame = cv2.resize(frame, (0, 0), fx=self.scale, fy=self.scale)
+
+        # Overlay text
+        if self.overlay_text:
+            cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
+
+        # Ensure frame matches output size and type
+        if self.frame_size is not None and (frame.shape[1], frame.shape[0]) != self.frame_size:
+            frame = cv2.resize(frame, self.frame_size)
+        if frame.dtype != np.uint8 or (frame.ndim != 3 or frame.shape[2] != 3):
+            raise ValueError("Frame must be uint8 BGR for VideoWriter")
+
+        self._writer.write(frame)
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+
 # TODO
 class YOLOBlock(ImageMatProcessor):
     def __init__(
@@ -680,7 +805,7 @@ class YOLOBlock(ImageMatProcessor):
         names: Optional[Dict[int, str]] = None,
         save_results_to_meta: bool = False
     ):
-        super().__init__('YOLO_detections', save_results_to_meta=save_results_to_meta)
+        super().__init__(title='YOLO_detections', save_results_to_meta=save_results_to_meta)
         self.modelname = modelname
         self.conf = conf
         self.cpu = cpu
@@ -775,154 +900,5 @@ class YoloRTBlock(YOLOBlock):
         if isinstance(img, torch.Tensor):
             img = img.to(torch.float16)
         return img
-
-class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
-    def __init__(self, stream_key_prefix: str):
-        super().__init__('np_uint8_shm_writer')
-        self.writers:list[NumpyUInt8SharedMemoryStreamIO.StreamWriter] = []
-        self.stream_key_prefix = stream_key_prefix
-
-    def validate_img(self, img_idx, img: ImageMat):
-        img.require_ndarray()
-        img.require_np_uint()
-        stream_key = f"{self.stream_key_prefix}:{img_idx}"
-        wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
-        wt.build_buffer()
-
-    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
-        for wt,img in zip(self.writers,imgs_data):
-            wt.write(img)
-        return imgs_data
-
-class CvImageViewer(ImageMatProcessor):
-    def __init__(self, window_name_prefix: str = 'ImageViewer',
-                 resizable: bool = True,    
-                 scale: Optional[float] = None,
-                 overlay_texts: Optional[List[str]] = None,
-                 save_on_key: Optional[int] = ord('s'),
-                 ):
-        super().__init__('cv_image_viewer')
-        self.window_name_prefix = f'{window_name_prefix}:{uuid.uuid4()}'
-        self.resizable = cv2.WINDOW_NORMAL if resizable else cv2.WINDOW_AUTOSIZE
-        self.scale = scale
-        self.overlay_texts = overlay_texts or []
-        self.save_on_key = save_on_key
-        self.window_names = []
-        self.mouse_pos = (0, 0)  # for showing mouse coords
-
-    def validate_img(self, img_idx, img: ImageMat):
-        img.require_ndarray()
-        img.require_np_uint()
-        win_name = f'{self.window_name_prefix}:{img_idx}'
-        self.window_names.append(win_name)
-        cv2.namedWindow(win_name, self.resizable)
-
-    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
-        scale = self.scale
-        overlay_texts = self.overlay_texts
-        save_on_key = self.save_on_key
-
-        for idx,img in enumerate(imgs_data):            
-            img = imgs_data[idx].copy()
-            if scale is not None:
-                img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
-
-            # Overlay text
-            text = overlay_texts[idx] if idx < len(overlay_texts) else ""
-            cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-            win_name = self.window_names[idx]
-            cv2.imshow(win_name, img)
-            key = cv2.waitKey(1) & 0xFF
-
-            if save_on_key and key == save_on_key:
-                filename = f'image_{idx}.png'
-                cv2.imwrite(filename, img)
-                print(f'Saved {filename}')
-            elif key == ord('e'):  # Edit overlay text
-                new_text = input(f"Enter new overlay text for image {idx}: ")
-                if idx < len(overlay_texts):
-                    overlay_texts[idx] = new_text
-                else:
-                    overlay_texts.append(new_text)
-
-        return imgs_data
-
-    def __del__(self):
-        try:
-            [cv2.destroyWindow(n) for n in self.window_names]
-        except Exception:
-            pass
-
-class CvVideoRecorder(ImageMatProcessor):
-    def __init__(self, 
-                 output_filename: str = "output.avi",
-                 codec: str = 'XVID',
-                 fps: int = 30,
-                 scale: Optional[float] = None,
-                 overlay_text: Optional[str] = None):
-        super().__init__('cv_video_recorder')        
-        self.output_filename = output_filename
-        self.codec = codec
-        self.fps = fps
-        self.scale = scale
-        self.overlay_text = overlay_text or ""
-
-        self.writer = None
-        self.recording = False
-        self.frame_size = None
-
-    def validate_img(self, img_idx, img: ImageMat):
-        if img_idx>0:
-            raise RuntimeError("CvVideoRecorder cannot process multiple images at once")
-        img.require_ndarray()
-        img.require_np_uint()
-        self.start(img.data().shape)
-
-    def forward_raw(self, imgs: list[np.ndarray])->list[np.ndarray]:
-        for img in imgs:self.write_frame(img)
-        return imgs
-    
-    def start(self, frame_shape: Tuple[int, int]):
-        fourcc = cv2.VideoWriter_fourcc(*self.codec)
-        self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
-        self.writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
-        self.recording = True
-        print(f"Started recording to {self.output_filename}")
-
-    def stop(self):
-        if self.writer:
-            self.writer.release()
-            self.writer = None
-        self.recording = False
-        print("Stopped recording.")
-
-    def write_frame(self, frame: np.ndarray):
-        if not self.recording:
-            raise RuntimeError("Recording has not started. Call start() first.")
-
-        # Resize frame if needed
-        if self.scale is not None:
-            frame = cv2.resize(frame, (0, 0), fx=self.scale, fy=self.scale)
-
-        # Overlay text
-        if self.overlay_text:
-            cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
-
-        # Ensure frame matches output size and type
-        if self.frame_size is not None and (frame.shape[1], frame.shape[0]) != self.frame_size:
-            frame = cv2.resize(frame, self.frame_size)
-        if frame.dtype != np.uint8 or (frame.ndim != 3 or frame.shape[2] != 3):
-            raise ValueError("Frame must be uint8 BGR for VideoWriter")
-
-        self.writer.write(frame)
-
-    def __del__(self):
-        try:
-            self.stop()
-        except Exception:
-            pass
-
-
 
 

@@ -1,4 +1,6 @@
+import json
 from generator import VideoFrameGenerator, XVSdkRGBDGenerator
+import processors
 from processors import *
 from ImageMat import ImageMat, ColorType
 
@@ -77,7 +79,7 @@ def test1():
     # 6. Test CVResizeBlock on HW and HWC
     gray_img = ImageMat(np.random.randint(0, 255, (8, 8), dtype=np.uint8), color_type="grayscale")
     color_img = ImageMat(np.random.randint(0, 255, (8, 8, 3), dtype=np.uint8), color_type="BGR")
-    cvresize = CVResizeBlock((4, 4))
+    cvresize = CVResizeBlock(target_size=(4, 4))
     imgs, _ = cvresize.validate([gray_img, color_img])
     assert imgs[0].data().shape == (4, 4) or imgs[0].data().shape == (4, 4, 3)
     print("Pass: CVResizeBlock resizes HW and HWC formats.")
@@ -127,13 +129,13 @@ def test1():
         print("Pass: NumpyBayerToTorchBayerBlock rejects non-HW input.")
 
     # 11. MergeYoloResultsBlock: no result in meta, returns as is
-    merge = MergeYoloResultsBlock("not-in-meta")
+    merge = MergeYoloResultsBlock(yolo_results_uuid="not-in-meta")
     input_imgs = [ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "BGR")]
     out, meta = merge(input_imgs, {})
     assert out == input_imgs
     print("Pass: MergeYoloResultsBlock returns input if no YOLO results in meta.")
 
-    print("/nAll additional tests passed.")
+    print("All additional tests passed.")
 
 def build_image_pipeline(
     bayer_images: List[np.ndarray],
@@ -322,7 +324,17 @@ def test_vid_show(mp4s=[]):
         viewer.validate(frame_list,{})
         print("validate complete.")
         break
-    
+
+    # dumps
+    print([p.model_dump() for p in pipes])
+    pipes_json = json.dumps([p.model_dump() for p in pipes])
+    del pipes
+    print(pipes_json)
+
+    # loads
+    pipes = [processors.__dict__[f'{p["uuid"].split(":")[0]}'](**p) 
+             for p in json.loads(pipes_json)]
+
     # return gen, pipes
     for imgs in gen:ImageMatProcessor.run_once(imgs,pipes=pipes)
 
@@ -363,7 +375,7 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 # ========== Usage Example ==========
 if __name__ == "__main__":
     # test_xvsdk_show()
-    test_vid_show(['./data/Serene Valley Vista.mp4',])
+    test_vid_show(['./data/Serene Valley Vista.avi',])
     # test1()
     # test_build_image_pipeline()
     # test_build_image_pipeline_gpu()
