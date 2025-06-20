@@ -13,11 +13,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import ImageMat, ImageMatProcessor
+from ImageMat import ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
 from pydantic import BaseModel, Field
 from PIL import Image
 
-class CvDebayerBlock(ImageMatProcessor):
+class CvDebayer(ImageMatProcessor):
     title:str='cv_debayer'
     format:int=cv2.COLOR_BAYER_BG2BGR
         
@@ -63,10 +63,12 @@ class CvDebayerBlock(ImageMatProcessor):
     def forward_raw(self,imgs_data)->List[np.ndarray]:
         return [cv2.cvtColor(i,self.format) for i in imgs_data]
 
-class TorchDebayerBlock(ImageMatProcessor):
+class TorchDebayer(ImageMatProcessor):
     ### Define the `Debayer5x5` PyTorch Model
     # The `Debayer5x5` model applies a **5x5 convolution filter** to interpolate missing 
     # color information from a Bayer pattern.
+    # in list of Bx1xHxW tensor [0.0 ~ 1.0)
+    # out list of Bx3xHxW tensor [0.0 ~ 1.0)
 
     class Debayer5x5(torch.nn.Module):
         # from https://github.com/cheind/pytorch-debayer
@@ -97,7 +99,7 @@ class TorchDebayerBlock(ImageMatProcessor):
             BGGR = (2, 1, 1, 0)
 
         def __init__(self, layout: Layout = Layout.RGGB):
-            super(TorchDebayerBlock.Debayer5x5, self).__init__()
+            super(TorchDebayer.Debayer5x5, self).__init__()
             self.layout = layout
             # fmt: off
             self.kernels = torch.nn.Parameter(
@@ -223,7 +225,7 @@ class TorchDebayerBlock(ImageMatProcessor):
         # - Supports **different Bayer layouts** (`RGGB`, `GRBG`, `GBRG`, `BGGR`).
         # - Uses **fixed convolution kernels** for demosaicing.
     title:str='torch_debayer'
-    _debayer_models:List['TorchDebayerBlock.Debayer5x5'] = []
+    _debayer_models:List['TorchDebayer.Debayer5x5'] = []
     _input_devices = []  # To track device of each input tensor
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
@@ -240,7 +242,7 @@ class TorchDebayerBlock(ImageMatProcessor):
             self._input_devices.append(img.info.device)
 
             # Initialize and store model on the corresponding device
-            model = TorchDebayerBlock.Debayer5x5().to(img.info.device).to(img.info._dtype)
+            model = TorchDebayer.Debayer5x5().to(img.info.device).to(img.info._dtype)
             self._debayer_models.append(model)
     
     
@@ -257,7 +259,7 @@ class TorchDebayerBlock(ImageMatProcessor):
             debayered_imgs.append(model(img))
         return debayered_imgs
 
-class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
+class TorchRGBToNumpyBGR(ImageMatProcessor):
     title:str='torch_rgb_to_numpy_bgr'
     def model_post_init(self, context):
         self.num_devices = self.devices_info()  # Number of available GPUs
@@ -298,19 +300,20 @@ class TorchRGBToNumpyBGRBlock(ImageMatProcessor):
             bgr_images.append(img)
         return bgr_images
 
-class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
+class NumpyBGRToTorchRGB(ImageMatProcessor):
     title:str='numpy_bgr_to_torch_rgb'
     gpu:bool=True
     multi_gpu:int=-1
-    torch_dtype:ImageMat.TorchDtype = torch.float32
+    _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
     _tensor_models:list = []
 
     def model_post_init(self, context):
         self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
         # Model function to convert BGR numpy to Torch RGB tensor
-        def get_model(device, dtype=self.torch_dtype):
+        def get_model(device, dtype=self._torch_dtype):
             def model(img:np.ndarray):
-                return torch.tensor(img[:, :, ::-1].copy(), dtype=dtype, device=device
+                return torch.tensor(img[:, :, ::-1].copy(), 
+                                    dtype=dtype, device=device
                                     ).div(255.0).permute(2, 0, 1).unsqueeze(0)
             return model
 
@@ -362,22 +365,23 @@ class NumpyBGRToTorchRGBBlock(ImageMatProcessor):
         torch_images = []
         for i, img in enumerate(imgs_data):
             device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self.torch_dtype, device=device
+            tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self._torch_dtype, device=device
                                       ).div(255.0).permute(2, 0, 1).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
-class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
+class NumpyBayerToTorchBayer(ImageMatProcessor):
+    # to BCHW
     title:str='numpy_bayer_to_torch_bayer'
     gpu:bool=True
     multi_gpu:int=-1
-    torch_dtype:ImageMat.TorchDtype = torch.float32
+    _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
     _tensor_models:list = []
 
     def model_post_init(self, context):
         self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
 
-        def get_model(device, dtype=self.torch_dtype):
+        def get_model(device, dtype=self._torch_dtype):
             def model(img:np.ndarray):
                 return torch.tensor(img.copy(), dtype=dtype, device=device
                                     ).div(255.0).unsqueeze(0).unsqueeze(0)
@@ -413,12 +417,12 @@ class NumpyBayerToTorchBayerBlock(ImageMatProcessor):
         torch_images = []
         for i, img in enumerate(imgs_data):
             device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-            tensor_img = torch.tensor(img.copy(), dtype=self.torch_dtype, device=device
+            tensor_img = torch.tensor(img.copy(), dtype=self._torch_dtype, device=device
                                     ).div(255.0).unsqueeze(0).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
 
-class TorchResizeBlock(ImageMatProcessor):
+class TorchResize(ImageMatProcessor):
     title:str='torch_resize'
     target_size:Tuple[int, int]
     mode:str="bilinear"
@@ -451,7 +455,7 @@ class TorchResizeBlock(ImageMatProcessor):
             resized_images.append(resized_img)
         return resized_images
 
-class CVResizeBlock(ImageMatProcessor):
+class CVResize(ImageMatProcessor):
     title:str='cv_resize',
     target_size: Tuple[int, int]
     interpolation:int=cv2.INTER_LINEAR
@@ -486,7 +490,7 @@ class CVResizeBlock(ImageMatProcessor):
             resized_images.append(resized_img)
         return resized_images
     
-class TileNumpyImagesBlock(ImageMatProcessor):
+class TileNumpyImages(ImageMatProcessor):
     class Layout(BaseModel):
         tile_width:int
         tile_height:int
@@ -530,7 +534,7 @@ class TileNumpyImagesBlock(ImageMatProcessor):
         else:
             canvas = np.zeros((total_height, total_width, channels), dtype=imgs_data[0].dtype)
 
-        layout =  TileNumpyImagesBlock.Layout(
+        layout =  TileNumpyImages.Layout(
             tile_width=tile_width,
             tile_height=tile_height,
             col_widths=col_widths,
@@ -588,7 +592,8 @@ class TileNumpyImagesBlock(ImageMatProcessor):
             y_offset += row_heights[row]
         return [canvas]
 
-class EncodeNumpyToJpegBlock(ImageMatProcessor):
+
+class EncodeNumpyToJpeg(ImageMatProcessor):
     title:str='encode_numpy_to_jpeg'
     quality: int = 90
 
@@ -632,7 +637,7 @@ class EncodeNumpyToJpegBlock(ImageMatProcessor):
         
         return encoded_images
 
-class MergeYoloResultsBlock(ImageMatProcessor):
+class MergeYoloResults(ImageMatProcessor):
     title:str='merge_yolo_results'
     yolo_results_uuid:str
 
@@ -796,17 +801,24 @@ class CvVideoRecorder(ImageMatProcessor):
         except Exception:
             pass
 
+def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
+    """Convert hex color to RGBA format."""
+    hex_color = hex_color.lstrip('#')
+    rgba = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    alpha = int(hex_color[6:8], 16) if len(hex_color) == 8 else 255
+    return rgba + (alpha,)
 
-class NumpyImageMaskBlock(ImageMatProcessor):
+class NumpyImageMask(ImageMatProcessor):
     title: str = "numpy_image_mask"
     mask_image_path: Optional[str] = None
     mask_color: str = "#00000080"
     mask_split: Tuple[int, int] = (2, 2)
+    _masks:list = None
 
     def model_post_init(self, context: Any) -> None:
         self._masks = self._make_mask_images(self.mask_image_path, self.mask_split, self.mask_color)
         if self._masks is None:
-            print('[NumpyImageMaskBlock] Warning: no mask image loaded. This block will do nothing.')
+            print('[NumpyImageMask] Warning: no mask image loaded. This block will do nothing.')
         return super().model_post_init(context)
 
     def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
@@ -845,53 +857,95 @@ class NumpyImageMaskBlock(ImageMatProcessor):
 
         return {"original": gray_masks, "preview": preview_masks}
 
-    def _adjust_mask(self, images: List[np.ndarray]):
-        w,h,c = self._img_w_h_c(images[0])
-            
+    def _adjust_mask(self, images: List[ImageMat]):
         self._masks["resized_masks"] = [
-            cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST)
-            for mask in self._masks["original"]
+            None for _ in self._masks["original"]
         ]
-        # print([i.shape for i in self._masks["resized_masks"]])
 
-        self._masks["resized_masks"] = [
-            mask if len(mask.shape) > len(image.shape) else
-            np.expand_dims(mask, axis=-1)
-            for image, mask in zip(images, self._masks["resized_masks"])
-        ]
-        # print([i.shape for i in self._masks["resized_masks"]])
-        
-        self._masks["resized_masks"] = [
-            mask if mask.shape[-1] == c else
-            mask.repeat(c, axis=-1) 
-            for mask in self._masks["resized_masks"]
-        ]
-        # print([i.shape for i in self._masks["resized_masks"]])
+        for i, img in enumerate(images):
+            gray_mask: np.ndarray = self._masks["original"][i]
 
-    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-        self.input_mats = [i for i in imgs]
-        validated_imgs:List[ImageMat] = []
+            shape_type = img.info.shape_type
+            h, w = img.info.H, img.info.W
+            c = img.info.C if shape_type == ShapeType.HWC else None
 
-        for img in imgs:
-            img.require_ndarray()
-            img.require_np_uint()
-            validated_imgs.append(img)
+            # Resize the mask to match image dimensions
+            resized_mask = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        self._adjust_mask([img.data() for img in validated_imgs])
-        masked_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(color_type=old.info.color_type).build(img) for img, old in zip(masked_imgs, validated_imgs)]
+            # Expand dimensions if needed
+            if c:
+                resized_mask = np.expand_dims(resized_mask, axis=-1)
+                if c > 1:
+                    resized_mask = resized_mask.repeat(c, axis=-1)
 
-        return self.forward(validated_imgs, meta)
+            self._masks["resized_masks"][i] = resized_mask
+
+    def validate_img(self, img_idx:int, img:ImageMat):
+        img.require_ndarray()
+        img.require_np_uint()
+        img.require_HW_or_HWC()
 
     def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
         if self._masks is None:
             return imgs_data
+        
+        if "resized_masks" not in self._masks:
+            self._adjust_mask([img for img in self.input_mats])
 
         masks = self._masks["resized_masks"]
         return [cv2.bitwise_and(image, mask) for image, mask in zip(imgs_data, masks)]
 
+class TorchImageMask(NumpyImageMask):
+    title: str = "torch_image_mask"
+
+    def validate_img(self, img_idx: int, img: ImageMat):
+        img.require_torch_float()
+        img.require_BCHW()
+
+    def _make_mask_images(
+        self, mask_image_path: Optional[str], mask_split: Tuple[int, int], preview_color: str
+    ) -> Optional[Dict[str, List[Any]]]:
+        data = super()._make_mask_images(mask_image_path, mask_split, preview_color)
+
+        if data is None:
+            return None
+
+        # Convert grayscale masks to PyTorch tensors in BCHW format, normalized
+        data["torch_original"] = [
+            torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(
+            ImageMatInfo.torch_img_dtype()) / 255.0
+            for mask in data["original"]
+        ]
+        return data
+
+    def _adjust_mask(self, images: List[ImageMat]):
+        self._masks["resized_masks"] = [None for _ in self._masks["original"]]
+
+        for i, img in enumerate(images):
+            gray_mask: np.ndarray = self._masks["original"][i]
+
+            h, w = img.info.H, img.info.W
+            # Resize using OpenCV (still in NumPy), then convert to torch tensor
+            resized_mask_np = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            resized_mask_torch = torch.from_numpy(resized_mask_np
+                                    ).unsqueeze(0).unsqueeze(0).to(
+                                    ImageMatInfo.torch_img_dtype()) / 255.0
+            if img.info.device != 'cpu':
+                resized_mask_torch = resized_mask_torch.to(img.info.device)
+            self._masks["resized_masks"][i] = resized_mask_torch
+
+    def forward_raw(self, imgs_data: List[torch.Tensor]) -> List[torch.Tensor]:
+        if self._masks is None:
+            return imgs_data
+
+        if "resized_masks" not in self._masks:
+            self._adjust_mask([img for img in self.input_mats])
+
+        masks = self._masks["resized_masks"]
+        return [image * mask for image, mask in zip(imgs_data, masks)]
+
 # TODO
-class YOLOBlock(ImageMatProcessor):
+class YOLO(ImageMatProcessor):
     def __init__(
         self, 
         modelname: str = 'yolov5s6u.pt', 
@@ -941,7 +995,7 @@ class YOLOBlock(ImageMatProcessor):
                 det_fn = lambda x, m=model: m([*x], conf=self.conf, verbose=False)
                 self.models.append(det_fn)
             else:
-                raise TypeError("Unsupported image type for YOLOBlock")
+                raise TypeError("Unsupported image type for YOLO")
 
         self.out_mats = [img.copy() for img in imgs]
         return self.forward(imgs, meta)
@@ -977,7 +1031,7 @@ class YOLOBlock(ImageMatProcessor):
         return img
 
 # TODO
-class YoloRTBlock(YOLOBlock):
+class YoloRT(YOLO):
     def __init__(
         self, 
         modelname: str = 'yolov5s6u.engine', 
@@ -1001,24 +1055,27 @@ class YoloRTBlock(YOLOBlock):
 class ImageMatProcessors(BaseModel):
     @staticmethod    
     def dumps(pipes:list[ImageMatProcessor]):
+        print([p.model_dump() for p in pipes])
         return json.dumps([p.model_dump() for p in pipes])
     
     @staticmethod
     def loads(pipes_json:str)->list[ImageMatProcessor]:
         processors = {
-            'CvDebayerBlock':CvDebayerBlock,
-            'TorchDebayerBlock':TorchDebayerBlock,
-            'TorchRGBToNumpyBGRBlock':TorchRGBToNumpyBGRBlock,
-            'NumpyBGRToTorchRGBBlock':NumpyBGRToTorchRGBBlock,
-            'NumpyBayerToTorchBayerBlock':NumpyBayerToTorchBayerBlock,
-            'TorchResizeBlock':TorchResizeBlock,
-            'CVResizeBlock':CVResizeBlock,
-            'TileNumpyImagesBlock':TileNumpyImagesBlock,
-            'EncodeNumpyToJpegBlock':EncodeNumpyToJpegBlock,
-            'MergeYoloResultsBlock':MergeYoloResultsBlock,
+            'CvDebayer':CvDebayer,
+            'TorchDebayer':TorchDebayer,
+            'TorchRGBToNumpyBGR':TorchRGBToNumpyBGR,
+            'NumpyBGRToTorchRGB':NumpyBGRToTorchRGB,
+            'NumpyBayerToTorchBayer':NumpyBayerToTorchBayer,
+            'TorchResize':TorchResize,
+            'CVResize':CVResize,
+            'TileNumpyImages':TileNumpyImages,
+            'EncodeNumpyToJpeg':EncodeNumpyToJpeg,
+            'MergeYoloResults':MergeYoloResults,
             'NumpyUInt8SharedMemoryWriter':NumpyUInt8SharedMemoryWriter,
             'CvImageViewer':CvImageViewer,
             'CvVideoRecorder':CvVideoRecorder,
+            'NumpyImageMask':NumpyImageMask,
+            'TorchImageMask':TorchImageMask,
         }
         return [processors[f'{p["uuid"].split(":")[0]}'](**p) 
                 for p in json.loads(pipes_json)]

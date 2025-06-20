@@ -10,6 +10,10 @@ import numpy as np
 from pydantic import BaseModel
 import torch
 
+class DeviceType(str, enum.Enum):
+    CPU = 'cpu'
+    GPU = 'gpu'
+
 class ShapeType(str, enum.Enum):
     HWC = 'HWC'
     HW = 'HW'
@@ -28,6 +32,10 @@ COLOR_TYPE_CHANNELS = {
     ColorType.RGB: [3],
     ColorType.BGR: [3],
 }
+
+# global setting
+torch_img_dtype = torch.float16
+numpy_img_dtype = np.uint8
 
 class ImageMatInfo(BaseModel):
 
@@ -48,7 +56,10 @@ class ImageMatInfo(BaseModel):
     W: int = 0
     color_type: Optional[ColorType] = None
 
-    model_config = {"arbitrary_types_allowed": True}
+    @staticmethod
+    def torch_img_dtype():return torch_img_dtype
+    @staticmethod
+    def numpy_img_dtype():return numpy_img_dtype
 
     def build(self, img_data: Union[np.ndarray, torch.Tensor],
                   color_type: Union[str, ColorType]):
@@ -64,7 +75,7 @@ class ImageMatInfo(BaseModel):
         if isinstance(img_data, np.ndarray):
             self._dtype = img_data.dtype
             self.device = "cpu"
-            self.max_value = 255 if img_data.dtype == np.uint8 else 1.0
+            self.max_value = 255 if img_data.dtype == numpy_img_dtype else 1.0
 
             if img_data.ndim == 3:
                 self.shape_type = ShapeType.HWC
@@ -158,14 +169,19 @@ class ImageMat(BaseModel):
 
     def require_np_uint(self):
         self.require_ndarray()
-        if self._img_data.dtype != np.uint8:
-            raise TypeError(f"Image data must be np.uint8. Got {self._img_data.dtype}")
+        if self._img_data.dtype != numpy_img_dtype:
+            raise TypeError(f"Image data must be {numpy_img_dtype}. Got {self._img_data.dtype}")
 
     def require_torch_tensor(self):
         if not isinstance(self._img_data, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(self._img_data)}")
         self.require_BCHW()
 
+    def require_torch_float(self):
+        self.require_torch_tensor()
+        if self._img_data.dtype != torch_img_dtype:
+            raise TypeError(f"Image data must be {torch_img_dtype}. Got {self._img_data.dtype}")
+        
     def require_shape_type(self, shape_type: ShapeType):
         if self.info.shape_type != shape_type:
             raise TypeError(f"Expected {shape_type.value} format, got {self.info.shape_type}")
@@ -237,7 +253,7 @@ class ImageMatProcessor(BaseModel):
 
         return output_imgs, meta
     
-    def validate_img(self, img_idx, img):
+    def validate_img(self, img_idx:int, img:ImageMat):
         raise NotImplementedError()
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
@@ -250,7 +266,10 @@ class ImageMatProcessor(BaseModel):
 
         # Create new ImageMat instances for output
         converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(color_type=old.info.color_type).build(img) for old,img in zip(validated_imgs,converted_imgs)]
+        self.input_mats = validated_imgs
+        self.out_mats = [ImageMat(color_type=old.info.color_type
+            ).build(img)
+            for old,img in zip(validated_imgs,converted_imgs)]
         return self.forward(validated_imgs, meta)
     
     def forward_raw(self, imgs: List[Any]) -> List["Any"]:

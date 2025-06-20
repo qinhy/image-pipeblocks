@@ -26,7 +26,7 @@ def test_multiple_images(monkeypatch):
 
     img1 = ImageMat(np.zeros((4,4,3), dtype=np.uint8), 'RGB')
     img2 = ImageMat(np.zeros((4,4,3), dtype=np.uint8), 'RGB')
-    block = YOLOBlock(modelname='fake')
+    block = YOLO(modelname='fake')
     _, meta = block.validate([img1, img2])
 
     results = meta['YOLO_detections']
