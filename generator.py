@@ -5,22 +5,22 @@ import uuid
 
 import cv2
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ImageMat import ColorType, ImageMat, ImageMatGenerator
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 
 class ImageMatGenerator(BaseModel):
-    sources: list[str] = str
-    color_types: list[ColorType] = []
-    uuid:str = ''
-    _resources = []  # General-purpose resource registry
-    _source_generators = []  # General-purpose resource registry
+    sources: list[str] = Field(default_factory=list)
+    color_types: list['ColorType'] = Field(default_factory=list)
+    uuid: str = ''
+    
+    _resources: list = []
+    _source_generators: list = []
 
-    def model_post_init(self, context):
-        self._source_generators = [self.create_source_generator(src) for src in self.sources]        
+    def model_post_init(self, __context) -> None:
+        self._source_generators = [self.create_source_generator(src) for src in self.sources]
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
-        return super().model_post_init(context)
 
     def register_resource(self, resource):
         self._resources.append(resource)
@@ -72,8 +72,6 @@ class ImageMatGenerator(BaseModel):
     def __del__(self):
         self.release()
 
-    def __len__(self):
-        return None
 
 class VideoFrameGenerator(ImageMatGenerator):
     """
@@ -84,12 +82,11 @@ class VideoFrameGenerator(ImageMatGenerator):
         if not cap.isOpened():
             raise ValueError(f"Cannot open video source: {source}")
         self.register_resource(cap)
-        return cap  # Use the capture object directly
+        return cap
 
     def __next__(self):
         results = []
-        resources:list[cv2.VideoCapture] = self._resources
-        for cap, color_type in zip(resources, self.color_types):
+        for cap, color_type in zip(self._resources, self.color_types):
             if not cap.isOpened():
                 continue
             ret, frame = cap.read()
@@ -102,8 +99,7 @@ class VideoFrameGenerator(ImageMatGenerator):
 
     def reset_generators(self):
         self.release_resources()
-        self.source_generators = [self.create_source_generator(src
-                                        ) for src in self.sources]
+        self._source_generators = [self.create_source_generator(src) for src in self.sources]
 
 class XVSdkRGBDGenerator(ImageMatGenerator):
     class RGBResolution(IntEnum):
