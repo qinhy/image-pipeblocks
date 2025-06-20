@@ -94,9 +94,13 @@ class ImageMatInfo(BaseModel):
                 )
         self.color_type = color_type
 
-class ImageMat:
+class ImageMat(BaseModel):
+    info: Optional[ImageMatInfo] = None
+    color_type: Union[str, ColorType] = None
+
     def __init__(self, img_data: Union[np.ndarray, torch.Tensor], 
                  color_type: Union[str, ColorType], info: Optional[ImageMatInfo] = None):
+        super().__init__(info=info,color_type=color_type)
         if img_data is None:
             raise ValueError("img_data cannot be None")
         self.info = info or ImageMatInfo(img_data, color_type=color_type)
@@ -170,9 +174,26 @@ class ImageMat:
 
     def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
 
-class ImageMatProcessor:
-    class MetaData(BaseModel):        
+class ImageMatProcessor(BaseModel):
+    class MetaData(BaseModel):
         model_config = {"arbitrary_types_allowed": True}
+        
+    title:str = ''
+    uuid:str = ''
+    save_results_to_meta:bool = False
+    _enable:bool = True
+    meta:dict = {}
+    input_mats: List[ImageMat] = []
+    out_mats: List[ImageMat] = []
+
+    def __init__(self,title='', save_results_to_meta=False):
+        super().__init__(title=title,save_results_to_meta=save_results_to_meta)
+
+    def model_post_init(self, context: Any, /) -> None:
+        if len(self.title)==0:
+            self.title = self.__class__.__name__
+        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
+        return super().model_post_init(context)
 
     @staticmethod    
     def run_once(imgs,meta={},
@@ -185,14 +206,6 @@ class ImageMatProcessor:
             for fn in pipes:
                 imgs,meta = fn(imgs,meta)
         return imgs,meta
-
-    def __init__(self,title='ImageMatProcessor', save_results_to_meta=False):
-        self.title = title
-        self.uuid = uuid.uuid4()
-        self.save_results_to_meta = save_results_to_meta
-        self._enable = True
-        self.input_mats: List[ImageMat] = []
-        self.out_mats: List[ImageMat] = []
 
     def on(self):
         self._enable = True
