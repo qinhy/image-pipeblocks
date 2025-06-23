@@ -315,11 +315,19 @@ def test_vid_show(mp4s=[]):
     dh = (640-480)//2
     dw = (1280-854)//2
     pipes.append(Processors.NumpyPadImage(pad_width=((dh,dh),(dw,dw)))) # ((top, bottom), (left, right))
-    pipes.append(Processors.SlidingWindowSplitter(window_size=(640,640)))
+    sws = Processors.SlidingWindowSplitter(window_size=(640,640),save_results_to_meta=True)
+    pipes.append(sws)
     pipes.append(Processors.NumpyBGRToTorchRGB())
-    pipes.append(Processors.YOLO())
-    pipes.append(Processors.NumpyRGBToNumpyBGR())
-
+    plot_imgs=False
+    yolo = Processors.YOLO(plot_imgs=plot_imgs,save_results_to_meta=True)
+    pipes.append(yolo)
+    if plot_imgs:
+        pipes.append(Processors.NumpyRGBToNumpyBGR())
+    else:
+        pipes.append(Processors.TorchRGBToNumpyBGR())
+        pipes.append(Processors.SlidingWindowMerger(sliding_window_splitter_uuid=sws.uuid,
+                                                    yolo_uuid=yolo.uuid))
+    
     # pipes.append(NumpyImageMask(
     #     mask_image_path="./data/MaskImage.png"))
 

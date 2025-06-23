@@ -124,6 +124,7 @@ class ImageMat(BaseModel):
 
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
+    _img_data: Any = None
 
     def build(self, img_data: Union[np.ndarray, torch.Tensor], info: Optional[ImageMatInfo] = None):
         if img_data is None:
@@ -255,7 +256,6 @@ class ImageMatProcessor(BaseModel):
             
         if self.save_results_to_meta:
             meta[self.uuid] = self#[i.copy() for i in output_imgs]
-
         return output_imgs, meta
     
     def validate_img(self, img_idx:int, img:ImageMat):
@@ -274,7 +274,7 @@ class ImageMatProcessor(BaseModel):
                                               [img.info for img in validated_imgs])
         self.input_mats = validated_imgs
         self.build_out_mats(validated_imgs,converted_raw_imgs)
-        return self.forward(validated_imgs, meta)
+        return self(validated_imgs, meta)
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
         # 1:1 mapping

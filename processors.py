@@ -17,6 +17,8 @@ from ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, Shape
 from pydantic import BaseModel, Field
 from PIL import Image
 
+logger = print
+
 def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     """Convert hex color to RGBA format."""
     hex_color = hex_color.lstrip('#')
@@ -578,7 +580,7 @@ class Processors:
                 if save_on_key and key == save_on_key:
                     filename = f'image_{idx}.png'
                     cv2.imwrite(filename, img)
-                    print(f'Saved {filename}')
+                    logger(f'Saved {filename}')
                 elif key == ord('e'):  # Edit overlay text
                     new_text = input(f"Enter new overlay text for image {idx}: ")
                     if idx < len(overlay_texts):
@@ -620,14 +622,14 @@ class Processors:
             self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
             self._writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
             self.recording = True
-            print(f"Started recording to {self.output_filename}")
+            logger(f"Started recording to {self.output_filename}")
 
         def stop(self):
             if self._writer:
                 self._writer.release()
                 self._writer = None
             self.recording = False
-            print("Stopped recording.")
+            logger("Stopped recording.")
 
         def write_frame(self, frame: np.ndarray):
             if not self.recording:
@@ -665,7 +667,7 @@ class Processors:
         def model_post_init(self, context: Any) -> None:
             self._masks = self._make_mask_images(self.mask_image_path, self.mask_split, self.mask_color)
             if self._masks is None:
-                print('[NumpyImageMask] Warning: no mask image loaded. This block will do nothing.')
+                logger('[NumpyImageMask] Warning: no mask image loaded. This block will do nothing.')
             return super().model_post_init(context)
 
         def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
@@ -695,7 +697,7 @@ class Processors:
                     for sub_mask in np.split(row, mask_split[1], axis=1)
                 ]
             except ValueError:
-                print("Error: Invalid mask split configuration.")
+                logger("Error: Invalid mask split configuration.")
                 return None
 
             # Convert to grayscale and apply preview color
@@ -1036,7 +1038,7 @@ class Processors:
                     for col_start in range(0, W - wW + 1, sW):
                         window = img[row_start:row_start + wH, col_start:col_start + wW, :]
                         windows_list.append(window)
-                        offsets_xyxy.append((col_start, row_start, col_start, row_start))  # Can be adjusted
+                        offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))  # Can be adjusted
             
                 image_mats = [w for w in windows_list]
 
@@ -1070,80 +1072,79 @@ class Processors:
     class SlidingWindowMerger(ImageMatProcessor):
         title: str = "sliding_window_merge"
         sliding_window_splitter_uuid:str = ''
-        sliding_window_splitter_yolo_uuid:str = ''
+        yolo_uuid:str = ''
         _sliding_window_splitter:'Processors.SlidingWindowSplitter'=None
 
         def validate_img(self, img_idx:int, img:ImageMat):
             img.require_np_uint()
             img.require_HW_or_HWC()
+                
+        def forward_raw_yolo(self,meta):
+            sw_yolo_proc: Processors.YOLO = meta[self.yolo_uuid]
+            detections_per_window = sw_yolo_proc.yolo_results
+            transforms = self._sliding_window_splitter.pixel_idx_backward_T
+
+            full_detections = []
+
+            for dets, T in zip(detections_per_window, transforms):
+                if len(dets) == 0:
+                    continue
+                T = np.array(T)  # 3x3
+                coords = dets[:, :4]
+                ones = np.ones((coords.shape[0], 1))
+                xy1 = np.concatenate([coords[:, :2], ones], axis=1)
+                xy2 = np.concatenate([coords[:, 2:], ones], axis=1)
+
+                xy1_trans = (T @ xy1.T).T
+                xy2_trans = (T @ xy2.T).T
+                new_boxes = np.concatenate([xy1_trans[:, :2], xy2_trans[:, :2], dets[:, 4:]], axis=1)
+                full_detections.append(new_boxes)
+
+            return np.vstack(full_detections) if full_detections else np.empty((0, 6), dtype=np.float32)
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
+            color_types = []
+            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):
+                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets[img_idx]
+                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
+                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):pass
+                color_types.append(validated_imgs[tile_idx].info.color_type)
+                
+            self.out_mats = [ImageMat(color_type=color_type if color_type is None else color_type
+                ).build(img)
+                for color_type,img in zip(color_types,converted_raw_imgs)]
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[]) -> List[np.ndarray]:
+            """Merge sliding window outputs back into full-size images."""
+            merged_imgs = [None]*len(self._sliding_window_splitter.input_imgs_info)
+            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):                
+                if self.out_mats and self.out_mats[img_idx].data() is not None:
+                    merged = self.out_mats[img_idx].data()
+                else:
+                    H, W, channels = info.H, info.W, info.C
+                    if channels>1:
+                        merged = np.zeros((H, W, channels), dtype=np.uint8)
+                    else:
+                        merged = np.zeros((H, W), dtype=np.uint8)
+
+                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets[img_idx]
+                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
+                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):
+                    merged[y1:y2, x1:x2] = imgs_data[tile_idx]
+                merged_imgs[img_idx] = merged                         
+            return merged_imgs
+        
+        def validate(self, imgs, meta = ...):
+            self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
+            return super().validate(imgs, meta)
         
         def forward(self, imgs, meta):
             self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
-            output_imgs, meta = super().forward(imgs, meta)        
+            if self.yolo_uuid:
+                full_detections = self.forward_raw_yolo(meta)
+                meta[self.yolo_uuid].yolo_results = full_detections
+            output_imgs, meta = super().forward(imgs, meta)
             return output_imgs, meta
-        
-        def forward_raw_yolo(self):
-            multi_dets = meta[StaticWords.yolo_results]
-            splits = len(raw_imgs_idx)
-            yolo_results = []
-            multi_dets = [[np.asarray(multi_dets[ii]).reshape(-1, 6) for ii in raw_imgs_idx[i]] for i in range(splits)]
-
-            for ii, (img_info, preds) in enumerate(zip(raw_imgs_info, multi_dets)):
-                if len(preds) == 0:
-                    yolo_results.append([])
-                    continue
-
-                trans_xyxy = trans[ii]
-                preds = [self._extract_preds(p) for p in preds]
-                for i, p in enumerate(preds):
-                    if len(p) == 0:
-                        continue
-                    p[:, 0] = (p[:, 0] * (wW / W) + trans_xyxy[i][0] / W)
-                    p[:, 1] = (p[:, 1] * (wH / H) + trans_xyxy[i][1] / H)
-                    p[:, 2] = (p[:, 2] * (wW / W) + trans_xyxy[i][2] / W)
-                    p[:, 3] = (p[:, 3] * (wH / H) + trans_xyxy[i][3] / H)
-                    preds[i] = p
-
-                preds = np.vstack(preds)
-
-                boxes = torch.tensor(preds[:, :4])
-                scores = torch.tensor(preds[:, 4])
-                class_ids = torch.tensor(preds[:, 5])
-
-                keep_indices = torch.ops.torchvision.nms(boxes, scores, 0.15)
-                preds = preds[keep_indices.numpy()]
-
-                yolo_results.append(preds)
-
-            meta[StaticWords.yolo_results] = yolo_results
-
-        def forward_raw_merge_imgs(self):
-            pass
-
-        def forward_raw(self, imgs_data: List[Any], imgs_info: List[ImageMatInfo]=[])->List[Any]:
-            raw_imgs_idx = self._sliding_window_splitter.imgs_idx
-            trans = self._sliding_window_splitter.output_offsets
-            raw_imgs_info:list[ImageMatInfo] = self._sliding_window_splitter.input_imgs_info
-            window_size = self._sliding_window_splitter.window_size
-            W, H = raw_imgs_info[0].W,raw_imgs_info[0].H
-            wH, wW = window_size
-
-            if self.sliding_window_splitter_yolo_uuid:self.forward_raw_yolo()
-            if self.sliding_window_splitter_uuid:self.forward_raw_merge_imgs()
-
-            return [i.data() for i in self._sliding_window_splitter.input_mats]
-
-        def _extract_preds(self, preds):
-            if hasattr(preds, 'pred'):
-                preds = preds.pred
-                preds = np.vstack([d.cpu().numpy() for d in preds])
-            elif hasattr(preds, 'boxes'):
-                bs = preds.boxes
-                xyxy = bs.xyxy.cpu().numpy()
-                conf = bs.conf.cpu().numpy()
-                cls = bs.cls.cpu().numpy()
-                preds = np.hstack([xyxy, conf.reshape(-1, 1), cls.reshape(-1, 1)])
-            return preds
 
     class YOLO(ImageMatProcessor):
         title:str='YOLO_detections'
@@ -1223,6 +1224,7 @@ class Processors:
             for d in devices:
                 if d not in self._models:
                     self._models[d] = YOLO(self.modelname, task='detect').to(d)
+    
     # TODO
     class YoloRT(YOLO):
         def __init__(
@@ -1263,7 +1265,7 @@ class ImageMatProcessors(BaseModel):
                 for fn in pipes:
                         imgs,meta = fn.validate(imgs,meta)            
             except Exception as e:
-                print(fn.uuid,e)
+                logger(fn.uuid,e)
                 raise e
         else:
             for fn in pipes:
