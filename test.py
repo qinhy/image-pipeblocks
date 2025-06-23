@@ -1,7 +1,11 @@
 import json
+from typing import List, Tuple
+
+import cv2
+import numpy as np
+import torch
 from generator import ImageMatGenerators, VideoFrameGenerator, XVSdkRGBDGenerator
-import processors
-from processors import *
+from processors import ImageMatProcessors, Processors
 from ImageMat import ImageMat, ColorType
 
 def test1():
@@ -11,26 +15,26 @@ def test1():
     print("ImageMat created:", img_mat.info)
 
     # Test CvDebayerBlock
-    debayer_block = CvDebayer()
+    debayer_block = Processors.CvDebayer()
     debayered_imgs, _ = debayer_block.validate([img_mat])
     print("Debayered image shape:", debayered_imgs[0].data().shape)
 
     # Test TorchResizeBlock
     torch_image = torch.rand(1, 3, 100, 100)
     img_mat_torch = ImageMat(color_type="RGB").build(torch_image)
-    resize_block = TorchResize(target_size=(50, 50))
+    resize_block = Processors.TorchResize(target_size=(50, 50))
     resized_imgs, _ = resize_block.validate([img_mat_torch])
     print("Resized torch image shape:", resized_imgs[0].data().shape)
 
     # Test NumpyBGRToTorchRGBBlock
     bgr_image = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
     img_mat_bgr = ImageMat(color_type="BGR").build(bgr_image)
-    bgr_to_rgb_block = NumpyBGRToTorchRGB()
+    bgr_to_rgb_block = Processors.NumpyBGRToTorchRGB()
     rgb_imgs, _ = bgr_to_rgb_block.validate([img_mat_bgr])
     print("Converted torch RGB image shape:", rgb_imgs[0].data().shape)
 
     # Test TileNumpyImagesBlock
-    tile_block = TileNumpyImages(tile_width=2)
+    tile_block = Processors.TileNumpyImages(tile_width=2)
     images = [ImageMat(color_type="BGR").build(np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)) for _ in range(4)]
     tiled_imgs, _ = tile_block.validate(images)
     print("Tiled image shape:", tiled_imgs[0].data().shape)
@@ -64,14 +68,14 @@ def test1():
 
     # 4. TorchResizeBlock error for wrong input shape
     try:
-        TorchResize(target_size=(20, 20)).validate([ImageMat(np.zeros((10, 10), dtype=np.uint8), "grayscale")])
+        Processors.TorchResize(target_size=(20, 20)).validate([ImageMat(np.zeros((10, 10), dtype=np.uint8), "grayscale")])
         print("ERROR: TorchResizeBlock accepted numpy input.")
     except TypeError:
         print("Pass: TorchResizeBlock rejects non-torch input.")
 
     # 5. NumpyBGRToTorchRGBBlock error for wrong color
     try:
-        NumpyBGRToTorchRGB().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "RGB")])
+        Processors.NumpyBGRToTorchRGB().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "RGB")])
         print("ERROR: NumpyBGRToTorchRGBBlock accepted wrong color.")
     except Exception as e:
         print("Pass: NumpyBGRToTorchRGBBlock rejects non-BGR input.")
@@ -79,26 +83,26 @@ def test1():
     # 6. Test CVResizeBlock on HW and HWC
     gray_img = ImageMat(color_type="grayscale").build(np.random.randint(0, 255, (8, 8), dtype=np.uint8))
     color_img = ImageMat(color_type="BGR").build(np.random.randint(0, 255, (8, 8, 3), dtype=np.uint8))
-    cvresize = CVResize(target_size=(4, 4))
+    cvresize = Processors.CVResize(target_size=(4, 4))
     imgs, _ = cvresize.validate([gray_img, color_img])
     assert imgs[0].data().shape == (4, 4) or imgs[0].data().shape == (4, 4, 3)
     print("Pass: CVResizeBlock resizes HW and HWC formats.")
 
     # 7. TileNumpyImagesBlock error for non-HWC shape
     try:
-        TileNumpyImages(2).validate([gray_img])
+        Processors.TileNumpyImages(2).validate([gray_img])
         print("ERROR: TileNumpyImagesBlock accepted HW shape.")
     except Exception as e:
         print("Pass: TileNumpyImagesBlock rejects HW input.")
 
     # 8. EncodeNumpyToJpegBlock positive and error test
-    encoder = EncodeNumpyToJpeg(quality=80)
+    encoder = Processors.EncodeNumpyToJpeg(quality=80)
     encoded, _ = encoder.validate([color_img])
     assert isinstance(encoded[0].data(), np.ndarray) and encoded[0].data().dtype == np.uint8
     print("Pass: EncodeNumpyToJpegBlock works on HWC.")
 
     try:
-        EncodeNumpyToJpeg().validate([gray_img])
+        Processors.EncodeNumpyToJpeg().validate([gray_img])
         print("Pass: EncodeNumpyToJpegBlock encodes grayscale (HW) images (should raise).")
     except Exception as e:
         print("Pass: EncodeNumpyToJpegBlock correctly rejects HW input.")
@@ -106,30 +110,30 @@ def test1():
     # 9. TorchRGBToNumpyBGRBlock: accept torch RGB, error for wrong shape
     rgb_tensor = torch.rand(1, 3, 20, 20)
     rgb_img = ImageMat(color_type="RGB").build(rgb_tensor)
-    out, _ = TorchRGBToNumpyBGR().validate([rgb_img])
+    out, _ = Processors.TorchRGBToNumpyBGR().validate([rgb_img])
     assert out[0].data().shape == (20, 20, 3)
     print("Pass: TorchRGBToNumpyBGRBlock converts to numpy BGR.")
 
     try:
-        TorchRGBToNumpyBGR().validate([ImageMat(np.zeros((20, 20, 3), dtype=np.uint8), "BGR")])
+        Processors.TorchRGBToNumpyBGR().validate([ImageMat(np.zeros((20, 20, 3), dtype=np.uint8), "BGR")])
         print("ERROR: TorchRGBToNumpyBGRBlock accepted numpy.")
     except TypeError:
         print("Pass: TorchRGBToNumpyBGRBlock rejects numpy input.")
 
     # 10. NumpyBayerToTorchBayerBlock works and errors
     bayer_np = ImageMat(color_type="bayer").build(np.random.randint(0, 255, (10, 10), dtype=np.uint8))
-    result, _ = NumpyBayerToTorchBayer().validate([bayer_np])
+    result, _ = Processors.NumpyBayerToTorchBayer().validate([bayer_np])
     assert isinstance(result[0].data(), torch.Tensor)
     print("Pass: NumpyBayerToTorchBayerBlock converts Bayer.")
 
     try:
-        NumpyBayerToTorchBayer().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "BGR")])
+        Processors.NumpyBayerToTorchBayer().validate([ImageMat(np.zeros((10, 10, 3), dtype=np.uint8), "BGR")])
         print("ERROR: NumpyBayerToTorchBayerBlock accepted non-HW input.")
     except Exception as e:
         print("Pass: NumpyBayerToTorchBayerBlock rejects non-HW input.")
 
     # 11. MergeYoloResultsBlock: no result in meta, returns as is
-    merge = MergeYoloResults(yolo_results_uuid="not-in-meta")
+    merge = Processors.MergeYoloResults(yolo_results_uuid="not-in-meta")
     input_imgs = [ImageMat(color_type="BGR").build(np.zeros((10, 10, 3), dtype=np.uint8))]
     out, meta = merge(input_imgs, {})
     assert out == input_imgs
@@ -161,31 +165,31 @@ def build_image_pipeline(
     bayer_mats,meta = init(bayer_images)
 
     # 2. Numpy Bayer -> Torch Bayer
-    np2torch_block = NumpyBayerToTorchBayer()
+    np2torch_block = Processors.NumpyBayerToTorchBayer()
     torch_bayer_imgs, meta = np2torch_block.validate(bayer_mats, meta)
 
     # 3. Debayer (Demosaic) to RGB
     if debayer_backend == 'torch':
-        debayer_block = TorchDebayer()
+        debayer_block = Processors.TorchDebayer()
     else:
         # cv2: use BG2BGR, change as needed for your Bayer pattern
-        debayer_block = CvDebayer(format=cv2.COLOR_BAYER_BG2BGR)
+        debayer_block = Processors.CvDebayer(format=cv2.COLOR_BAYER_BG2BGR)
     torch_rgb_imgs, meta = debayer_block.validate(torch_bayer_imgs, meta)
 
     # 4. Resize
-    resize_block = TorchResize(target_size=resize_to)
+    resize_block = Processors.TorchResize(target_size=resize_to)
     torch_rgb_imgs, meta = resize_block.validate(torch_rgb_imgs, meta)
 
     # 5. Torch RGB -> Numpy BGR
-    torch2np_block = TorchRGBToNumpyBGR()
+    torch2np_block = Processors.TorchRGBToNumpyBGR()
     bgr_imgs, meta = torch2np_block.validate(torch_rgb_imgs, meta)
 
     # 6. Tile images
-    tile_block = TileNumpyImages(tile_width=tile_width)
+    tile_block = Processors.TileNumpyImages(tile_width=tile_width)
     tiled_imgs, meta = tile_block.validate(bgr_imgs, meta)
 
     # 7. Encode to JPEG
-    jpeg_block = EncodeNumpyToJpeg(quality=jpeg_quality)
+    jpeg_block = Processors.EncodeNumpyToJpeg(quality=jpeg_quality)
     jpeg_imgs, meta = jpeg_block.validate(tiled_imgs, meta)
     
     def run(bayer_images: List[np.ndarray]):
@@ -228,32 +232,32 @@ def build_image_pipeline_gpu(
 
     # 2. Numpy Bayer -> Torch Bayer (on GPU)
     # The block will detect CUDA availability; we force device here.
-    np2torch_block = NumpyBayerToTorchBayer(dtype=torch_dtype,gpu=True)
+    np2torch_block = Processors.NumpyBayerToTorchBayer(dtype=torch_dtype,gpu=True)
 
     torch_bayer_imgs, meta = np2torch_block.validate(bayer_mats, meta)
 
     # 3. Debayer (GPU)
     if debayer_backend == 'torch':
-        debayer_block = TorchDebayer()
+        debayer_block = Processors.TorchDebayer()
     else:
-        debayer_block = CvDebayer(format=cv2.COLOR_BAYER_BG2BGR)
+        debayer_block = Processors.CvDebayer(format=cv2.COLOR_BAYER_BG2BGR)
     torch_rgb_imgs, meta = debayer_block.validate(torch_bayer_imgs, meta)
 
     # 4. Resize (GPU)
-    resize_block = TorchResize(target_size=resize_to)
+    resize_block = Processors.TorchResize(target_size=resize_to)
     torch_rgb_imgs, meta = resize_block.validate(torch_rgb_imgs, meta)
 
     # 5. Torch RGB -> Numpy BGR (CPU, so move to CPU here)
-    torch2np_block = TorchRGBToNumpyBGR()
+    torch2np_block = Processors.TorchRGBToNumpyBGR()
 
     bgr_imgs, meta = torch2np_block.validate(torch_rgb_imgs, meta)
 
     # 6. Tile (CPU)
-    tile_block = TileNumpyImages(tile_width=tile_width)
+    tile_block = Processors.TileNumpyImages(tile_width=tile_width)
     tiled_imgs, meta = tile_block.validate(bgr_imgs, meta)
 
     # 7. JPEG (CPU)
-    jpeg_block = EncodeNumpyToJpeg(quality=jpeg_quality)
+    jpeg_block = Processors.EncodeNumpyToJpeg(quality=jpeg_quality)
     jpeg_imgs, meta = jpeg_block.validate(tiled_imgs, meta)
 
     def run(bayer_images: List[np.ndarray]) -> List[np.ndarray]:
@@ -311,10 +315,10 @@ def test_vid_show(mp4s=[]):
     )
     # pipes.append(SlidingWindowSplitter(window_size=(480//2,854//2)))
     
-    pipes.append(NumpyBGRToTorchRGB())
-    pipes.append(TorchResize(target_size=(640,640)))
-    pipes.append(YOLO())
-    pipes.append(NumpyRGBToNumpyBGR())
+    pipes.append(Processors.NumpyBGRToTorchRGB())
+    pipes.append(Processors.TorchResize(target_size=(640,640)))
+    pipes.append(Processors.YOLO())
+    pipes.append(Processors.NumpyRGBToNumpyBGR())
 
     # pipes.append(NumpyImageMask(
     #     mask_image_path="./data/MaskImage.png"))
@@ -324,7 +328,7 @@ def test_vid_show(mp4s=[]):
     # pipes.append(TorchRGBToNumpyBGR())
     
     # Create a simple viewer
-    pipes.append(CvImageViewer(
+    pipes.append(Processors.CvImageViewer(
         window_name_prefix="MultiVideoTest",
         resizable=False,
         scale=0.5,
@@ -355,8 +359,8 @@ def test_vid_show(mp4s=[]):
 def test_xvsdk_show(output_filename="./out.mp4"):
     pipes = [
         # Create a simple viewer
-        TileNumpyImages(tile_width=1),        
-        CvImageViewer(
+        Processors.TileNumpyImages(tile_width=1),        
+        Processors.CvImageViewer(
             window_name_prefix="MultiVideoTest",
             resizable=False,
             scale=0.5,
@@ -365,7 +369,7 @@ def test_xvsdk_show(output_filename="./out.mp4"):
     
     if output_filename:
         pipes += [
-            CvVideoRecorder(
+            Processors.CvVideoRecorder(
                 output_filename=output_filename,
                 fps=30,
             ),
