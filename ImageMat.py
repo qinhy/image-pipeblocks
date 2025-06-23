@@ -25,6 +25,7 @@ class ColorType(str, enum.Enum):
     RGB = 'RGB'
     BGR = 'BGR'
     JPEG = 'jpeg'
+    UNKNOWN = 'unknown'
 
 COLOR_TYPE_CHANNELS = {
     ColorType.BAYER: [1],
@@ -210,14 +211,18 @@ class ImageMatProcessor(BaseModel):
         
     title:str
     uuid:str = ''
+    pixel_idx_forward_T : List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    pixel_idx_backward_T: List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
     save_results_to_meta:bool = False
-    _enable:bool = True
-    meta:dict = {}
     input_mats: List[ImageMat] = []
     out_mats: List[ImageMat] = []
+    meta:dict = {}
+    
     num_devices:list[str] = ['cpu']
     num_gpus:int = 0
     _enable:bool = True
+    _eye:list = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
     def model_post_init(self, context: Any, /) -> None:
         if len(self.title)==0:
@@ -249,7 +254,7 @@ class ImageMatProcessor(BaseModel):
             output_imgs, meta = self.forward(imgs, meta)
             
         if self.save_results_to_meta:
-            meta[self.uuid] = [i.copy() for i in output_imgs]
+            meta[self.uuid] = self#[i.copy() for i in output_imgs]
 
         return output_imgs, meta
     
@@ -265,7 +270,8 @@ class ImageMatProcessor(BaseModel):
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
-        converted_raw_imgs = self.forward_raw([img.data() for img in validated_imgs])
+        converted_raw_imgs = self.forward_raw([img.data() for img in validated_imgs],
+                                              [img.info for img in validated_imgs])
         self.input_mats = validated_imgs
         self.build_out_mats(validated_imgs,converted_raw_imgs)
         return self.forward(validated_imgs, meta)
@@ -276,18 +282,25 @@ class ImageMatProcessor(BaseModel):
             ).build(img)
             for old,img in zip(validated_imgs,converted_raw_imgs)]
     
-    def forward_raw(self, imgs: List[Any]) -> List["Any"]:
+    def forward_raw(self, imgs: List[Any], imgs_info: List[ImageMatInfo]=[]) -> List[Any]:
         raise NotImplementedError()
     
+    def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
+        self.pixel_idx_forward_T = [self._eye for _ in range(len(imgs_info))]
+        self.pixel_idx_backward_T = [self._eye for _ in range(len(imgs_info))]
+    
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
-        forwarded_imgs = self.forward_raw([img.data() for img in imgs])
+        infos = [img.info for img in imgs]
+        if len(self.pixel_idx_forward_T)==0:
+            self.build_pixel_transform_matrix(infos)
+                
+        forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos)
         output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]        
         return output_imgs, meta
 
     def get_converted_imgs(self, meta: Dict = {}):
         """Retrieve forwarded images from metadata if stored."""
         return meta.get(self.uuid, None)
-
 
 class ImageMatGenerator(BaseModel):
     sources: list[str] = str

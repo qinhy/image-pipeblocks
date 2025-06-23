@@ -85,8 +85,10 @@ class ImageMatGenerator(BaseModel):
     def __del__(self):
         self.release()
 
-class VideoFrameGenerator(ImageMatGenerator):
+class CvVideoFrameGenerator(ImageMatGenerator):
+    color_types: list['ColorType'] = Field(default_factory=list)
     def create_frame_generator(self, source):
+        self.color_types.append(ColorType.BGR)
         cap = self.register_resource(cv2.VideoCapture(source))
         if not cap.isOpened():
             raise ValueError(f"Cannot open video source: {source}")
@@ -379,7 +381,7 @@ class ImageMatGenerators(BaseModel):
     @staticmethod
     def loads(gen_json:str)->ImageMatGenerator:
         gen = {
-            'VideoFrameGenerator':VideoFrameGenerator,
+            'CvVideoFrameGenerator':CvVideoFrameGenerator,
             'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
             'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
             'BitFlowFrameGenerator':BitFlowFrameGenerator,

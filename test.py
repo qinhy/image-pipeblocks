@@ -4,7 +4,7 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import torch
-from generator import ImageMatGenerators, VideoFrameGenerator, XVSdkRGBDGenerator
+from generator import ImageMatGenerators, CvVideoFrameGenerator, XVSdkRGBDGenerator
 from processors import ImageMatProcessors, Processors
 from ImageMat import ImageMat, ColorType
 
@@ -306,17 +306,17 @@ def test_vid_show(mp4s=[]):
     if len(mp4s)==0:return print('Not mp4s.')
     pipes = []
     # Create multi-video generator
-    gen = multi_video_gen = VideoFrameGenerator(
+    gen = multi_video_gen = CvVideoFrameGenerator(
         sources=mp4s,
-        color_types=[ColorType.BGR for _ in mp4s],  # Or ColorType.RGB, as needed
-        # scale=0.5,                 # Resize frames for speed, optional
-        # step=1,                    # No frame skipping
-        # max_frames=10              # Limit to 10 frames for quick testing
+        # scale=0.5,        # Resize frames for speed, optional
+        # step=1,           # No frame skipping
+        # max_frames=10     # Limit to 10 frames for quick testing
     )
-    # pipes.append(SlidingWindowSplitter(window_size=(480//2,854//2)))
-    
+    dh = (640-480)//2
+    dw = (1280-854)//2
+    pipes.append(Processors.NumpyPadImage(pad_width=((dh,dh),(dw,dw)))) # ((top, bottom), (left, right))
+    pipes.append(Processors.SlidingWindowSplitter(window_size=(640,640)))
     pipes.append(Processors.NumpyBGRToTorchRGB())
-    pipes.append(Processors.TorchResize(target_size=(640,640)))
     pipes.append(Processors.YOLO())
     pipes.append(Processors.NumpyRGBToNumpyBGR())
 
@@ -393,6 +393,6 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 if __name__ == "__main__":
     # test_xvsdk_show()
     test_vid_show(['./data/Serene Valley Vista.avi','./data/Object Test Area.avi'])
-    # test1()
-    # test_build_image_pipeline()
-    # test_build_image_pipeline_gpu()
+    test1()
+    test_build_image_pipeline()
+    test_build_image_pipeline_gpu()
