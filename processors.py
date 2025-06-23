@@ -63,243 +63,6 @@ class CvDebayer(ImageMatProcessor):
     def forward_raw(self,imgs_data)->List[np.ndarray]:
         return [cv2.cvtColor(i,self.format) for i in imgs_data]
 
-class TorchDebayer(ImageMatProcessor):
-    ### Define the `Debayer5x5` PyTorch Model
-    # The `Debayer5x5` model applies a **5x5 convolution filter** to interpolate missing 
-    # color information from a Bayer pattern.
-    # in list of Bx1xHxW tensor [0.0 ~ 1.0)
-    # out list of Bx3xHxW tensor [0.0 ~ 1.0)
-
-    class Debayer5x5(torch.nn.Module):
-        # from https://github.com/cheind/pytorch-debayer
-        """Demosaicing of Bayer images using Malver-He-Cutler algorithm.
-
-        Requires BG-Bayer color filter array layout. That is,
-        the image[1,1]='B', image[1,2]='G'. This corresponds
-        to OpenCV naming conventions.
-
-        Compared to Debayer2x2 this method does not use upsampling.
-        Compared to Debayer3x3 the algorithm gives sharper edges and
-        less chromatic effects.
-
-        ## References
-        Malvar, Henrique S., Li-wei He, and Ross Cutler.
-        "High-quality linear interpolation for demosaicing of Bayer-patterned
-        color images." 2004
-        """
-        class Layout(enum.Enum):
-            """Possible Bayer color filter array layouts.
-
-            The value of each entry is the color index (R=0,G=1,B=2)
-            within a 2x2 Bayer block.
-            """
-            RGGB = (0, 1, 1, 2)
-            GRBG = (1, 0, 2, 1)
-            GBRG = (1, 2, 0, 1)
-            BGGR = (2, 1, 1, 0)
-
-        def __init__(self, layout: Layout = Layout.RGGB):
-            super(TorchDebayer.Debayer5x5, self).__init__()
-            self.layout = layout
-            # fmt: off
-            self.kernels = torch.nn.Parameter(
-                torch.tensor(
-                    [
-                        # G at R,B locations
-                        # scaled by 16
-                        [ 0,  0, -2,  0,  0], # noqa
-                        [ 0,  0,  4,  0,  0], # noqa
-                        [-2,  4,  8,  4, -2], # noqa
-                        [ 0,  0,  4,  0,  0], # noqa
-                        [ 0,  0, -2,  0,  0], # noqa
-
-                        # R,B at G in R rows
-                        # scaled by 16
-                        [ 0,  0,  1,  0,  0], # noqa
-                        [ 0, -2,  0, -2,  0], # noqa
-                        [-2,  8, 10,  8, -2], # noqa
-                        [ 0, -2,  0, -2,  0], # noqa
-                        [ 0,  0,  1,  0,  0], # noqa
-
-                        # R,B at G in B rows
-                        # scaled by 16
-                        [ 0,  0, -2,  0,  0], # noqa
-                        [ 0, -2,  8, -2,  0], # noqa
-                        [ 1,  0, 10,  0,  1], # noqa
-                        [ 0, -2,  8, -2,  0], # noqa
-                        [ 0,  0, -2,  0,  0], # noqa
-
-                        # R at B and B at R
-                        # scaled by 16
-                        [ 0,  0, -3,  0,  0], # noqa
-                        [ 0,  4,  0,  4,  0], # noqa
-                        [-3,  0, 12,  0, -3], # noqa
-                        [ 0,  4,  0,  4,  0], # noqa
-                        [ 0,  0, -3,  0,  0], # noqa
-
-                        # R at R, B at B, G at G
-                        # identity kernel not shown
-                    ]
-                ).view(4, 1, 5, 5).float() / 16.0,
-                requires_grad=False,
-            )
-            # fmt: on
-
-            self.index = torch.nn.Parameter(
-                # Below, note that index 4 corresponds to identity kernel
-                self._index_from_layout(layout),
-                requires_grad=False,
-            )
-
-        def forward(self, x):
-            """Debayer image.
-
-            Parameters
-            ----------
-            x : Bx1xHxW tensor [0.0 ~ 1.0)
-                Images to debayer
-
-            Returns
-            -------
-            rgb : Bx3xHxW tensor [0.0 ~ 1.0)
-                Color images in RGB channel order.
-            """
-            B, C, H, W = x.shape
-
-            xpad = torch.nn.functional.pad(x, (2, 2, 2, 2), mode="reflect")
-            planes = torch.nn.functional.conv2d(xpad, self.kernels, stride=1)
-            planes = torch.cat(
-                (planes, x), 1
-            )  # Concat with input to give identity kernel Bx5xHxW
-            rgb = torch.gather(
-                planes,
-                1,
-                self.index.repeat(
-                    1,
-                    1,
-                    torch.div(H, 2, rounding_mode="floor"),
-                    torch.div(W, 2, rounding_mode="floor"),
-                ).expand(
-                    B, -1, -1, -1
-                ),  # expand for singleton batch dimension is faster
-            )
-            return torch.clamp(rgb, 0, 1)
-
-        def _index_from_layout(self, layout: Layout = Layout) -> torch.Tensor:
-            """Returns a 1x3x2x2 index tensor for each color RGB in a 2x2 bayer tile.
-
-            Note, the index corresponding to the identity kernel is 4, which will be
-            correct after concatenating the convolved output with the input image.
-            """
-            #       ...
-            # ... b g b g ...
-            # ... g R G r ...
-            # ... b G B g ...
-            # ... g r g r ...
-            #       ...
-            # fmt: off
-            rggb = torch.tensor(
-                [
-                    # dest channel r
-                    [4, 1],  # pixel is R,G1
-                    [2, 3],  # pixel is G2,B
-                    # dest channel g
-                    [0, 4],  # pixel is R,G1
-                    [4, 0],  # pixel is G2,B
-                    # dest channel b
-                    [3, 2],  # pixel is R,G1
-                    [1, 4],  # pixel is G2,B
-                ]
-            ).view(1, 3, 2, 2)
-            # fmt: on
-            return {
-                layout.RGGB: rggb,
-                layout.GRBG: torch.roll(rggb, 1, -1),
-                layout.GBRG: torch.roll(rggb, 1, -2),
-                layout.BGGR: torch.roll(rggb, (1, 1), (-1, -2)),
-            }.get(layout)
-
-
-        #### Key Features:
-        # - Implements **Malvar-He-Cutler** algorithm for Bayer interpolation.
-        # - Supports **different Bayer layouts** (`RGGB`, `GRBG`, `GBRG`, `BGGR`).
-        # - Uses **fixed convolution kernels** for demosaicing.
-    title:str='torch_debayer'
-    _debayer_models:List['TorchDebayer.Debayer5x5'] = []
-    _input_devices = []  # To track device of each input tensor
-
-    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-        """Validate input images and initialize debayer models."""
-        self.input_mats = [i for i in imgs]
-        self._input_devices = []
-
-        for img in self.input_mats:
-            img.require_torch_tensor()
-            img.require_BCHW()
-            img.require_BAYER()
-
-            # Save input device for tracking
-            self._input_devices.append(img.info.device)
-
-            # Initialize and store model on the corresponding device
-            model = TorchDebayer.Debayer5x5().to(img.info.device).to(img.info._dtype)
-            self._debayer_models.append(model)
-    
-    
-        # Perform debayering after validation
-        debayered_imgs = self.forward_raw([img.data() for img in imgs])
-        self.out_mats = [ImageMat(color_type="RGB").build(i) for i in debayered_imgs]
-        processed_imgs, meta = self.forward(imgs, meta)
-        return processed_imgs, meta
-    
-    def forward_raw(self,imgs_data:List[torch.Tensor])->List[torch.Tensor]:
-        debayered_imgs = []
-        for i, img in enumerate(imgs_data):
-            model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
-            debayered_imgs.append(model(img))
-        return debayered_imgs
-
-class TorchRGBToNumpyBGR(ImageMatProcessor):
-    title:str='torch_rgb_to_numpy_bgr'
-    def model_post_init(self, context):
-        self.num_devices = self.devices_info()  # Number of available GPUs
-        return super().model_post_init(context)
-
-    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-        """
-        Validates input images before conversion.
-        Ensures that they are PyTorch tensors in RGB format with BCHW shape.
-        """
-        self.input_mats = [i for i in imgs]
-        validated_imgs: List[ImageMat] = []
-
-        for img in imgs:
-            img.require_torch_tensor()
-            img.require_BCHW()
-            img.require_RGB()
-            validated_imgs.append(img)
-
-        # Create new ImageMat instances for output
-        converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-        self.out_mats = [ImageMat(color_type="BGR").build(img) for img in converted_imgs]
-        return self.forward(validated_imgs, meta)
-
-    def forward_raw(self, imgs_data: List[torch.Tensor]) -> List[np.ndarray]:
-        """
-        Converts a batch of RGB tensors (torch.Tensor) to BGR images (NumPy).
-        """
-        bgr_images = []
-        for img in imgs_data:
-            if img.device.type != 'cpu':
-                img = img.cpu()  # Move tensor to CPU before conversion
-
-            img = img.squeeze(0).permute(1, 2, 0).numpy()  # Convert BCHW to HWC
-            img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)  
-            # Normalize if needed
-            img = img[:, :, ::-1]  # Convert RGB to BGR
-            bgr_images.append(img)
-        return bgr_images
-
 class NumpyBGRToTorchRGB(ImageMatProcessor):
     title:str='numpy_bgr_to_torch_rgb'
     gpu:bool=True
@@ -421,6 +184,47 @@ class NumpyBayerToTorchBayer(ImageMatProcessor):
                                     ).div(255.0).unsqueeze(0).unsqueeze(0)
             torch_images.append(tensor_img)
         return torch_images
+
+class TorchRGBToNumpyBGR(ImageMatProcessor):
+    title:str='torch_rgb_to_numpy_bgr'
+    def model_post_init(self, context):
+        self.num_devices = self.devices_info()  # Number of available GPUs
+        return super().model_post_init(context)
+
+    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
+        """
+        Validates input images before conversion.
+        Ensures that they are PyTorch tensors in RGB format with BCHW shape.
+        """
+        self.input_mats = [i for i in imgs]
+        validated_imgs: List[ImageMat] = []
+
+        for img in imgs:
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_RGB()
+            validated_imgs.append(img)
+
+        # Create new ImageMat instances for output
+        converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
+        self.out_mats = [ImageMat(color_type="BGR").build(img) for img in converted_imgs]
+        return self.forward(validated_imgs, meta)
+
+    def forward_raw(self, imgs_data: List[torch.Tensor]) -> List[np.ndarray]:
+        """
+        Converts a batch of RGB tensors (torch.Tensor) to BGR images (NumPy).
+        """
+        bgr_images = []
+        for img in imgs_data:
+            if img.device.type != 'cpu':
+                img = img.cpu()  # Move tensor to CPU before conversion
+
+            img = img.squeeze(0).permute(1, 2, 0).numpy()  # Convert BCHW to HWC
+            img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)  
+            # Normalize if needed
+            img = img[:, :, ::-1]  # Convert RGB to BGR
+            bgr_images.append(img)
+        return bgr_images
 
 class TorchResize(ImageMatProcessor):
     title:str='torch_resize'
@@ -591,7 +395,6 @@ class TileNumpyImages(ImageMatProcessor):
                 x_offset += col_widths[col]
             y_offset += row_heights[row]
         return [canvas]
-
 
 class EncodeNumpyToJpeg(ImageMatProcessor):
     title:str='encode_numpy_to_jpeg'
@@ -943,6 +746,202 @@ class TorchImageMask(NumpyImageMask):
 
         masks = self._masks["resized_masks"]
         return [image * mask for image, mask in zip(imgs_data, masks)]
+
+class TorchDebayer(ImageMatProcessor):
+    ### Define the `Debayer5x5` PyTorch Model
+    # The `Debayer5x5` model applies a **5x5 convolution filter** to interpolate missing 
+    # color information from a Bayer pattern.
+    # in list of Bx1xHxW tensor [0.0 ~ 1.0)
+    # out list of Bx3xHxW tensor [0.0 ~ 1.0)
+
+    class Debayer5x5(torch.nn.Module):
+        # from https://github.com/cheind/pytorch-debayer
+        """Demosaicing of Bayer images using Malver-He-Cutler algorithm.
+
+        Requires BG-Bayer color filter array layout. That is,
+        the image[1,1]='B', image[1,2]='G'. This corresponds
+        to OpenCV naming conventions.
+
+        Compared to Debayer2x2 this method does not use upsampling.
+        Compared to Debayer3x3 the algorithm gives sharper edges and
+        less chromatic effects.
+
+        ## References
+        Malvar, Henrique S., Li-wei He, and Ross Cutler.
+        "High-quality linear interpolation for demosaicing of Bayer-patterned
+        color images." 2004
+        """
+        class Layout(enum.Enum):
+            """Possible Bayer color filter array layouts.
+
+            The value of each entry is the color index (R=0,G=1,B=2)
+            within a 2x2 Bayer block.
+            """
+            RGGB = (0, 1, 1, 2)
+            GRBG = (1, 0, 2, 1)
+            GBRG = (1, 2, 0, 1)
+            BGGR = (2, 1, 1, 0)
+
+        def __init__(self, layout: Layout = Layout.RGGB):
+            super(TorchDebayer.Debayer5x5, self).__init__()
+            self.layout = layout
+            # fmt: off
+            self.kernels = torch.nn.Parameter(
+                torch.tensor(
+                    [
+                        # G at R,B locations
+                        # scaled by 16
+                        [ 0,  0, -2,  0,  0], # noqa
+                        [ 0,  0,  4,  0,  0], # noqa
+                        [-2,  4,  8,  4, -2], # noqa
+                        [ 0,  0,  4,  0,  0], # noqa
+                        [ 0,  0, -2,  0,  0], # noqa
+
+                        # R,B at G in R rows
+                        # scaled by 16
+                        [ 0,  0,  1,  0,  0], # noqa
+                        [ 0, -2,  0, -2,  0], # noqa
+                        [-2,  8, 10,  8, -2], # noqa
+                        [ 0, -2,  0, -2,  0], # noqa
+                        [ 0,  0,  1,  0,  0], # noqa
+
+                        # R,B at G in B rows
+                        # scaled by 16
+                        [ 0,  0, -2,  0,  0], # noqa
+                        [ 0, -2,  8, -2,  0], # noqa
+                        [ 1,  0, 10,  0,  1], # noqa
+                        [ 0, -2,  8, -2,  0], # noqa
+                        [ 0,  0, -2,  0,  0], # noqa
+
+                        # R at B and B at R
+                        # scaled by 16
+                        [ 0,  0, -3,  0,  0], # noqa
+                        [ 0,  4,  0,  4,  0], # noqa
+                        [-3,  0, 12,  0, -3], # noqa
+                        [ 0,  4,  0,  4,  0], # noqa
+                        [ 0,  0, -3,  0,  0], # noqa
+
+                        # R at R, B at B, G at G
+                        # identity kernel not shown
+                    ]
+                ).view(4, 1, 5, 5).float() / 16.0,
+                requires_grad=False,
+            )
+            # fmt: on
+
+            self.index = torch.nn.Parameter(
+                # Below, note that index 4 corresponds to identity kernel
+                self._index_from_layout(layout),
+                requires_grad=False,
+            )
+
+        def forward(self, x):
+            """Debayer image.
+
+            Parameters
+            ----------
+            x : Bx1xHxW tensor [0.0 ~ 1.0)
+                Images to debayer
+
+            Returns
+            -------
+            rgb : Bx3xHxW tensor [0.0 ~ 1.0)
+                Color images in RGB channel order.
+            """
+            B, C, H, W = x.shape
+
+            xpad = torch.nn.functional.pad(x, (2, 2, 2, 2), mode="reflect")
+            planes = torch.nn.functional.conv2d(xpad, self.kernels, stride=1)
+            planes = torch.cat(
+                (planes, x), 1
+            )  # Concat with input to give identity kernel Bx5xHxW
+            rgb = torch.gather(
+                planes,
+                1,
+                self.index.repeat(
+                    1,
+                    1,
+                    torch.div(H, 2, rounding_mode="floor"),
+                    torch.div(W, 2, rounding_mode="floor"),
+                ).expand(
+                    B, -1, -1, -1
+                ),  # expand for singleton batch dimension is faster
+            )
+            return torch.clamp(rgb, 0, 1)
+
+        def _index_from_layout(self, layout: Layout = Layout) -> torch.Tensor:
+            """Returns a 1x3x2x2 index tensor for each color RGB in a 2x2 bayer tile.
+
+            Note, the index corresponding to the identity kernel is 4, which will be
+            correct after concatenating the convolved output with the input image.
+            """
+            #       ...
+            # ... b g b g ...
+            # ... g R G r ...
+            # ... b G B g ...
+            # ... g r g r ...
+            #       ...
+            # fmt: off
+            rggb = torch.tensor(
+                [
+                    # dest channel r
+                    [4, 1],  # pixel is R,G1
+                    [2, 3],  # pixel is G2,B
+                    # dest channel g
+                    [0, 4],  # pixel is R,G1
+                    [4, 0],  # pixel is G2,B
+                    # dest channel b
+                    [3, 2],  # pixel is R,G1
+                    [1, 4],  # pixel is G2,B
+                ]
+            ).view(1, 3, 2, 2)
+            # fmt: on
+            return {
+                layout.RGGB: rggb,
+                layout.GRBG: torch.roll(rggb, 1, -1),
+                layout.GBRG: torch.roll(rggb, 1, -2),
+                layout.BGGR: torch.roll(rggb, (1, 1), (-1, -2)),
+            }.get(layout)
+
+
+        #### Key Features:
+        # - Implements **Malvar-He-Cutler** algorithm for Bayer interpolation.
+        # - Supports **different Bayer layouts** (`RGGB`, `GRBG`, `GBRG`, `BGGR`).
+        # - Uses **fixed convolution kernels** for demosaicing.
+    title:str='torch_debayer'
+    _debayer_models:List['TorchDebayer.Debayer5x5'] = []
+    _input_devices = []  # To track device of each input tensor
+
+    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
+        """Validate input images and initialize debayer models."""
+        self.input_mats = [i for i in imgs]
+        self._input_devices = []
+
+        for img in self.input_mats:
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_BAYER()
+
+            # Save input device for tracking
+            self._input_devices.append(img.info.device)
+
+            # Initialize and store model on the corresponding device
+            model = TorchDebayer.Debayer5x5().to(img.info.device).to(img.info._dtype)
+            self._debayer_models.append(model)
+    
+    
+        # Perform debayering after validation
+        debayered_imgs = self.forward_raw([img.data() for img in imgs])
+        self.out_mats = [ImageMat(color_type="RGB").build(i) for i in debayered_imgs]
+        processed_imgs, meta = self.forward(imgs, meta)
+        return processed_imgs, meta
+    
+    def forward_raw(self,imgs_data:List[torch.Tensor])->List[torch.Tensor]:
+        debayered_imgs = []
+        for i, img in enumerate(imgs_data):
+            model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
+            debayered_imgs.append(model(img))
+        return debayered_imgs
 
 # TODO
 class YOLO(ImageMatProcessor):
