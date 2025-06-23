@@ -160,3 +160,4 @@ cython_debug/
 #.idea/
 xvsdk.py
 *.mp4
+*.pt

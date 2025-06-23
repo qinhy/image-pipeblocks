@@ -265,12 +265,16 @@ class ImageMatProcessor(BaseModel):
             validated_imgs.append(img)
 
         # Create new ImageMat instances for output
-        converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
+        converted_raw_imgs = self.forward_raw([img.data() for img in validated_imgs])
         self.input_mats = validated_imgs
-        self.out_mats = [ImageMat(color_type=old.info.color_type
-            ).build(img)
-            for old,img in zip(validated_imgs,converted_imgs)]
+        self.build_out_mats(validated_imgs,converted_raw_imgs)
         return self.forward(validated_imgs, meta)
+    
+    def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
+        # 1:1 mapping
+        self.out_mats = [ImageMat(color_type=old.info.color_type if color_type is None else color_type
+            ).build(img)
+            for old,img in zip(validated_imgs,converted_raw_imgs)]
     
     def forward_raw(self, imgs: List[Any]) -> List["Any"]:
         raise NotImplementedError()

@@ -309,19 +309,25 @@ def test_vid_show(mp4s=[]):
         # step=1,                    # No frame skipping
         # max_frames=10              # Limit to 10 frames for quick testing
     )
+    # pipes.append(SlidingWindowSplitter(window_size=(480//2,854//2)))
+    
+    pipes.append(NumpyBGRToTorchRGB())
+    pipes.append(TorchResize(target_size=(640,640)))
+    pipes.append(YOLO())
+    pipes.append(NumpyRGBToNumpyBGR())
 
     # pipes.append(NumpyImageMask(
     #     mask_image_path="./data/MaskImage.png"))
 
-    pipes.append(NumpyBGRToTorchRGB())
-    pipes.append(TorchImageMask(mask_image_path="./data/MaskImage.png"))
-    pipes.append(TorchRGBToNumpyBGR())
+    # pipes.append(NumpyBGRToTorchRGB())
+    # pipes.append(TorchImageMask(mask_image_path="./data/MaskImage.png"))
+    # pipes.append(TorchRGBToNumpyBGR())
     
     # Create a simple viewer
     pipes.append(CvImageViewer(
         window_name_prefix="MultiVideoTest",
         resizable=False,
-        scale=0.25,
+        scale=0.5,
         # overlay_texts=None
     ))
 
@@ -335,8 +341,8 @@ def test_vid_show(mp4s=[]):
     gen_json = ImageMatGenerators.dumps(gen)
     pipes_json = ImageMatProcessors.dumps(pipes)
     del pipes,gen
-    print(gen_json)
-    print(pipes_json)
+    # print(gen_json)
+    # print(pipes_json)
 
     # loads
     pipes = ImageMatProcessors.loads(pipes_json)
@@ -382,10 +388,7 @@ def test_xvsdk_show(output_filename="./out.mp4"):
 # ========== Usage Example ==========
 if __name__ == "__main__":
     # test_xvsdk_show()
-    test_vid_show(['./data/Serene Valley Vista.avi',
-                   './data/Serene Valley Vista.avi',
-                   './data/Serene Valley Vista.avi',
-                   './data/Serene Valley Vista.avi',])
-    test1()
-    test_build_image_pipeline()
-    test_build_image_pipeline_gpu()
+    test_vid_show(['./data/Serene Valley Vista.avi','./data/Object Test Area.avi'])
+    # test1()
+    # test_build_image_pipeline()
+    # test_build_image_pipeline_gpu()
