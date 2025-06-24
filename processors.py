@@ -542,60 +542,6 @@ class Processors:
                 wt.write(img)
             return imgs_data
 
-    class CvImageViewer(ImageMatProcessor):
-        title:str = 'cv_image_viewer'
-        window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
-        resizable: bool = Field(default=True, description="Whether window is resizable")
-        scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
-        overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
-        save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
-        window_names:list[str] = []
-        mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
-
-        def validate_img(self, img_idx, img: ImageMat):
-            img.require_ndarray()
-            img.require_np_uint()
-            win_name = f'{self.window_name_prefix}:{img_idx}'
-            self.window_names.append(win_name)
-            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
-            scale = self.scale
-            overlay_texts = self.overlay_texts
-            save_on_key = self.save_on_key
-
-            for idx,img in enumerate(imgs_data):            
-                img = imgs_data[idx].copy()
-                if scale is not None:
-                    img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
-
-                # Overlay text
-                text = overlay_texts[idx] if idx < len(overlay_texts) else ""
-                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-                win_name = self.window_names[idx]
-                cv2.imshow(win_name, img)
-                key = cv2.waitKey(1) & 0xFF
-
-                if save_on_key and key == save_on_key:
-                    filename = f'image_{idx}.png'
-                    cv2.imwrite(filename, img)
-                    logger(f'Saved {filename}')
-                elif key == ord('e'):  # Edit overlay text
-                    new_text = input(f"Enter new overlay text for image {idx}: ")
-                    if idx < len(overlay_texts):
-                        overlay_texts[idx] = new_text
-                    else:
-                        overlay_texts.append(new_text)
-
-            return imgs_data
-
-        def __del__(self):
-            try:
-                [cv2.destroyWindow(n) for n in self.window_names]
-            except Exception:
-                pass
-
     class CvVideoRecorder(ImageMatProcessor):
         output_filename: str = "output.avi",
         codec: str = 'XVID',
@@ -1225,6 +1171,60 @@ class Processors:
                 if d not in self._models:
                     self._models[d] = YOLO(self.modelname, task='detect').to(d)
     
+    class CvImageViewer(ImageMatProcessor):
+        title:str = 'cv_image_viewer'
+        window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
+        resizable: bool = Field(default=True, description="Whether window is resizable")
+        scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
+        overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
+        save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
+        window_names:list[str] = []
+        mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
+
+        def validate_img(self, img_idx, img: ImageMat):
+            img.require_ndarray()
+            img.require_np_uint()
+            win_name = f'{self.window_name_prefix}:{img_idx}'
+            self.window_names.append(win_name)
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+            scale = self.scale
+            overlay_texts = self.overlay_texts
+            save_on_key = self.save_on_key
+
+            for idx,img in enumerate(imgs_data):            
+                img = imgs_data[idx].copy()
+                if scale is not None:
+                    img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+
+                # Overlay text
+                text = overlay_texts[idx] if idx < len(overlay_texts) else ""
+                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+                win_name = self.window_names[idx]
+                cv2.imshow(win_name, img)
+                key = cv2.waitKey(1) & 0xFF
+
+                if save_on_key and key == save_on_key:
+                    filename = f'image_{idx}.png'
+                    cv2.imwrite(filename, img)
+                    logger(f'Saved {filename}')
+                elif key == ord('e'):  # Edit overlay text
+                    new_text = input(f"Enter new overlay text for image {idx}: ")
+                    if idx < len(overlay_texts):
+                        overlay_texts[idx] = new_text
+                    else:
+                        overlay_texts.append(new_text)
+
+            return imgs_data
+
+        def __del__(self):
+            try:
+                [cv2.destroyWindow(n) for n in self.window_names]
+            except Exception:
+                pass
+
     # TODO
     class YoloRT(YOLO):
         def __init__(
