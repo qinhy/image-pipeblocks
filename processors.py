@@ -58,7 +58,7 @@ class Processors:
             color_type = self.get_output_color_type()
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return [cv2.cvtColor(i,self.format) for i in imgs_data]
 
     class NumpyRGBToNumpyBGR(ImageMatProcessor):
@@ -71,7 +71,7 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.BGR):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return [img[..., ::-1] for img in imgs_data]
         
     class NumpyBGRToTorchRGB(ImageMatProcessor):
@@ -97,26 +97,15 @@ class Processors:
                 self._tensor_models.append((model, device))
             return super().model_post_init(context)
         
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """
-            Validates input images before conversion.
-            Ensures they are NumPy BGR images with HWC shape.
-            """
-            self.input_mats = [i for i in imgs]
-            validated_imgs: List[ImageMat] = []
+        def validate_img(self, img_idx, img):            
+            img.require_ndarray()
+            img.require_HWC()
+            img.require_BGR()
+            
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-            for img in imgs:
-                img.require_ndarray()
-                img.require_HWC()
-                img.require_BGR()
-                validated_imgs.append(img)
-
-            # Create new ImageMat instances for output
-            converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-            self.out_mats = [ImageMat(color_type="RGB").build(img) for img in converted_imgs]
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[torch.Tensor]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
             """
             Converts a batch of BGR images (NumPy) to RGB tensors (Torch).
             """
@@ -142,7 +131,8 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:                
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:                
+            
             padded_imgs = []
             for img,info in zip(imgs_data,imgs_info):
                 C = info.C
@@ -159,7 +149,7 @@ class Processors:
                 padded_imgs.append(padded_img)
             return padded_imgs
 
-        def build_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
+        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
             self.pixel_idx_forward_T = []
             self.pixel_idx_backward_T = []
 
@@ -202,26 +192,15 @@ class Processors:
                 model = get_model(device)
                 self._tensor_models.append((model, device))
 
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """
-            Validates input images before conversion.
-            Ensures they are NumPy Bayer images with HW shape.
-            """
-            self.input_mats = [i for i in imgs]
-            validated_imgs: List[ImageMat] = []
+        def validate_img(self, img_idx, img):
+            img.require_ndarray()
+            img.require_HW()
+            img.require_BAYER()
+            
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.BAYER):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-            for img in imgs:
-                img.require_ndarray()
-                img.require_HW()
-                img.require_BAYER()
-                validated_imgs.append(img)
-
-            # Create new ImageMat instances for output
-            converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-            self.out_mats = [ImageMat(color_type="bayer").build(img) for img in converted_imgs]
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[torch.Tensor]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
             """
             Converts a batch of Bayer images (NumPy) to Bayer tensors (Torch).
             """
@@ -239,26 +218,15 @@ class Processors:
             self.num_devices = self.devices_info()  # Number of available GPUs
             return super().model_post_init(context)
 
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """
-            Validates input images before conversion.
-            Ensures that they are PyTorch tensors in RGB format with BCHW shape.
-            """
-            self.input_mats = [i for i in imgs]
-            validated_imgs: List[ImageMat] = []
+        def validate_img(self, img_idx, img):
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_RGB()
 
-            for img in imgs:
-                img.require_torch_tensor()
-                img.require_BCHW()
-                img.require_RGB()
-                validated_imgs.append(img)
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.BGR):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-            # Create new ImageMat instances for output
-            converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-            self.out_mats = [ImageMat(color_type="BGR").build(img) for img in converted_imgs]
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             """
             Converts a batch of RGB tensors (torch.Tensor) to BGR images (NumPy).
             """
@@ -279,25 +247,11 @@ class Processors:
         target_size:Tuple[int, int]
         mode:str="bilinear"
 
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """
-            Validates input images before resizing.
-            Ensures they are PyTorch tensors with BCHW shape.
-            """
-            self.input_mats = [i for i in imgs]
-            validated_imgs:List[ImageMat] = []
+        def validate_img(self, img_idx, img):
+            img.require_torch_tensor()
+            img.require_BCHW()
 
-            for img in imgs:
-                img.require_torch_tensor()
-                img.require_BCHW()
-                validated_imgs.append(img)
-
-            # Create new ImageMat instances for output
-            converted_imgs = self.forward_raw([img.data() for img in validated_imgs])
-            self.out_mats = [ImageMat(color_type=validated_imgs[i].info.color_type).build(img) for i,img in enumerate(converted_imgs)]
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[])->List[torch.Tensor]:
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
             """
             Resizes a batch of PyTorch images to the target size.
             """
@@ -316,7 +270,7 @@ class Processors:
             img.require_ndarray()
             img.require_HW_or_HWC()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             """
             Resizes a batch of NumPy images using OpenCV.
             """
@@ -327,7 +281,7 @@ class Processors:
                 resized_images.append(resized_img)
             return resized_images
 
-        def build_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
+        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
             self.pixel_idx_forward_T = []
             self.pixel_idx_backward_T = []
 
@@ -365,8 +319,11 @@ class Processors:
         tile_width:int
         layout:Optional[Layout] = None
 
-        def _init_layout(self, imgs_data):
-            num_images = len(imgs_data)
+        def _init_layout(self, imgs:list[ImageMat]):
+            imgs_info = [i.info for i in imgs]
+            num_images = len(imgs_info)
+            if num_images == 0:
+                raise ValueError("No input images info for doing tile.")
             tile_width = self.tile_width
             tile_height = math.ceil(num_images / tile_width)
 
@@ -374,9 +331,9 @@ class Processors:
             col_widths = [0] * tile_width
             row_heights = [0] * tile_height
 
-            for idx, img in enumerate(imgs_data):
+            for idx, info in enumerate(imgs_info):
                 row, col = divmod(idx, tile_width)
-                h, w = img.shape[:2]
+                h, w = info.H,info.W
                 if w > col_widths[col]:
                     col_widths[col] = w
                 if h > row_heights[row]:
@@ -384,12 +341,12 @@ class Processors:
 
             total_width = sum(col_widths)
             total_height = sum(row_heights)
-            channels = imgs_data[0].shape[2] if imgs_data[0].ndim == 3 else 1
+            channels = imgs_info[0].C
 
             if channels == 1:
-                canvas = np.zeros((total_height, total_width), dtype=imgs_data[0].dtype)
+                canvas = np.zeros((total_height, total_width), dtype=imgs[0].data().dtype)
             else:
-                canvas = np.zeros((total_height, total_width, channels), dtype=imgs_data[0].dtype)
+                canvas = np.zeros((total_height, total_width, channels), dtype=imgs[0].data().dtype)
 
             layout =  Processors.TileNumpyImages.Layout(
                 tile_width=tile_width,
@@ -402,27 +359,19 @@ class Processors:
             layout._canvas=canvas
             return layout
 
-        def validate(self, imgs: list[ImageMat], meta: dict = {}):
-            if len(imgs) == 0:
-                raise ValueError("No images to tile.")
-
+        def validate_img(self, img_idx, img):            
+            img.require_np_uint()
+            img.require_HWC()
+        
+        def validate(self, imgs, meta = ...):
             color_types = {i.info.color_type for i in imgs}
             if len(color_types) != 1:
                 raise ValueError(f"All images must have the same color_type, got {color_types}")
-
-            validated_imgs:list[ImageMat] = []
-            for img in imgs:
-                img.require_np_uint()
-                img.require_HWC()
-                validated_imgs.append(img)
-
-            imgs_data = [img.data() for img in validated_imgs]
-            self.layout = self._init_layout(imgs_data)
-            tiled_imgs = self.forward_raw(imgs_data)
-            self.out_mats = [ImageMat(color_type=imgs[0].info.color_type).build(tiled_imgs[0])]
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+            return super().validate(imgs, meta)
+        
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            if self.layout is None:
+                self.layout = self._init_layout(self.input_mats)
             layout = self.layout
             tile_width = layout.tile_width
             tile_height = layout.tile_height
@@ -453,28 +402,14 @@ class Processors:
         title:str='encode_numpy_to_jpeg'
         quality: int = 90
 
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """
-            Validates input images before encoding.
-            Ensures they are NumPy images in HWC format.
-            """
-            self.input_mats = [i for i in imgs]
-            validated_imgs: List[ImageMat] = []
+        def validate_img(self, img_idx, img):
+            img.require_ndarray()
+            img.require_HWC()
+            
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.JPEG):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-            for img in imgs:
-                img.require_ndarray()
-                img.require_HWC()
-                validated_imgs.append(img)
-
-            # Create new ImageMat instances for output
-            encoded_imgs = self.forward_raw([img.data() for img in validated_imgs])
-            self.out_mats = [i.copy() for i in validated_imgs]
-            for i,d in zip(self.out_mats,encoded_imgs):
-                i.info.color_type = 'jpeg'
-                i._img_data = d
-            return self.forward(validated_imgs, meta)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             """
             Encodes a batch of NumPy images to JPEG format.
             """
@@ -490,40 +425,7 @@ class Processors:
                     raise ValueError("JPEG encoding failed.")
 
                 encoded_images.append(encoded)
-            
-            return encoded_images
-
-    class MergeYoloResults(ImageMatProcessor):
-        title:str='merge_yolo_results'
-        yolo_results_uuid:str
-
-        def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat], Dict]:
-            """
-            Merges YOLO detection results from multiple images.
-            """
-            # Retrieve YOLO results from meta
-            results = meta.get(self.yolo_results_uuid, [])
-
-            if not results:
-                return imgs, meta  # No YOLO results to merge
-
-            # If only one result, no need to merge
-            if len(results) == 1:
-                result = results[0]
-
-            # If results contain bounding boxes (PyTorch format)
-            elif hasattr(results[0], 'boxes'):
-                boxes = torch.cat([res.boxes.data.cpu() for res in results])
-                result = results[0].new()  # Create a new result object
-                result.update(boxes=boxes)  # Update with merged bounding boxes
-
-            # If results are NumPy arrays
-            elif isinstance(results[0], np.ndarray):
-                result = np.vstack(results)  # Stack NumPy arrays along first axis
-
-            # Update meta with merged results
-            meta[self.uuid] = result
-            return imgs, meta
+                return encoded_images
 
     class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
         title:str='np_uint8_shm_writer'
@@ -537,7 +439,7 @@ class Processors:
             wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
             wt.build_buffer()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             for wt,img in zip(self.writers,imgs_data):
                 wt.write(img)
             return imgs_data
@@ -559,7 +461,7 @@ class Processors:
             img.require_np_uint()
             self.start(img.data().shape)
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             for img in imgs_data:self.write_frame(img)
             return imgs_data
         
@@ -680,7 +582,7 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             if self._masks is None:
                 return imgs_data
             
@@ -729,7 +631,8 @@ class Processors:
                     resized_mask_torch = resized_mask_torch.to(img.info.device)
                 self._masks["resized_masks"][i] = resized_mask_torch
 
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[])->List[torch.Tensor]:
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+            
             if self._masks is None:
                 return imgs_data
 
@@ -904,31 +807,20 @@ class Processors:
         _debayer_models:List['Processors.TorchDebayer.Debayer5x5'] = []
         _input_devices = []  # To track device of each input tensor
 
-        def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-            """Validate input images and initialize debayer models."""
-            self.input_mats = [i for i in imgs]
-            self._input_devices = []
+        def validate_img(self, img_idx, img):
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_BAYER()
+            # Save input device for tracking
+            self._input_devices.append(img.info.device)
+            # Initialize and store model on the corresponding device
+            model = Processors.TorchDebayer.Debayer5x5().to(img.info.device).to(img.info._dtype)
+            self._debayer_models.append(model)
 
-            for img in self.input_mats:
-                img.require_torch_tensor()
-                img.require_BCHW()
-                img.require_BAYER()
-
-                # Save input device for tracking
-                self._input_devices.append(img.info.device)
-
-                # Initialize and store model on the corresponding device
-                model = Processors.TorchDebayer.Debayer5x5().to(img.info.device).to(img.info._dtype)
-                self._debayer_models.append(model)
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
-        
-            # Perform debayering after validation
-            debayered_imgs = self.forward_raw([img.data() for img in imgs])
-            self.out_mats = [ImageMat(color_type="RGB").build(i) for i in debayered_imgs]
-            processed_imgs, meta = self.forward(imgs, meta)
-            return processed_imgs, meta
-        
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[])->List[torch.Tensor]:
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
             debayered_imgs = []
             for i, img in enumerate(imgs_data):
                 model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
@@ -942,7 +834,7 @@ class Processors:
         window_size: Tuple[int, int] = (1280, 1280)
         imgs_idx:dict[int,list] = {}
         input_imgs_info:list[ImageMatInfo] = []
-        output_offsets:list[ List[Tuple[int, int, int, int]] ] = []
+        output_offsets_xyxy:list[ List[Tuple[int, int, int, int]] ] = []
         save_results_to_meta:bool =True
 
         def validate_img(self, img_idx:int, img:ImageMat):
@@ -964,11 +856,13 @@ class Processors:
 
             self.out_mats = [ImageMat(color_type=i.info.color_type).build(img)
                 for i,img in zip(out_mats,converted_raw_imgs)]
+            return self.out_mats
             
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            
             out_imgs:list[np.ndarray] = []
-            output_offsets = []
+            output_offsets_xyxy = []
             imgs_idx = {}
 
             for i, img in enumerate(imgs_data):
@@ -990,18 +884,18 @@ class Processors:
 
                 imgs_idx[i] = list(range(len(out_imgs), len(out_imgs) + len(image_mats)))
                 out_imgs+=image_mats
-                output_offsets.append(offsets_xyxy)
+                output_offsets_xyxy.append(offsets_xyxy)
 
             self.imgs_idx = imgs_idx
             self.input_imgs_info = [i.info.model_copy() for i in self.input_mats]
-            self.output_offsets = output_offsets
+            self.output_offsets_xyxy = output_offsets_xyxy
             return out_imgs
         
-        def build_transform_matrix(self, imgs_info: List[ImageMatInfo] = []):
+        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo] = []):
             self.pixel_idx_forward_T = []
             self.pixel_idx_backward_T = []
 
-            for img_idx, offsets in self.output_offsets:
+            for offsets in self.output_offsets_xyxy:
                 for offset in offsets:
                     x1, y1, _, _ = offset  # top-left corner of window
 
@@ -1025,33 +919,43 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
                 
-        def forward_raw_yolo(self,meta):
-            sw_yolo_proc: Processors.YOLO = meta[self.yolo_uuid]
-            detections_per_window = sw_yolo_proc.yolo_results
+        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLO'):
+            detections_per_window = sw_yolo_proc.yolo_results_xyxycc
             transforms = self._sliding_window_splitter.pixel_idx_backward_T
 
-            full_detections = []
+            merged_detections = [np.empty((0, 6), dtype=np.float32)
+                    for i in range(len(self._sliding_window_splitter.input_imgs_info))]
+            
+            if len(detections_per_window) != len(transforms):
+                raise ValueError(f"Number of detections_per_window({len(detections_per_window)}) and transforms({len(transforms)}) must match.")
 
-            for dets, T in zip(detections_per_window, transforms):
-                if len(dets) == 0:
-                    continue
+            transform_detections = [None]*len(transforms)
+
+            for i, (dets, T) in enumerate(zip(detections_per_window, transforms)):
+                transform_detections[i] = dets
+                if len(dets) == 0: continue
                 T = np.array(T)  # 3x3
                 coords = dets[:, :4]
                 ones = np.ones((coords.shape[0], 1))
                 xy1 = np.concatenate([coords[:, :2], ones], axis=1)
                 xy2 = np.concatenate([coords[:, 2:], ones], axis=1)
-
+                
                 xy1_trans = (T @ xy1.T).T
                 xy2_trans = (T @ xy2.T).T
                 new_boxes = np.concatenate([xy1_trans[:, :2], xy2_trans[:, :2], dets[:, 4:]], axis=1)
-                full_detections.append(new_boxes)
-
-            return np.vstack(full_detections) if full_detections else np.empty((0, 6), dtype=np.float32)
+                transform_detections[i] = new_boxes
+                
+            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):
+                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
+                merged_detections[img_idx] = [transform_detections[i] for i in tile_indices]
+                merged_detections[img_idx] = np.vstack(merged_detections[img_idx])
+                
+            return merged_detections
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             color_types = []
             for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets[img_idx]
+                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):pass
                 color_types.append(validated_imgs[tile_idx].info.color_type)
@@ -1059,9 +963,12 @@ class Processors:
             self.out_mats = [ImageMat(color_type=color_type if color_type is None else color_type
                 ).build(img)
                 for color_type,img in zip(color_types,converted_raw_imgs)]
+            return self.out_mats
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[]) -> List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             """Merge sliding window outputs back into full-size images."""
+            self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
+
             merged_imgs = [None]*len(self._sliding_window_splitter.input_imgs_info)
             for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):                
                 if self.out_mats and self.out_mats[img_idx].data() is not None:
@@ -1073,24 +980,18 @@ class Processors:
                     else:
                         merged = np.zeros((H, W), dtype=np.uint8)
 
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets[img_idx]
+                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):
                     merged[y1:y2, x1:x2] = imgs_data[tile_idx]
                 merged_imgs[img_idx] = merged                         
-            return merged_imgs
-        
-        def validate(self, imgs, meta = ...):
-            self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
-            return super().validate(imgs, meta)
-        
-        def forward(self, imgs, meta):
-            self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
+                
+
             if self.yolo_uuid:
-                full_detections = self.forward_raw_yolo(meta)
-                meta[self.yolo_uuid].yolo_results = full_detections
-            output_imgs, meta = super().forward(imgs, meta)
-            return output_imgs, meta
+                yolo = meta[self.yolo_uuid]
+                yolo.yolo_results_xyxycc = self.forward_raw_yolo(yolo)
+
+            return merged_imgs
 
     class YOLO(ImageMatProcessor):
         title:str='YOLO_detections'
@@ -1101,13 +1002,13 @@ class Processors:
         save_results_to_meta: bool = True
         devices:list[str] = []
         plot_imgs:bool = True
-        yolo_results:list = Field([],exclude=True)
+        yolo_results_xyxycc:list = Field([],exclude=True)
         _models:dict = {}
 
         def model_post_init(self, context):
             default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
             from ultralytics import YOLO
-            tmp_model = YOLO(self.modelname, task='detect')        
+            tmp_model = YOLO(self.modelname, task='detect')
             if not hasattr(tmp_model, 'names'):
                 self.class_names = self.class_names if self.class_names is not None else default_names
             else:
@@ -1126,14 +1027,13 @@ class Processors:
                 else:
                     raise TypeError("Unsupported image type for YOLO")
         
-        def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]],
-                        imgs_info: List[ImageMatInfo]=[]) -> List["Any"]:
+        def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
                 self.build_models(imgs_info)
 
             results = []
-            yolo_results = []
-            for img,info in zip(imgs_data,imgs_info):
+            yolo_results_xyxycc = [None]*len(imgs_data)
+            for i,(img,info) in enumerate(zip(imgs_data,imgs_info)):
                 device = info.device
                 yolo_result = self._models[device](img, conf=self.conf, verbose=False)
                 if isinstance(yolo_result, list) and len(yolo_result) == 1:
@@ -1146,18 +1046,17 @@ class Processors:
                 if hasattr(yolo_result, 'boxes'):
                     boxes = yolo_result.boxes                    
                     # Convert to numpy: [x1, y1, x2, y2, conf, class_id]
-                    det_array = torch.cat([
+                    xyxycc = torch.cat([
                         boxes.xyxy,                  # (N, 4)
                         boxes.conf.view(-1, 1),      # (N, 1)
                         boxes.cls.view(-1, 1)        # (N, 1)
                     ], dim=1).cpu().numpy()          # (N, 6)
                 else:
-                    det_array = np.zeros((0, 6), dtype=np.float32)  # no detections
+                    xyxycc = np.zeros((0, 6), dtype=np.float32)  # no detections
 
-                yolo_results.append(det_array)
+                yolo_results_xyxycc[i] = xyxycc
             
-            self.yolo_results = yolo_results
-
+            self.yolo_results_xyxycc = yolo_results_xyxycc
             return results
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
@@ -1181,6 +1080,13 @@ class Processors:
         window_names:list[str] = []
         mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
 
+        yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
+        _yolo_processor: 'Processors.YOLO' = None
+        draw_box_color: tuple = (0, 255, 0)  # Green
+        draw_text_color: tuple = (255, 255, 255)  # White
+        draw_font_scale: float = 0.5
+        draw_thickness: int = 2
+
         def validate_img(self, img_idx, img: ImageMat):
             img.require_ndarray()
             img.require_np_uint()
@@ -1188,36 +1094,57 @@ class Processors:
             self.window_names.append(win_name)
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[])->List[np.ndarray]:
+        def draw_yolo(self, img: np.ndarray, yolo_detection: np.ndarray, class_names=[]) -> np.ndarray:
+            for det in yolo_detection:
+                x1, y1, x2, y2, conf, cls_id = det
+                label = f"{class_names[int(cls_id)]} {conf:.2f}"
+                # Draw box
+                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), self.draw_box_color, self.draw_thickness)
+                # Draw label
+                cv2.putText(img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                            self.draw_font_scale, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
+            return img
+        
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
+            if self.yolo_uuid:
+                self._yolo_processor = meta[self.yolo_uuid]
+
             scale = self.scale
             overlay_texts = self.overlay_texts
-            save_on_key = self.save_on_key
 
-            for idx,img in enumerate(imgs_data):            
-                img = imgs_data[idx].copy()
-                if scale is not None:
-                    img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+            for idx, img in enumerate(imgs_data):
+                img = img.copy()
 
-                # Overlay text
+                # Optional overlay text
                 text = overlay_texts[idx] if idx < len(overlay_texts) else ""
-                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+                if text:
+                    cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            1, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
+
+                # Optional YOLO detection overlays
+                if self._yolo_processor and idx<len(self._yolo_processor.yolo_results_xyxycc):
+                    self.draw_yolo(img,self._yolo_processor.yolo_results_xyxycc[idx],self._yolo_processor.class_names)
 
                 win_name = self.window_names[idx]
+
+                if scale is not None:
+                    img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
                 cv2.imshow(win_name, img)
-                key = cv2.waitKey(1) & 0xFF
-
-                if save_on_key and key == save_on_key:
-                    filename = f'image_{idx}.png'
-                    cv2.imwrite(filename, img)
-                    logger(f'Saved {filename}')
-                elif key == ord('e'):  # Edit overlay text
-                    new_text = input(f"Enter new overlay text for image {idx}: ")
-                    if idx < len(overlay_texts):
-                        overlay_texts[idx] = new_text
-                    else:
-                        overlay_texts.append(new_text)
-
+                self.cv2_keys(idx,img)
             return imgs_data
+        
+        def cv2_keys(self,idx,img):
+            key = cv2.waitKey(1) & 0xFF
+            if self.save_on_key and key == self.save_on_key:
+                filename = f'image_{idx}.png'
+                cv2.imwrite(filename, img)
+                logger(f'Saved {filename}')
+            elif key == ord('e'):
+                new_text = input(f"Enter new overlay text for image {idx}: ")
+                if idx < len(self.overlay_texts):
+                    self.overlay_texts[idx] = new_text
+                else:
+                    self.overlay_texts.append(new_text)
 
         def __del__(self):
             try:
@@ -1225,25 +1152,9 @@ class Processors:
             except Exception:
                 pass
 
-    # TODO
-    class YoloRT(YOLO):
-        def __init__(
-            self, 
-            modelname: str = 'yolov5s6u.engine', 
-            conf: float = 0.6, 
-            cpu: bool = False, 
-            names: Optional[Dict[int, str]] = None,
-            save_results_to_meta: bool = False
-        ):
-            super().__init__(modelname, conf, cpu, names, save_results_to_meta)
-            self.title = 'YOLO_RT_detections'
-
-        def _torch_transform(self, img: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
-            img = super()._torch_transform(img)
-            # Use float16 for TensorRT models
-            if isinstance(img, torch.Tensor):
-                img = img.to(torch.float16)
-            return img
+    class YoloTRT(YOLO):
+        title = 'YOLO_TRT_detections'
+        modelname: str = 'yolov5s6u.engine'
 
 class ImageMatProcessors(BaseModel):
     @staticmethod    
@@ -1263,7 +1174,7 @@ class ImageMatProcessors(BaseModel):
         if validate:
             try:
                 for fn in pipes:
-                        imgs,meta = fn.validate(imgs,meta)            
+                    imgs,meta = fn.validate(imgs,meta)            
             except Exception as e:
                 logger(fn.uuid,e)
                 raise e

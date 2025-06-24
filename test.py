@@ -339,7 +339,8 @@ def test_vid_show(mp4s=[]):
     pipes.append(Processors.CvImageViewer(
         window_name_prefix="MultiVideoTest",
         resizable=False,
-        scale=0.5,
+        # scale=0.5,
+        yolo_uuid=yolo.uuid if not plot_imgs else None
         # overlay_texts=None
     ))
 
@@ -364,43 +365,43 @@ def test_vid_show(mp4s=[]):
     for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
 
 
-def test_xvsdk_show(output_filename="./out.mp4"):
-    pipes = [
-        # Create a simple viewer
-        Processors.TileNumpyImages(tile_width=1),        
-        Processors.CvImageViewer(
-            window_name_prefix="MultiVideoTest",
-            resizable=False,
-            scale=0.5,
-            # overlay_texts=None
-        ),]
+# def test_xvsdk_show(output_filename="./out.mp4"):
+#     pipes = [
+#         # Create a simple viewer
+#         Processors.TileNumpyImages(tile_width=1),        
+#         Processors.CvImageViewer(
+#             window_name_prefix="MultiVideoTest",
+#             resizable=False,
+#             # scale=0.5,
+#             # overlay_texts=None
+#         ),]
     
-    if output_filename:
-        pipes += [
-            Processors.CvVideoRecorder(
-                output_filename=output_filename,
-                fps=30,
-            ),
-        ]
+#     if output_filename:
+#         pipes += [
+#             Processors.CvVideoRecorder(
+#                 output_filename=output_filename,
+#                 fps=30,
+#             ),
+#         ]
 
-    # Create multi-video generator
-    gen =  XVSdkRGBDGenerator(
-        color_resolution=XVSdkRGBDGenerator.RGBResolution.RGB_1280x720,
-    )
+#     # Create multi-video generator
+#     gen =  XVSdkRGBDGenerator(
+#         color_resolution=XVSdkRGBDGenerator.RGBResolution.RGB_1280x720,
+#     )
 
-    # validate
-    for i, imgs in enumerate(gen):
-        ImageMatProcessors.run_once(imgs,pipes=pipes,validate=True)
-        print("validate complete.")
-        break
+#     # validate
+#     for i, imgs in enumerate(gen):
+#         ImageMatProcessors.run_once(imgs,pipes=pipes,validate=True)
+#         print("validate complete.")
+#         break
 
-    # return gen, pipes
-    for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
+#     # return gen, pipes
+#     for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
 
 # ========== Usage Example ==========
 if __name__ == "__main__":
     # test_xvsdk_show()
-    test_vid_show(['./data/Serene Valley Vista.avi','./data/Object Test Area.avi'])
+    test_vid_show(['./data/Object Test Area.avi'])
     test1()
     test_build_image_pipeline()
     test_build_image_pipeline_gpu()
