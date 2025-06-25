@@ -36,6 +36,26 @@ class Processors:
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return imgs_data
         
+    class CropToDivisibleBy32(ImageMatProcessor):
+        title: str = 'crop_to_divisible_by_32'
+
+        def validate_img(self, img_idx, img):
+            img.require_np_uint()
+            img.require_HW_or_HWC()
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
+            processed_imgs = []
+            for img in imgs_data:
+                h, w = img.shape[:2]
+                new_h = h - (h % 32)
+                new_w = w - (w % 32)
+                cropped_img = img[:new_h, :new_w]
+                processed_imgs.append(cropped_img)
+            return processed_imgs
+  
     class CvDebayer(ImageMatProcessor):
         title:str='cv_debayer'
         format:int=cv2.COLOR_BAYER_BG2BGR
@@ -1096,7 +1116,7 @@ class Processors:
             for d in devices:
                 if d not in self._models:
                     self._models[d] = YOLO(self.modelname, task='detect').to(d)
-                    if not self.official_predict:
+                    if not self.use_official_predict:
                         self._models[d] = self._models[d].to(self._torch_dtype)
 
         def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):

@@ -14,21 +14,24 @@ from pydantic import BaseModel, Field
 from ImageMat import ColorType, ImageMat, ImageMatGenerator
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 
+logger = print
 
 class ImageMatGenerator(BaseModel):
-    sources: list[str] = Field(default_factory=list)
-    color_types: list['ColorType'] = Field(default_factory=list)
+    sources: list[str]
+    color_types: list['ColorType']
     uuid: str = ''
 
     _resources: list = []
     _frame_generators: list = []
     _mats:list[ImageMat] = []
 
-    def model_post_init(self, __context) -> None:
+    def model_post_init(self, context):
+        self.color_types=[]
         self._frame_generators = [self.create_frame_generator(src) for src in self.sources]
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
         self._mats = [ImageMat(color_type=color_type).build(next(gen))
                       for gen,color_type in zip(self._frame_generators, self.color_types)]
+        return super().model_post_init(context)        
 
     def register_resource(self, resource):
         self._resources.append(resource)
@@ -53,7 +56,7 @@ class ImageMatGenerator(BaseModel):
                     try:
                         getattr(res, method)()
                     except Exception as e:
-                        print(f"Error during {method} on {res}: {e}")
+                        logger(f"Error during {method} on {res}: {e}")
 
         self._resources.clear()
 
@@ -86,7 +89,7 @@ class ImageMatGenerator(BaseModel):
         self.release()
 
 class CvVideoFrameGenerator(ImageMatGenerator):
-    color_types: list['ColorType'] = Field(default_factory=list)
+    color_types: list['ColorType'] = []    
     def create_frame_generator(self, source):
         self.color_types.append(ColorType.BGR)
         cap = self.register_resource(cv2.VideoCapture(source))
@@ -184,7 +187,7 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
                 rgb = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_IYUV)
                 return rgb[::-1, ::-1, :]
         except Exception as e:
-            print("RGB capture error:", e)
+            logger("RGB capture error:", e)
         return None
 
     def _get_depth_as_float32(self) -> Optional[np.ndarray]:
@@ -194,7 +197,7 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
             if size.value > 0:
                 return np.frombuffer(data, dtype=np.float32).reshape(h.value, w.value)
         except Exception as e:
-            print("TOF capture error:", e)
+            logger("TOF capture error:", e)
         return None
 
     def _get_depth_as_uint8(self, depth_min: float = 0, depth_max: float = 10) -> Optional[np.ndarray]:
@@ -269,12 +272,12 @@ class BitFlowFrameGenerator(ImageMatGenerator):
             if sdk_path:
                 os.add_dll_directory(sdk_path)
             else:
-                print(f"Warning: BitFlow SDK not found.")
+                logger(f"Warning: BitFlow SDK not found.")
 
             if serial_path:
                 os.add_dll_directory(serial_path)
             else:
-                print(f"Warning: CameraLink Serial directory not found.")
+                logger(f"Warning: CameraLink Serial directory not found.")
 
         def _initialize_camera_params(self):
             from BFModule import BFGTLUtils as BFGTL
@@ -287,7 +290,7 @@ class BitFlowFrameGenerator(ImageMatGenerator):
                 self.width = self.get_camera_param(dev, 'Width')
                 self.height = self.get_camera_param(dev, 'Height')
             except Exception as e:
-                print(f"Error reading parameter: {e}")
+                logger(f"Error reading parameter: {e}")
             finally:
                 dev.Close()
 
@@ -303,7 +306,7 @@ class BitFlowFrameGenerator(ImageMatGenerator):
                 self.CirAq.AqSetup(Buf.SetupOptions.setupDefault)
                 self.CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
             except Exception as e:
-                print(f"Error initializing BitFlow camera: {e}")
+                logger(f"Error initializing BitFlow camera: {e}")
                 self.close()
                 raise
 
@@ -377,13 +380,10 @@ class NumpyRawFrameFileGenerator(ImageMatGenerator):
     color_types: list['ColorType']
     def create_frame_generator(self, source):
         arr = np.load(source)
-        h,w = arr[0].shape[:2]
-        # yolo need divided by 32
-        h,w = h - h%32,w - w%32
-        def gen(arr=arr,h=h,w=w):
+        def gen(arr=arr):
             while True:
                 idx = np.random.choice(len(arr))
-                yield arr[idx][:h,:w]
+                yield arr[idx]
         return gen()
     
           
@@ -400,7 +400,6 @@ class ImageMatGenerators(BaseModel):
             'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
             'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
             'BitFlowFrameGenerator':BitFlowFrameGenerator,
-            'NumpyRawFrameFileGenerator':NumpyRawFrameFileGenerator,
         }
         g = json.loads(gen_json)
         return gen[f'{g["uuid"].split(":")[0]}'](**g) 
