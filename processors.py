@@ -873,7 +873,7 @@ class Processors:
         stride: Optional[Tuple[int, int]] = None
         window_size: Tuple[int, int] = (1280, 1280)
         imgs_idx:dict[int,list] = {}
-        input_imgs_info:list[ImageMatInfo] = []
+        # input_imgs_info:list[ImageMatInfo] = []
         output_offsets_xyxy:list[ List[Tuple[int, int, int, int]] ] = []
         save_results_to_meta:bool =True
 
@@ -927,7 +927,7 @@ class Processors:
                 output_offsets_xyxy.append(offsets_xyxy)
 
             self.imgs_idx = imgs_idx
-            self.input_imgs_info = [i.info.model_copy() for i in self.input_mats]
+            # self.input_imgs_info = [i.info.model_copy() for i in self.input_mats]
             self.output_offsets_xyxy = output_offsets_xyxy
             return out_imgs
         
@@ -960,11 +960,11 @@ class Processors:
             img.require_HW_or_HWC()
                 
         def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLOv5'):
-            detections_per_window = sw_yolo_proc.yolo_results_xyxycc
+            detections_per_window = sw_yolo_proc.bounding_box_xyxy
             transforms = self._sliding_window_splitter.pixel_idx_backward_T
 
             merged_detections = [np.empty((0, 6), dtype=np.float32)
-                    for i in range(len(self._sliding_window_splitter.input_imgs_info))]
+                    for i in range(len(self._sliding_window_splitter.input_mats))]
             
             if len(detections_per_window) != len(transforms):
                 raise ValueError(f"Number of detections_per_window({len(detections_per_window)}) and transforms({len(transforms)}) must match.")
@@ -984,17 +984,15 @@ class Processors:
                 xy2_trans = (T @ xy2.T).T
                 new_boxes = np.concatenate([xy1_trans[:, :2], xy2_trans[:, :2], dets[:, 4:]], axis=1)
                 transform_detections[i] = new_boxes
-                
-            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):
+            
+            for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                merged_detections[img_idx] = [transform_detections[i] for i in tile_indices]
-                merged_detections[img_idx] = np.vstack(merged_detections[img_idx])
-                
+                merged_detections[img_idx] = np.vstack([transform_detections[i] for i in tile_indices])                
             return merged_detections
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             color_types = []
-            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):
+            for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
                 offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):pass
@@ -1009,12 +1007,12 @@ class Processors:
             """Merge sliding window outputs back into full-size images."""
             self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
 
-            merged_imgs = [None]*len(self._sliding_window_splitter.input_imgs_info)
-            for img_idx,info in enumerate(self._sliding_window_splitter.input_imgs_info):                
+            merged_imgs = [None]*len(self._sliding_window_splitter.input_mats)
+            for img_idx,img in enumerate(self._sliding_window_splitter.input_mats):                
                 if self.out_mats and self.out_mats[img_idx].data() is not None:
                     merged = self.out_mats[img_idx].data()
                 else:
-                    H, W, channels = info.H, info.W, info.C
+                    H, W, channels = img.info.H, img.info.W, img.info.C
                     if channels>1:
                         merged = np.zeros((H, W, channels), dtype=np.uint8)
                     else:
@@ -1027,8 +1025,8 @@ class Processors:
                 merged_imgs[img_idx] = merged
 
             if self.yolo_uuid:
-                yolo = meta[self.yolo_uuid]
-                yolo.yolo_results_xyxycc = self.forward_raw_yolo(yolo)
+                yolo:Processors.YOLOv5 = meta[self.yolo_uuid]
+                yolo.bounding_box_xyxy = self.forward_raw_yolo(yolo)
 
             return merged_imgs
 
@@ -1047,10 +1045,9 @@ class Processors:
         devices:list[str] = []
         
         plot_imgs:bool = True
-        official_predict:bool = True
+        use_official_predict:bool = True
 
         yolo_verbose:bool = False
-        yolo_results_xyxycc:list = Field([],exclude=True)
 
         nms_iou:float = 0.7
         _models:dict = {}
@@ -1081,13 +1078,12 @@ class Processors:
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
                 self.build_models(imgs_info)
-            if self.official_predict:
+            if self.use_official_predict:
                 imgs,yolo_results_xyxycc = self.official_predict(imgs_data,imgs_info)
             else:
                 imgs,yolo_results_xyxycc = self.predict(imgs_data,imgs_info)
 
             self.bounding_box_xyxy = yolo_results_xyxycc
-            self.yolo_results_xyxycc = yolo_results_xyxycc
             return imgs
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
@@ -1129,12 +1125,12 @@ class Processors:
                     xyxycc = np.zeros((0, 6), dtype=np.float32)  # no detections
 
                 yolo_results_xyxycc[i] = xyxycc
-            return imgs,bou
+            return imgs,yolo_results_xyxycc
 
         def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             from ultralytics.utils import ops
             from ultralytics import YOLO
-            bou:list[torch.Tensor] = [None] * len(imgs_data)  # Placeholder for ordered predictions
+            yolo_results_xyxycc:list[torch.Tensor] = [None] * len(imgs_data)  # Placeholder for ordered predictions
             res = []
 
             for d in self.num_devices:
@@ -1162,10 +1158,10 @@ class Processors:
                 )                
                 # Normalize predictions and store them in the correct order
                 for j, pred in enumerate(preds):               
-                    bou[batch_indices[j]] = pred
+                    yolo_results_xyxycc[batch_indices[j]] = pred
 
-            bou = [r.cpu().numpy() if r is not None else [] for r in bou]
-            return imgs_data,bou
+            yolo_results_xyxycc = [r.cpu().numpy() if r is not None else [] for r in yolo_results_xyxycc]
+            return imgs_data,yolo_results_xyxycc
         
     class CvImageViewer(ImageMatProcessor):
 

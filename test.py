@@ -132,13 +132,6 @@ def test1():
     except Exception as e:
         print("Pass: NumpyBayerToTorchBayerBlock rejects non-HW input.")
 
-    # 11. MergeYoloResultsBlock: no result in meta, returns as is
-    merge = Processors.MergeYoloResults(yolo_results_uuid="not-in-meta")
-    input_imgs = [ImageMat(color_type="BGR").build(np.zeros((10, 10, 3), dtype=np.uint8))]
-    out, meta = merge(input_imgs, {})
-    assert out == input_imgs
-    print("Pass: MergeYoloResultsBlock returns input if no YOLO results in meta.")
-
     print("All additional tests passed.")
 
 def build_image_pipeline(
@@ -319,7 +312,7 @@ def test_vid_show(mp4s=[]):
     pipes.append(sws)
     pipes.append(Processors.NumpyBGRToTorchRGB())
     plot_imgs=False
-    yolo = Processors.YOLO(plot_imgs=plot_imgs,save_results_to_meta=True)
+    yolo = Processors.YOLOv5(plot_imgs=plot_imgs,save_results_to_meta=True)
     pipes.append(yolo)
     if plot_imgs:
         pipes.append(Processors.NumpyRGBToNumpyBGR())
