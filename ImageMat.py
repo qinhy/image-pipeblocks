@@ -84,9 +84,9 @@ class ImageMatInfo(BaseModel):
             elif img_data.ndim == 2:
                 self.shape_type = ShapeType.HW
                 self.H, self.W = img_data.shape
-                self.C = 1
-            else:
-                raise ValueError("NumPy array must be 2D (HW) or 3D (HWC).")
+                self.C = 1            
+            elif color_type != ColorType.JPEG:
+                raise ValueError(f"NumPy array must be 2D (HW) or 3D (HWC). Got {img_data.shape}")
 
         elif isinstance(img_data, torch.Tensor):
             self._dtype = img_data.dtype
@@ -98,9 +98,11 @@ class ImageMatInfo(BaseModel):
                 self.B, self.C, self.H, self.W = img_data.shape
             else:
                 raise ValueError("Torch tensor must be 4D (BCHW).")
-
         else:
             raise TypeError(f"img_data must be np.ndarray or torch.Tensor, got {type(img_data)}")
+        
+        if img_data.max() > self.max_value:
+            raise ValueError(f"max value must be {self.max_value}. Got {img_data.max()}")
 
         # Channel count validation
         if color_type in COLOR_TYPE_CHANNELS:
@@ -258,15 +260,12 @@ class ImageMatProcessor(BaseModel):
         raise NotImplementedError()
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-        self.input_mats = [i for i in imgs]
-        validated_imgs: List[ImageMat] = []
-
+        self.input_mats = []
         for i,img in enumerate(imgs):
             self.validate_img(i,img)
-            validated_imgs.append(img)
-
-        self.input_mats = validated_imgs
-        return self(validated_imgs, meta)
+            self.input_mats.append(img)
+        self.input_mats = self.input_mats
+        return self(self.input_mats, meta)
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
         # 1:1 mapping
@@ -284,15 +283,12 @@ class ImageMatProcessor(BaseModel):
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
         infos = [img.info for img in imgs]
-        if self.out_mats:
-            forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos,meta)        
+        forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos,meta) 
+        if len(self.out_mats)==len(forwarded_imgs):
             output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]
         else:
             # Create new ImageMat instances for output
-            validated_imgs = self.input_mats
-            converted_raw_imgs = self.forward_raw([img.data() for img in validated_imgs],
-                                                [img.info for img in validated_imgs],meta)
-            output_imgs = self.build_out_mats(validated_imgs,converted_raw_imgs)
+            output_imgs = self.build_out_mats(self.input_mats,forwarded_imgs)
    
         if len(self.pixel_idx_forward_T)==0:
             self.build_pixel_transform_matrix(infos)

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
+from ImageMat import ColorType, ImageMat, ImageMatGenerator, ImageMatInfo, ImageMatProcessor, ShapeType
 from pydantic import BaseModel, Field
 from PIL import Image
 
@@ -28,6 +28,14 @@ def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
 
 class Processors:
 
+    class DoingNothing(ImageMatProcessor):
+        title:str='doing_nothing'
+        def validate_img(self, img_idx, img):
+            pass
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            return imgs_data
+        
     class CvDebayer(ImageMatProcessor):
         title:str='cv_debayer'
         format:int=cv2.COLOR_BAYER_BG2BGR
@@ -182,16 +190,6 @@ class Processors:
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
 
-            def get_model(device, dtype=self._torch_dtype):
-                def model(img:np.ndarray):
-                    return torch.tensor(img.copy(), dtype=dtype, device=device
-                                        ).div(255.0).unsqueeze(0).unsqueeze(0)
-                return model
-            self._tensor_models = []
-            for device in self.num_devices:
-                model = get_model(device)
-                self._tensor_models.append((model, device))
-
         def validate_img(self, img_idx, img):
             img.require_ndarray()
             img.require_HW()
@@ -206,17 +204,15 @@ class Processors:
             """
             torch_images = []
             for i, img in enumerate(imgs_data):
-                device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-                tensor_img = torch.tensor(img.copy(), dtype=self._torch_dtype, device=device
+                tensor_img = torch.tensor(img, dtype=self._torch_dtype,
+                                          device=self.num_devices[i % self.num_gpus]
                                         ).div(255.0).unsqueeze(0).unsqueeze(0)
                 torch_images.append(tensor_img)
             return torch_images
 
     class TorchRGBToNumpyBGR(ImageMatProcessor):
         title:str='torch_rgb_to_numpy_bgr'
-        def model_post_init(self, context):
-            self.num_devices = self.devices_info()  # Number of available GPUs
-            return super().model_post_init(context)
+        _numpy_dtype:Any = ImageMatInfo.numpy_img_dtype()
 
         def validate_img(self, img_idx, img):
             img.require_torch_tensor()
@@ -226,18 +222,10 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.BGR):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            """
-            Converts a batch of RGB tensors (torch.Tensor) to BGR images (NumPy).
-            """
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             bgr_images = []
             for img in imgs_data:
-                if img.device.type != 'cpu':
-                    img = img.cpu()  # Move tensor to CPU before conversion
-
-                img = img.squeeze(0).permute(1, 2, 0).numpy()  # Convert BCHW to HWC
-                img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)  
-                # Normalize if needed
+                img = img.squeeze(0).permute(1, 2, 0).mul(255.0).clamp(0, 255).cpu().numpy().astype(self._numpy_dtype)
                 img = img[:, :, ::-1]  # Convert RGB to BGR
                 bgr_images.append(img)
             return bgr_images
@@ -262,7 +250,7 @@ class Processors:
             return resized_images
 
     class CVResize(ImageMatProcessor):
-        title:str='cv_resize',
+        title:str='cv_resize'
         target_size: Tuple[int, int]
         interpolation:int=cv2.INTER_LINEAR
 
@@ -820,7 +808,35 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+            debayered_imgs = []
+            for i, img in enumerate(imgs_data):
+                model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
+                debayered_imgs.append(model(img))
+            return debayered_imgs
+
+    class MockTorchDebayer(ImageMatProcessor):
+        title:str='mock_torch_debayer'
+        _debayer_models:List['Processors.TorchDebayer.Debayer5x5'] = []
+        _input_devices = []  # To track device of each input tensor
+
+        def validate_img(self, img_idx, img):
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_BAYER()
+            # Save input device for tracking
+            self._input_devices.append(img.info.device)
+            # Initialize and store model on the corresponding device
+            def model(x: torch.Tensor) -> torch.Tensor:
+                # x: Bx1xHxW — Bayer pattern grayscale input
+                # Repeat the single channel into 3 channels (RGB)
+                return x.repeat(1, 3, 1, 1)  # Bx3xHxW
+            self._debayer_models.append(model)
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
+        
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
             debayered_imgs = []
             for i, img in enumerate(imgs_data):
                 model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
@@ -1153,7 +1169,7 @@ class Processors:
                 pass
 
     class YoloTRT(YOLO):
-        title = 'YOLO_TRT_detections'
+        title:str = 'YOLO_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
 
 class ImageMatProcessors(BaseModel):
@@ -1182,3 +1198,11 @@ class ImageMatProcessors(BaseModel):
             for fn in pipes:
                 imgs,meta = fn(imgs,meta)
         return imgs,meta
+
+    @staticmethod    
+    def validate_once(gen:ImageMatGenerator,
+            pipes:list['ImageMatProcessor']=[],
+            meta = {}):
+        for imgs in gen:
+            ImageMatProcessors.run_once(imgs,meta,pipes,True)
+            break

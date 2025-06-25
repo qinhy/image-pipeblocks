@@ -371,7 +371,22 @@ class BitFlowFrameGenerator(ImageMatGenerator):
         except Exception as e:
             self.release()
             raise e
-        
+
+class NumpyRawFrameFileGenerator(ImageMatGenerator):
+    sources:list[str] = ['bitflow-0']
+    color_types: list['ColorType']
+    def create_frame_generator(self, source):
+        arr = np.load(source)
+        h,w = arr[0].shape[:2]
+        # yolo need divided by 32
+        h,w = h - h%32,w - w%32
+        def gen(arr=arr,h=h,w=w):
+            while True:
+                idx = np.random.choice(len(arr))
+                yield arr[idx][:h,:w]
+        return gen()
+    
+          
 class ImageMatGenerators(BaseModel):
     
     @staticmethod    
@@ -385,11 +400,8 @@ class ImageMatGenerators(BaseModel):
             'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
             'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
             'BitFlowFrameGenerator':BitFlowFrameGenerator,
+            'NumpyRawFrameFileGenerator':NumpyRawFrameFileGenerator,
         }
         g = json.loads(gen_json)
         return gen[f'{g["uuid"].split(":")[0]}'](**g) 
-    
-
-
-    
 
