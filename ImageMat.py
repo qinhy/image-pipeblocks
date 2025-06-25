@@ -7,7 +7,7 @@ import uuid
 
 # Third-Party Library Imports
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 class DeviceType(str, enum.Enum):
@@ -214,8 +214,15 @@ class ImageMatProcessor(BaseModel):
         
     title:str
     uuid:str = ''
+
+    bounding_box_owner_uuid: Optional[str] = None
+    bounding_box_xyxy: List[ np.ndarray ] = Field([],exclude=True) # [img1_xyxy ... ] [ [[x,y,x,y]...] ... ]
+
     pixel_idx_forward_T : List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     pixel_idx_backward_T: List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    
+    _numpy_pixel_idx_forward_T : List[ np.ndarray ] = []
+    _numpy_pixel_idx_backward_T: List[ np.ndarray ] = []
 
     save_results_to_meta:bool = False
     input_mats: List[ImageMat] = []
@@ -226,6 +233,10 @@ class ImageMatProcessor(BaseModel):
     num_gpus:int = 0
     _enable:bool = True
     _eye:list = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True
+    )
 
     def print(self,*args):
         print(f'[{self.uuid}]',*args)
@@ -277,7 +288,46 @@ class ImageMatProcessor(BaseModel):
     def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
         self.pixel_idx_forward_T = [self._eye for _ in range(len(imgs_info))]
         self.pixel_idx_backward_T = [self._eye for _ in range(len(imgs_info))]
-    
+
+    def forward_transform_matrix(self, proc: 'ImageMatProcessor'):
+        original_boxes = proc.bounding_box_xyxy        
+        transformed_boxes = []
+        if not self._numpy_pixel_idx_forward_T:
+            self._numpy_pixel_idx_forward_T  = [np.asarray(i) for i in self.pixel_idx_forward_T ]
+
+        for i,(boxes, T) in enumerate(zip(original_boxes, self._numpy_pixel_idx_forward_T)):
+            if boxes.size == 0:
+                transformed_boxes.append(boxes)
+                continue
+
+            T = np.asarray(T)  # Ensure 3x3 NumPy array
+
+            # Prepare homogeneous coordinates for top-left and bottom-right corners
+            ones = np.ones((boxes.shape[0], 1), dtype=boxes.dtype)
+            top_left = np.hstack((boxes[:, :2], ones))      # [x1, y1, 1]
+            bottom_right = np.hstack((boxes[:, 2:4], ones)) # [x2, y2, 1]
+
+            # Apply transformation
+            tl_trans = top_left @ T.T  # Shape: (N, 3)
+            br_trans = bottom_right @ T.T
+
+            # Normalize if using homography (perspective)
+            if tl_trans.shape[1] == 3 and not np.allclose(tl_trans[:, 2], 1):
+                tl_trans /= tl_trans[:, 2:3]
+                br_trans /= br_trans[:, 2:3]
+
+            # Concatenate transformed coordinates and any remaining box fields
+            transformed = np.hstack((
+                tl_trans[:, :2],
+                br_trans[:, :2],
+                boxes[:, 4:]  # Preserve any extra box data
+            ))
+            original_boxes[i][:] = transformed
+            transformed_boxes.append(original_boxes)
+
+        return transformed_boxes
+
+
     def forward_raw(self, imgs: List[Any], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[Any]:
         raise NotImplementedError()
 
@@ -292,6 +342,9 @@ class ImageMatProcessor(BaseModel):
    
         if len(self.pixel_idx_forward_T)==0:
             self.build_pixel_transform_matrix(infos)
+
+        if self.bounding_box_owner_uuid:
+            self.forward_transform_matrix(meta[self.bounding_box_owner_uuid])
 
         return output_imgs, meta
     

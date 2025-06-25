@@ -189,6 +189,7 @@ class Processors:
 
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
+            return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
             img.require_ndarray()
@@ -206,13 +207,14 @@ class Processors:
             for i, img in enumerate(imgs_data):
                 tensor_img = torch.tensor(img, dtype=self._torch_dtype,
                                           device=self.num_devices[i % self.num_gpus]
-                                        ).div(255.0).unsqueeze(0).unsqueeze(0)
+                                          ).div(255.0).unsqueeze(0).unsqueeze(0)
                 torch_images.append(tensor_img)
             return torch_images
 
     class TorchRGBToNumpyBGR(ImageMatProcessor):
         title:str='torch_rgb_to_numpy_bgr'
         _numpy_dtype:Any = ImageMatInfo.numpy_img_dtype()
+        _to_torch_dtype:Any = torch.uint8
 
         def validate_img(self, img_idx, img):
             img.require_torch_tensor()
@@ -225,7 +227,8 @@ class Processors:
         def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             bgr_images = []
             for img in imgs_data:
-                img = img.squeeze(0).permute(1, 2, 0).mul(255.0).clamp(0, 255).cpu().numpy().astype(self._numpy_dtype)
+                img = img.squeeze(0).permute(1, 2, 0).mul(255.0).clamp(0, 255
+                    ).to(self._to_torch_dtype).cpu().numpy()
                 img = img[:, :, ::-1]  # Convert RGB to BGR
                 bgr_images.append(img)
             return bgr_images
@@ -249,6 +252,26 @@ class Processors:
                 resized_images.append(resized_img)
             return resized_images
 
+        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
+            self.pixel_idx_forward_T = []
+            self.pixel_idx_backward_T = []
+
+            for info in imgs_info:
+                transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
+      
+                scale_x = self.target_size[1] / info.W
+                scale_y = self.target_size[0] / info.H
+
+                T = np.array([
+                    [scale_x, 0,       0],
+                    [0,       scale_y, 0],
+                    [0,       0,       1]
+                ], dtype=np.float32)
+
+                transform_matrix = T
+                self.pixel_idx_forward_T.append(transform_matrix.tolist())
+                self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
+        
     class CVResize(ImageMatProcessor):
         title:str='cv_resize'
         target_size: Tuple[int, int]
@@ -839,8 +862,9 @@ class Processors:
         def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
             debayered_imgs = []
             for i, img in enumerate(imgs_data):
-                model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
-                debayered_imgs.append(model(img))
+                # model = self._debayer_models[i % len(self._debayer_models)]  # Fetch model from pre-assigned list
+                img = img.repeat(1, 3, 1, 1)  # Bx3xHxW
+                debayered_imgs.append(img)
             return debayered_imgs
 
     class SlidingWindowSplitter(ImageMatProcessor):
@@ -935,7 +959,7 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
                 
-        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLO'):
+        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLOv5'):
             detections_per_window = sw_yolo_proc.yolo_results_xyxycc
             transforms = self._sliding_window_splitter.pixel_idx_backward_T
 
@@ -1000,8 +1024,7 @@ class Processors:
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):
                     merged[y1:y2, x1:x2] = imgs_data[tile_idx]
-                merged_imgs[img_idx] = merged                         
-                
+                merged_imgs[img_idx] = merged
 
             if self.yolo_uuid:
                 yolo = meta[self.yolo_uuid]
@@ -1009,19 +1032,31 @@ class Processors:
 
             return merged_imgs
 
-    class YOLO(ImageMatProcessor):
-        title:str='YOLO_detections'
+    class YOLOv5(ImageMatProcessor):
+        title:str='YOLOv5_detections'
+        gpu:bool=True
+        multi_gpu:int=-1
+        _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
+
         modelname: str = 'yolov5s6u.pt'
+        imgsz: int = 1280
         conf: float = 0.6
-        cpu: bool = False
+        max_det: int = 300
         class_names: Optional[Dict[int, str]] = None
         save_results_to_meta: bool = True
         devices:list[str] = []
+        
         plot_imgs:bool = True
+        official_predict:bool = True
+
+        yolo_verbose:bool = False
         yolo_results_xyxycc:list = Field([],exclude=True)
+
+        nms_iou:float = 0.7
         _models:dict = {}
 
         def model_post_init(self, context):
+            self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
             default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
             from ultralytics import YOLO
             tmp_model = YOLO(self.modelname, task='detect')
@@ -1046,18 +1081,41 @@ class Processors:
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
                 self.build_models(imgs_info)
+            if self.official_predict:
+                imgs,yolo_results_xyxycc = self.official_predict(imgs_data,imgs_info)
+            else:
+                imgs,yolo_results_xyxycc = self.predict(imgs_data,imgs_info)
 
-            results = []
+            self.bounding_box_xyxy = yolo_results_xyxycc
+            self.yolo_results_xyxycc = yolo_results_xyxycc
+            return imgs
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
+        
+        def build_models(self,imgs_info: List[ImageMatInfo]):
+            from ultralytics import YOLO
+            self.devices = [i.device for i in imgs_info]
+            devices = set(self.devices)
+            for d in devices:
+                if d not in self._models:
+                    self._models[d] = YOLO(self.modelname, task='detect').to(d)
+                    if not self.official_predict:
+                        self._models[d] = self._models[d].to(self._torch_dtype)
+
+        def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
+            imgs = []
             yolo_results_xyxycc = [None]*len(imgs_data)
             for i,(img,info) in enumerate(zip(imgs_data,imgs_info)):
                 device = info.device
-                yolo_result = self._models[device](img, conf=self.conf, verbose=False)
+                yolo_result = self._models[device](img, conf=self.conf, verbose=self.yolo_verbose,
+                                                   imgsz=self.imgsz, half=(self._torch_dtype==torch.float16))
                 if isinstance(yolo_result, list) and len(yolo_result) == 1:
                     yolo_result = yolo_result[0]
 
                 if self.plot_imgs:
                     img = yolo_result.plot()
-                results.append(img)
+                imgs.append(img)
                 
                 if hasattr(yolo_result, 'boxes'):
                     boxes = yolo_result.boxes                    
@@ -1071,25 +1129,106 @@ class Processors:
                     xyxycc = np.zeros((0, 6), dtype=np.float32)  # no detections
 
                 yolo_results_xyxycc[i] = xyxycc
-            
-            self.yolo_results_xyxycc = yolo_results_xyxycc
-            return results
+            return imgs,bou
 
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-        
-        def build_models(self,imgs_info: List[ImageMatInfo]):
+        def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
+            from ultralytics.utils import ops
             from ultralytics import YOLO
-            self.devices = [i.device for i in imgs_info]
-            devices = set(self.devices)
-            for d in devices:
-                if d not in self._models:
-                    self._models[d] = YOLO(self.modelname, task='detect').to(d)
-    
+            bou:list[torch.Tensor] = [None] * len(imgs_data)  # Placeholder for ordered predictions
+            res = []
+
+            for d in self.num_devices:
+                batch = [(i,img) for i,(img,info) in enumerate(zip(imgs_data,imgs_info)) if info.device==d]
+                yolo_model:YOLO = self._models[d]
+                
+                with torch.no_grad():
+                    batch_imgs = torch.vstack([img for i,img in batch])
+                    batch_indices = [i for i,img in batch]
+                    res.append( (yolo_model.model(batch_imgs),batch_indices) )
+
+            # do it later for parallel GPU infer
+            for r in res:
+                (preds, feature_maps), batch_indices = r
+                preds = ops.non_max_suppression(
+                    preds,
+                    self.conf,
+                    self.nms_iou,
+                    classes = None,
+                    agnostic= False,                    
+                    max_det = self.max_det,
+                    nc      = len(self.class_names),
+                    end2end = False,
+                    rotated = False,
+                )                
+                # Normalize predictions and store them in the correct order
+                for j, pred in enumerate(preds):               
+                    bou[batch_indices[j]] = pred
+
+            bou = [r.cpu().numpy() if r is not None else [] for r in bou]
+            return imgs_data,bou
+        
     class CvImageViewer(ImageMatProcessor):
+
+        class DrawYOLO(BaseModel):
+            # === Drawing configuration (Pydantic-managed) ===
+            draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
+            draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
+            draw_font_scale: float = Field(0.5, description="Font scale for label text")
+            draw_thickness: int = Field(2, description="Line thickness for box and text")
+            # === Main method ===
+            def draw(
+                self,
+                img: np.ndarray,
+                detections: np.ndarray,
+                class_names: List[str] = []
+            ) -> np.ndarray:
+                """
+                Draw YOLO-style bounding boxes and labels on the image.
+
+                Parameters:
+                    img (np.ndarray): Image to draw on.
+                    detections (np.ndarray): Array of detections [x1, y1, x2, y2, conf, cls_id].
+                    class_names (List[str], optional): Class names for label display.
+
+                Returns:
+                    np.ndarray: Annotated image.
+                """
+                for det in detections:
+                    x1, y1, x2, y2, conf, cls_id = map(float, det[:6])
+                    cls_id = int(cls_id)
+
+                    # Compose label text
+                    if class_names and 0 <= cls_id < len(class_names):
+                        label = f"{class_names[cls_id]} {conf:.2f}"
+                    else:
+                        label = f"ID {cls_id} {conf:.2f}"
+
+                    # Draw bounding box
+                    cv2.rectangle(
+                        img,
+                        (int(x1), int(y1)),
+                        (int(x2), int(y2)),
+                        self.draw_box_color,
+                        self.draw_thickness
+                    )
+
+                    # Draw label
+                    cv2.putText(
+                        img,
+                        label,
+                        (int(x1), int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        self.draw_font_scale,
+                        self.draw_text_color,
+                        self.draw_thickness,
+                        cv2.LINE_AA
+                    )
+
+                return img
+
         title:str = 'cv_image_viewer'
         window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
-        resizable: bool = Field(default=True, description="Whether window is resizable")
+        resizable: bool = Field(default=False, description="Whether window is resizable")
         scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
         overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
         save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
@@ -1097,11 +1236,11 @@ class Processors:
         mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
 
         yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
-        _yolo_processor: 'Processors.YOLO' = None
-        draw_box_color: tuple = (0, 255, 0)  # Green
+        _yolo_processor: 'Processors.YOLOv5' = None
         draw_text_color: tuple = (255, 255, 255)  # White
         draw_font_scale: float = 0.5
         draw_thickness: int = 2
+        draw_yolo: DrawYOLO = DrawYOLO()
 
         def validate_img(self, img_idx, img: ImageMat):
             img.require_ndarray()
@@ -1110,16 +1249,17 @@ class Processors:
             self.window_names.append(win_name)
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
 
-        def draw_yolo(self, img: np.ndarray, yolo_detection: np.ndarray, class_names=[]) -> np.ndarray:
-            for det in yolo_detection:
-                x1, y1, x2, y2, conf, cls_id = det
-                label = f"{class_names[int(cls_id)]} {conf:.2f}"
-                # Draw box
-                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), self.draw_box_color, self.draw_thickness)
-                # Draw label
-                cv2.putText(img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                            self.draw_font_scale, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
-            return img
+        def _draw_yolo(self, img: np.ndarray, yolo_detection: np.ndarray, class_names=[]) -> np.ndarray:
+            return self.draw_yolo.draw(img,yolo_detection,class_names)
+            # for det in yolo_detection:
+                # x1, y1, x2, y2, conf, cls_id = det
+                # label = f"{class_names[int(cls_id)]} {conf:.2f}"
+                # # Draw box
+                # cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), self.draw_box_color, self.draw_thickness)
+                # # Draw label
+                # cv2.putText(img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                #             self.draw_font_scale, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
+            # return img
         
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             if self.yolo_uuid:
@@ -1138,8 +1278,8 @@ class Processors:
                             1, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
 
                 # Optional YOLO detection overlays
-                if self._yolo_processor and idx<len(self._yolo_processor.yolo_results_xyxycc):
-                    self.draw_yolo(img,self._yolo_processor.yolo_results_xyxycc[idx],self._yolo_processor.class_names)
+                if self._yolo_processor and idx<len(self._yolo_processor.bounding_box_xyxy):
+                    self._draw_yolo(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
 
                 win_name = self.window_names[idx]
 
@@ -1168,8 +1308,8 @@ class Processors:
             except Exception:
                 pass
 
-    class YoloTRT(YOLO):
-        title:str = 'YOLO_TRT_detections'
+    class YoloTRT(YOLOv5):
+        title:str = 'YOLOv5_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
 
 class ImageMatProcessors(BaseModel):
