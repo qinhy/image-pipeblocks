@@ -51,7 +51,7 @@ class ImageMatInfo(BaseModel):
     device: str = ''
     shape_type: Optional[ShapeType] = None
     max_value: Optional[Union[int, float]] = None
-    B: Optional[int] = None
+    B: Optional[int] = 1
     C: Optional[int] = None
     H: int = 0
     W: int = 0
@@ -97,7 +97,7 @@ class ImageMatInfo(BaseModel):
                 self.shape_type = ShapeType.BCHW
                 self.B, self.C, self.H, self.W = img_data.shape
             else:
-                raise ValueError("Torch tensor must be 4D (BCHW).")
+                raise ValueError(f"Torch tensor must be 4D (BCHW). Got {img_data.shape}")
         else:
             raise TypeError(f"img_data must be np.ndarray or torch.Tensor, got {type(img_data)}")
         
@@ -208,6 +208,9 @@ class ImageMat(BaseModel):
 
     def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
 
+    def require_square_size(self):
+        if self.info.W != self.info.H:
+            raise TypeError(f"Expected square size (W==H). Got {self.info.W} != {self.info.H}")
 class ImageMatProcessor(BaseModel):
     class MetaData(BaseModel):
         model_config = {"arbitrary_types_allowed": True}
@@ -239,7 +242,9 @@ class ImageMatProcessor(BaseModel):
     )
 
     def print(self,*args):
+        print(f'##############[{self.uuid}]#################')
         print(f'[{self.uuid}]',*args)
+        print(f'############################################')
 
     def model_post_init(self, context: Any, /) -> None:
         if len(self.title)==0:
@@ -279,10 +284,13 @@ class ImageMatProcessor(BaseModel):
         return self(self.input_mats, meta)
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
-        # 1:1 mapping
-        self.out_mats = [ImageMat(color_type=old.info.color_type if color_type is None else color_type
-            ).build(img)
-            for old,img in zip(validated_imgs,converted_raw_imgs)]
+        if color_type is None:
+            # 1:1 mapping
+            self.out_mats = [ImageMat(color_type=old.info.color_type if color_type is None else color_type
+                ).build(img)
+                for old,img in zip(validated_imgs,converted_raw_imgs)]
+        else:
+            self.out_mats = [ImageMat(color_type=color_type).build(img) for img in converted_raw_imgs]
         return self.out_mats
     
     def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
@@ -295,12 +303,13 @@ class ImageMatProcessor(BaseModel):
         if not self._numpy_pixel_idx_forward_T:
             self._numpy_pixel_idx_forward_T  = [np.asarray(i) for i in self.pixel_idx_forward_T ]
 
+        if len(original_boxes)!=len(self._numpy_pixel_idx_forward_T):
+            raise ValueError(f"original_boxes and numpy_pixel_idx_forward_T are not same size. Got {len(original_boxes)} and {len(self._numpy_pixel_idx_forward_T)}")
         for i,(boxes, T) in enumerate(zip(original_boxes, self._numpy_pixel_idx_forward_T)):
             if boxes.size == 0:
                 transformed_boxes.append(boxes)
                 continue
 
-            T = np.asarray(T)  # Ensure 3x3 NumPy array
 
             # Prepare homogeneous coordinates for top-left and bottom-right corners
             ones = np.ones((boxes.shape[0], 1), dtype=boxes.dtype)
@@ -322,6 +331,7 @@ class ImageMatProcessor(BaseModel):
                 br_trans[:, :2],
                 boxes[:, 4:]  # Preserve any extra box data
             ))
+            ## !!!!!!!! overwrite original !!!!!!!
             original_boxes[i][:] = transformed
             transformed_boxes.append(original_boxes)
 

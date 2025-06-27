@@ -26,11 +26,16 @@ class ImageMatGenerator(BaseModel):
     _mats:list[ImageMat] = []
 
     def model_post_init(self, context):
-        self.color_types=[]
-        self._frame_generators = [self.create_frame_generator(src) for src in self.sources]
-        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
+        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'        
+        if len(self.sources)==0:raise ValueError('empty sources.')
+        self._frame_generators = [self.create_frame_generator(i,src) for i,src in enumerate(self.sources)]
+
+        if len(self._frame_generators)==0:raise ValueError('empty frame_generators.')
+        if len(self.color_types)==0:raise ValueError('empty color_types.')
+
         self._mats = [ImageMat(color_type=color_type).build(next(gen))
                       for gen,color_type in zip(self._frame_generators, self.color_types)]
+        
         return super().model_post_init(context)        
 
     def register_resource(self, resource):
@@ -60,7 +65,7 @@ class ImageMatGenerator(BaseModel):
 
         self._resources.clear()
 
-    def create_frame_generator(self, source):
+    def create_frame_generator(self, idx,source):
         raise NotImplementedError("Subclasses must implement `create_frame_generator`")
 
     def __iter__(self):
@@ -80,7 +85,7 @@ class ImageMatGenerator(BaseModel):
     
     def reset_generators(self):
         self.release_resources()
-        self._frame_generators = [self.create_frame_generator(src) for src in self.sources]
+        self._frame_generators = [self.create_frame_generator(i,src) for i,src in enumerate(self.sources)]
 
     def release(self):
         self.release_resources()
@@ -89,9 +94,11 @@ class ImageMatGenerator(BaseModel):
         self.release()
 
 class CvVideoFrameGenerator(ImageMatGenerator):
-    color_types: list['ColorType'] = []    
-    def create_frame_generator(self, source):
-        self.color_types.append(ColorType.BGR)
+    def create_frame_generator(self, idx,source):
+        if idx>=len(self.color_types):
+            self.color_types.append(ColorType.BGR)
+        else:
+            self.color_types[0] = ColorType.BGR
         cap = self.register_resource(cv2.VideoCapture(source))
         if not cap.isOpened():
             raise ValueError(f"Cannot open video source: {source}")
@@ -99,7 +106,7 @@ class CvVideoFrameGenerator(ImageMatGenerator):
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret: break
-                yield frame
+                yield np.ascontiguousarray(frame)
         return gen()
     
 class XVSdkRGBDGenerator(ImageMatGenerator):
@@ -367,7 +374,7 @@ class BitFlowFrameGenerator(ImageMatGenerator):
     _frame_generators: list = []    
     _mats:list[ImageMat] = []
 
-    def create_frame_generator(self, source):
+    def create_frame_generator(self, idx,source):
         try:
             self.color_types = [ColorType.BAYER for _ in range(len(self.sources))]
             return self.register_resource(BitFlowFrameGenerator.BitFlowCamera(source))
@@ -376,16 +383,14 @@ class BitFlowFrameGenerator(ImageMatGenerator):
             raise e
 
 class NumpyRawFrameFileGenerator(ImageMatGenerator):
-    sources:list[str] = ['bitflow-0']
     color_types: list['ColorType']
-    def create_frame_generator(self, source):
+    def create_frame_generator(self, idx,source):
         arr = np.load(source)
         def gen(arr=arr):
             while True:
                 idx = np.random.choice(len(arr))
-                yield arr[idx]
-        return gen()
-    
+                yield np.ascontiguousarray(arr[idx])
+        return gen()    
           
 class ImageMatGenerators(BaseModel):
     

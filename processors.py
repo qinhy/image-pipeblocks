@@ -1,5 +1,6 @@
 
 # Standard Library Imports
+from collections import defaultdict
 import enum
 import json
 import math
@@ -38,7 +39,8 @@ class Processors:
         
     class CropToDivisibleBy32(ImageMatProcessor):
         title: str = 'crop_to_divisible_by_32'
-
+        hs:list[int] = []
+        ws:list[int] = []
         def validate_img(self, img_idx, img):
             img.require_np_uint()
             img.require_HW_or_HWC()
@@ -47,13 +49,16 @@ class Processors:
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
+            if len(self.hs)==0:
+                for img in imgs_data:
+                    h, w = img.shape[:2]
+                    new_h = h - (h % 32)
+                    new_w = w - (w % 32)
+                    self.hs.append(new_h)
+                    self.ws.append(new_w)
             processed_imgs = []
-            for img in imgs_data:
-                h, w = img.shape[:2]
-                new_h = h - (h % 32)
-                new_w = w - (w % 32)
-                cropped_img = img[:new_h, :new_w]
-                processed_imgs.append(cropped_img)
+            for img,h,w in zip(imgs_data,self.hs,self.ws):
+                processed_imgs.append(img[:h, :w])
             return processed_imgs
   
     class CvDebayer(ImageMatProcessor):
@@ -100,29 +105,16 @@ class Processors:
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            return [img[..., ::-1] for img in imgs_data]
+            return [img[:, :, [2, 1, 0]] for img in imgs_data]
         
     class NumpyBGRToTorchRGB(ImageMatProcessor):
         title:str='numpy_bgr_to_torch_rgb'
         gpu:bool=True
         multi_gpu:int=-1
         _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
-        _tensor_models:list = []
 
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
-            # Model function to convert BGR numpy to Torch RGB tensor
-            def get_model(device, dtype=self._torch_dtype):
-                def model(img:np.ndarray):
-                    return torch.tensor(img[:, :, ::-1].copy(), 
-                                        dtype=dtype, device=device
-                                        ).div(255.0).permute(2, 0, 1).unsqueeze(0)
-                return model
-
-            self._tensor_models = []
-            for device in self.num_devices:
-                model = get_model(device)
-                self._tensor_models.append((model, device))
             return super().model_post_init(context)
         
         def validate_img(self, img_idx, img):            
@@ -139,10 +131,10 @@ class Processors:
             """
             torch_images = []
             for i, img in enumerate(imgs_data):
-                device = self._tensor_models[i % self.num_gpus][1] if self.num_gpus > 0 else 'cpu'
-                tensor_img = torch.tensor(img[:, :, ::-1].copy(), dtype=self._torch_dtype, device=device
-                                        ).div(255.0).permute(2, 0, 1).unsqueeze(0)
-                torch_images.append(tensor_img)
+                device = self.num_devices[i % self.num_gpus]
+                img_tensor = torch.as_tensor(img[:, :, [2, 1, 0]]).permute(2, 0, 1).contiguous()
+                img_tensor = img_tensor.to(device, non_blocking=True).type(self._torch_dtype).div(255.0).unsqueeze(0)
+                torch_images.append(img_tensor)
             return torch_images
 
     class NumpyPadImage(ImageMatProcessor):
@@ -223,12 +215,27 @@ class Processors:
             """
             Converts a batch of Bayer images (NumPy) to Bayer tensors (Torch).
             """
-            torch_images = []
+            # Create a dictionary to hold lists of images for each device
+            device_image_batches = defaultdict(list)
+
+            # Step 1: Organize images by device
             for i, img in enumerate(imgs_data):
-                tensor_img = torch.tensor(img, dtype=self._torch_dtype,
-                                          device=self.num_devices[i % self.num_gpus]
-                                          ).div(255.0).unsqueeze(0).unsqueeze(0)
-                torch_images.append(tensor_img)
+                device = self.num_devices[i % self.num_gpus]
+                device_image_batches[device].append(img)
+
+            # Step 2: Create batched tensors per device
+            torch_images = []
+            for device, image_list in device_image_batches.items():
+                # [B, C, H, W]
+                batch_tensor = torch.stack([torch.as_tensor(img).unsqueeze(0) for img in image_list]) 
+                batch_tensor = batch_tensor.to(device).type(self._torch_dtype).div(255.0)
+                torch_images.append(batch_tensor)
+
+            # torch_images = []
+            # for i, img in enumerate(imgs_data):
+            #     tensor_img = torch.as_tensor(img).to(self.num_devices[i % self.num_gpus]).type(self._torch_dtype
+            #                               ).div(255.0).unsqueeze(0).unsqueeze(0)
+            #     torch_images.append(tensor_img)
             return torch_images
 
     class TorchRGBToNumpyBGR(ImageMatProcessor):
@@ -247,10 +254,14 @@ class Processors:
         def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             bgr_images = []
             for img in imgs_data:
-                img = img.squeeze(0).permute(1, 2, 0).mul(255.0).clamp(0, 255
-                    ).to(self._to_torch_dtype).cpu().numpy()
-                img = img[:, :, ::-1]  # Convert RGB to BGR
-                bgr_images.append(img)
+                img = img.permute(0, 2, 3, 1).mul(255.0).clamp(0, 255
+                    ).to(self._to_torch_dtype)
+                img = img.cpu().numpy()
+                img = img[..., [2,1,0]]  # Convert RGB to BGR
+                if len(img)>1:
+                    bgr_images+=[i for i in img]
+                else:
+                    bgr_images.append(img)
             return bgr_images
 
     class TorchResize(ImageMatProcessor):
@@ -277,20 +288,21 @@ class Processors:
             self.pixel_idx_backward_T = []
 
             for info in imgs_info:
-                transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
-      
-                scale_x = self.target_size[1] / info.W
-                scale_y = self.target_size[0] / info.H
+                for i in range(info.B):
+                    transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
+        
+                    scale_x = self.target_size[1] / info.W
+                    scale_y = self.target_size[0] / info.H
 
-                T = np.array([
-                    [scale_x, 0,       0],
-                    [0,       scale_y, 0],
-                    [0,       0,       1]
-                ], dtype=np.float32)
+                    T = np.array([
+                        [scale_x, 0,       0],
+                        [0,       scale_y, 0],
+                        [0,       0,       1]
+                    ], dtype=np.float32)
 
-                transform_matrix = T
-                self.pixel_idx_forward_T.append(transform_matrix.tolist())
-                self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
+                    transform_matrix = T
+                    self.pixel_idx_forward_T.append(transform_matrix.tolist())
+                    self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
         
     class CVResize(ImageMatProcessor):
         title:str='cv_resize'
@@ -429,6 +441,46 @@ class Processors:
                 y_offset += row_heights[row]
             return [canvas]
 
+        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
+            # Ensure the layout exists (may be first call on this instance)
+            if self.layout is None:
+                raise ValueError("Layout not initialized. Call forward() first to build layout.")
+
+            layout       = self.layout
+            tile_width   = layout.tile_width
+            col_widths   = layout.col_widths
+            row_heights  = layout.row_heights
+
+            # Pre-compute cumulative offsets so we don’t sum inside every loop
+            x_prefix = [0]
+            for w in col_widths[:-1]:
+                x_prefix.append(x_prefix[-1] + w)
+
+            y_prefix = [0]
+            for h in row_heights[:-1]:
+                y_prefix.append(y_prefix[-1] + h)
+
+            self.pixel_idx_forward_T = []
+            self.pixel_idx_backward_T = []
+
+            for idx, _info in enumerate(imgs_info):
+                row, col = divmod(idx, tile_width)
+                x_off    = x_prefix[col]      # left edge of this column in canvas
+                y_off    = y_prefix[row]      # top  edge of this row    in canvas
+
+                # Pure translation (no scale / rotation)
+                T = np.array([[1, 0, x_off],
+                            [0, 1, y_off],
+                            [0, 0,     1]], dtype=np.float32)
+
+                self.pixel_idx_forward_T.append(T.tolist())
+                self.pixel_idx_backward_T.append(np.linalg.inv(T).tolist())
+
+        def forward_transform_matrix(self, proc):
+            res = super().forward_transform_matrix(proc)
+            proc.bounding_box_xyxy = [np.vstack(proc.bounding_box_xyxy)]
+            return res
+        
     class EncodeNumpyToJpeg(ImageMatProcessor):
         title:str='encode_numpy_to_jpeg'
         quality: int = 90
@@ -640,7 +692,7 @@ class Processors:
 
             # Convert grayscale masks to PyTorch tensors in BCHW format, normalized
             data["torch_original"] = [
-                torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(
+                torch.as_tensor(mask).unsqueeze(0).unsqueeze(0).to(
                 ImageMatInfo.torch_img_dtype()) / 255.0
                 for mask in data["original"]
             ]
@@ -655,9 +707,9 @@ class Processors:
                 h, w = img.info.H, img.info.W
                 # Resize using OpenCV (still in NumPy), then convert to torch tensor
                 resized_mask_np = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                resized_mask_torch = torch.from_numpy(resized_mask_np
-                                        ).unsqueeze(0).unsqueeze(0).to(
-                                        ImageMatInfo.torch_img_dtype()) / 255.0
+                resized_mask_torch = torch.as_tensor(resized_mask_np
+                                        ).unsqueeze(0).unsqueeze(0).type(
+                                        ImageMatInfo.torch_img_dtype()).div(255.0)
                 if img.info.device != 'cpu':
                     resized_mask_torch = resized_mask_torch.to(img.info.device)
                 self._masks["resized_masks"][i] = resized_mask_torch
@@ -1057,12 +1109,11 @@ class Processors:
         _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
 
         modelname: str = 'yolov5s6u.pt'
-        imgsz: int = 1280
+        imgsz: int = -1
         conf: float = 0.6
         max_det: int = 300
         class_names: Optional[Dict[int, str]] = None
         save_results_to_meta: bool = True
-        devices:list[str] = []
         
         plot_imgs:bool = True
         use_official_predict:bool = True
@@ -1084,6 +1135,7 @@ class Processors:
             return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
+                img.require_square_size()
                 if img.is_ndarray():
                     img.require_ndarray()
                     img.require_HWC()
@@ -1094,6 +1146,9 @@ class Processors:
                     img.require_RGB()
                 else:
                     raise TypeError("Unsupported image type for YOLO")
+                
+                if self.imgsz<0:
+                    self.imgsz = img.info.W
         
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
@@ -1104,34 +1159,33 @@ class Processors:
                 imgs,yolo_results_xyxycc = self.predict(imgs_data,imgs_info)
 
             self.bounding_box_xyxy = yolo_results_xyxycc
-            return imgs
+            return imgs if len(imgs)>0 else imgs_data
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
         def build_models(self,imgs_info: List[ImageMatInfo]):
             from ultralytics import YOLO
-            self.devices = [i.device for i in imgs_info]
-            devices = set(self.devices)
-            for d in devices:
+            for d in self.num_devices:
                 if d not in self._models:
                     self._models[d] = YOLO(self.modelname, task='detect').to(d)
                     if not self.use_official_predict:
-                        self._models[d] = self._models[d].to(self._torch_dtype)
+                        self._models[d] = self._models[d].type(self._torch_dtype)
 
         def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             imgs = []
-            yolo_results_xyxycc = [None]*len(imgs_data)
+            yolo_results = []
             for i,(img,info) in enumerate(zip(imgs_data,imgs_info)):
                 device = info.device
                 yolo_result = self._models[device](img, conf=self.conf, verbose=self.yolo_verbose,
                                                    imgsz=self.imgsz, half=(self._torch_dtype==torch.float16))
-                if isinstance(yolo_result, list) and len(yolo_result) == 1:
-                    yolo_result = yolo_result[0]
+                if isinstance(yolo_result, list):
+                    yolo_results += yolo_result
 
+            yolo_results_xyxycc = [None]*len(yolo_results)
+            for i,yolo_result in enumerate(yolo_results):
                 if self.plot_imgs:
-                    img = yolo_result.plot()
-                imgs.append(img)
+                    imgs.append(yolo_result.plot())
                 
                 if hasattr(yolo_result, 'boxes'):
                     boxes = yolo_result.boxes                    
@@ -1150,21 +1204,10 @@ class Processors:
         def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             from ultralytics.utils import ops
             from ultralytics import YOLO
-            yolo_results_xyxycc:list[torch.Tensor] = [None] * len(imgs_data)  # Placeholder for ordered predictions
-            res = []
-
-            for d in self.num_devices:
-                batch = [(i,img) for i,(img,info) in enumerate(zip(imgs_data,imgs_info)) if info.device==d]
-                yolo_model:YOLO = self._models[d]
-                
-                with torch.no_grad():
-                    batch_imgs = torch.vstack([img for i,img in batch])
-                    batch_indices = [i for i,img in batch]
-                    res.append( (yolo_model.model(batch_imgs),batch_indices) )
-
-            # do it later for parallel GPU infer
-            for r in res:
-                (preds, feature_maps), batch_indices = r
+            yolo_results = []
+            for img,info in zip(imgs_data,imgs_info):
+                yolo_model:YOLO = self._models[info.device]
+                preds, feature_maps = yolo_model.model(img)
                 preds = ops.non_max_suppression(
                     preds,
                     self.conf,
@@ -1175,13 +1218,13 @@ class Processors:
                     nc      = len(self.class_names),
                     end2end = False,
                     rotated = False,
-                )                
-                # Normalize predictions and store them in the correct order
-                for j, pred in enumerate(preds):               
-                    yolo_results_xyxycc[batch_indices[j]] = pred
-
-            yolo_results_xyxycc = [r.cpu().numpy() if r is not None else [] for r in yolo_results_xyxycc]
-            return imgs_data,yolo_results_xyxycc
+                )
+                if isinstance(preds, list):
+                    yolo_results += preds
+                else:
+                    yolo_results.append(preds)
+            yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+            return [],yolo_results_xyxycc
         
     class CvImageViewer(ImageMatProcessor):
 
