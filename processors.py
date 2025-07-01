@@ -1,22 +1,45 @@
-
+# ===============================
 # Standard Library Imports
+# ===============================
 from collections import defaultdict
 import enum
 import json
 import math
 from multiprocessing import shared_memory
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
+# ===============================
 # Third-Party Library Imports
+# ===============================
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import ColorType, ImageMat, ImageMatGenerator, ImageMatInfo, ImageMatProcessor, ShapeType
+import torchvision
 from pydantic import BaseModel, Field
 from PIL import Image
+
+# ===============================
+# Ultralytics YOLO Imports
+# ===============================
+from ultralytics import YOLO
+from ultralytics.utils import ops
+
+# ===============================
+# TensorRT & CUDA Imports
+# ===============================
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+
+# ===============================
+# Custom Modules
+# ===============================
+from shmIO import NumpyUInt8SharedMemoryStreamIO
+from ImageMat import ColorType, ImageMat, ImageMatGenerator, ImageMatInfo, ImageMatProcessor, ShapeType
+
 
 logger = print
 
@@ -26,6 +49,150 @@ def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     rgba = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
     alpha = int(hex_color[6:8], 16) if len(hex_color) == 8 else 255
     return rgba + (alpha,)
+
+class GeneralTensorRTInferenceModel:
+    class CudaDeviceContext:
+        def __init__(self, device_index):
+            self.device = cuda.Device(device_index)
+            self.context = None
+
+        def __enter__(self):
+            self.context = self.device.make_context()
+            return self.context  # optional, in case you want to access it
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            # Pop and destroy context on exit
+            self.context.pop()
+            # self.context.detach()
+
+    np2torch_dtype = {
+        np.float32: torch.float32,
+        np.float16: torch.float16,
+        np.int32: torch.int32,
+    }
+
+    class HostDeviceMem:
+        def __init__(self, host_mem, device_mem,name,shape,dtype,size):
+            self.host = host_mem
+            self.device = device_mem
+            self.name = name
+            self.shape = shape
+            self.dtype = dtype
+            self.size = size
+
+        def __repr__(self):
+            return ( f"{self.__class__.__name__}(host=0x{id(self.host):x}"
+                     f",device=0x{id(self.device):x})"
+                     f",name={self.name}"
+                     f",shape={self.shape}"
+                     f",dtype={self.dtype}"
+                     f",size={self.size})")
+
+    def __init__(self,engine_path, device, input_name='input', output_name='output'):
+        self.engine_path=engine_path
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = None
+        self.context = None
+        self.inputs = []
+        self.outputs = []
+        self.bindings = []
+        self.stream = cuda.Stream()
+        self.input_shape = None
+        self.output_shape = None
+        self.dtype = None
+        self.device = torch.device(device)
+        # self.set_device(self.device.index)
+        if self.device.index>0:
+            with GeneralTensorRTInferenceModel.CudaDeviceContext(self.device.index):
+                self.load_trt(engine_path,input_name,output_name)
+                # self warmup
+                self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
+                self.load_trt(engine_path,input_name,output_name)
+        else:
+            self.load_trt(engine_path,input_name,output_name)
+            # self warmup
+            self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
+            self.load_trt(engine_path,input_name,output_name)
+
+
+    def load_trt(self, engine_path, input_name='input', output_name='output',verb=True):
+        """Load a TensorRT engine file and prepare context and buffers."""
+        with open(engine_path, "rb") as f:
+            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+
+        self.context = self.engine.create_execution_context()
+
+        self.input_shape = [*self.engine.get_tensor_shape(input_name)]
+        self.output_shape = [*self.engine.get_tensor_shape(output_name)]
+        self.dtype = trt.nptype(self.engine.get_tensor_dtype(input_name))
+
+        self.inputs, self.outputs, self.bindings = self._allocate_buffers()
+        if verb:
+            print(f"[TensorRT] Loaded engine: {engine_path}, dtype: {self.dtype}")
+            print(f"  Input shape: {self.input_shape}")
+            print(f"  Output shape: {self.output_shape}")
+
+    def _allocate_buffers(self):
+        inputs, outputs, bindings = [], [], []
+        num_io = self.engine.num_io_tensors
+        for i in range(num_io):
+            name = self.engine.get_tensor_name(i)
+            shape = self.engine.get_tensor_shape(name)
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            size = trt.volume(shape)
+
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            bindings.append(int(device_mem))
+            hdm = self.HostDeviceMem(host_mem,device_mem,name,shape,dtype,size)
+
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                inputs.append(hdm)
+            else:
+                outputs.append(hdm)
+        return inputs, outputs, bindings
+
+    def _transfer_torch2cuda(self, tensor: torch.Tensor, device_mem: HostDeviceMem):
+        num_bytes = tensor.element_size() * tensor.nelement()
+        cuda.memcpy_dtod_async(
+            dest=int(device_mem.device),
+            src=int(tensor.data_ptr()),
+            size=num_bytes,
+            stream=self.stream
+        )
+
+    def _transfer_cuda2torch(self, device_mem: HostDeviceMem):
+        torch_dtype = self.np2torch_dtype[self.dtype]
+        out_tensor = torch.empty(self.output_shape, device=self.device, dtype=torch_dtype)
+
+        num_bytes = out_tensor.element_size() * out_tensor.nelement()
+        cuda.memcpy_dtod_async(
+            dest=int(out_tensor.data_ptr()),
+            src=int(device_mem.device),
+            size=num_bytes,
+            stream=self.stream
+        )
+        return out_tensor
+
+    def infer(self, inputs: list[torch.Tensor]):
+        x = inputs[0]
+        assert torch.is_tensor(x), "Input must be a torch.Tensor!"
+        assert x.is_cuda, "Torch input must be on CUDA!"
+        assert x.dtype == self.np2torch_dtype[self.dtype], f"Expected dtype {self.np2torch_dtype[self.dtype]}, got {x.dtype}"
+        assert x.device == self.device, "Torch input must be on same CUDA!"
+        return self.raw_infer(x)
+
+    def raw_infer(self, x:torch.Tensor):
+        [self._transfer_torch2cuda(x, mem) for x, mem in zip([x], self.inputs)]
+        self.context.execute_v2(bindings=self.bindings)
+        # outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
+        self.stream.synchronize()
+        return []#outputs
+        
+    def __call__(self, input_data):
+        outputs = self.infer([input_data])
+        return outputs[0] if len(outputs) == 1 else outputs
 
 class Processors:
 
@@ -125,7 +292,7 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
             """
             Converts a batch of BGR images (NumPy) to RGB tensors (Torch).
             """
@@ -1126,12 +1293,7 @@ class Processors:
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
             default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
-            from ultralytics import YOLO
-            tmp_model = YOLO(self.modelname, task='detect')
-            if not hasattr(tmp_model, 'names'):
-                self.class_names = self.class_names if self.class_names is not None else default_names
-            else:
-                self.class_names = tmp_model.names
+            self.class_names = self.class_names if self.class_names is not None else default_names
             return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
@@ -1165,20 +1327,27 @@ class Processors:
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
         def build_models(self,imgs_info: List[ImageMatInfo]):
-            from ultralytics import YOLO
             for d in self.num_devices:
                 if d not in self._models:
-                    self._models[d] = YOLO(self.modelname, task='detect').to(d)
-                    if not self.use_official_predict:
-                        self._models[d] = self._models[d].type(self._torch_dtype)
+                    model = YOLO(self.modelname, task='detect').to(d)
+                    if hasattr(model, 'names'):
+                        self.class_names = model.names
 
+                    if not self.use_official_predict:
+                        model = model.type(self._torch_dtype)
+                        self._models[d] = lambda img,model=model:model.model(img)
+                    else:
+                        self._models[d] = lambda img,model=model:model.predict(img,
+                                                      conf=self.conf,verbose=self.yolo_verbose,
+                                                   imgsz=self.imgsz, half=(self._torch_dtype==torch.float16))
+
+                        
         def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             imgs = []
             yolo_results = []
             for i,(img,info) in enumerate(zip(imgs_data,imgs_info)):
                 device = info.device
-                yolo_result = self._models[device](img, conf=self.conf, verbose=self.yolo_verbose,
-                                                   imgsz=self.imgsz, half=(self._torch_dtype==torch.float16))
+                yolo_result = self._models[device](img)
                 if isinstance(yolo_result, list):
                     yolo_results += yolo_result
 
@@ -1200,14 +1369,13 @@ class Processors:
 
                 yolo_results_xyxycc[i] = xyxycc
             return imgs,yolo_results_xyxycc
-
+        
         def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
-            from ultralytics.utils import ops
-            from ultralytics import YOLO
             yolo_results = []
             for img,info in zip(imgs_data,imgs_info):
                 yolo_model:YOLO = self._models[info.device]
-                preds, feature_maps = yolo_model.model(img)
+                preds, feature_maps = yolo_model(img)                
+                print(preds[:,4:,:].max())
                 preds = ops.non_max_suppression(
                     preds,
                     self.conf,
@@ -1367,10 +1535,57 @@ class Processors:
             except Exception:
                 pass
 
-    class YoloTRT(YOLOv5):
+    class YOLOv5TRT(YOLOv5):
         title:str = 'YOLOv5_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
+        use_official_predict:bool = False
+        conf: float = 0.0001        
 
+        def build_models(self,imgs_info: List[ImageMatInfo]):
+            config = dict(imgsz=self.imgsz,                           
+                        conf=self.conf,verbose=self.yolo_verbose,
+                        half=(self._torch_dtype==torch.float16))
+            self._models = {}
+            for i,d in enumerate(self.num_devices):
+                with torch.cuda.device(d):
+                    modelname = self.modelname.replace('.trt',(f'_{d}.trt').replace(':','@'))
+                    yolo = GeneralTensorRTInferenceModel(modelname,d,'images','output0')
+                self._models[d] = yolo
+                
+            self.use_official_predict = False            
+            self.print('load mode by config :',config)
+
+        def predict(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[]):
+            yolo_results = []
+            for img,info in zip(imgs_data,imgs_info):
+                yolo_model = self._models[info.device]
+                print(img.device,img.dtype,yolo_model.device)
+                preds = yolo_model(img)
+                time.sleep(1)
+                # print(preds.shape,preds.dtype)
+                # print(preds[:,4:,:].max())
+            #     preds = ops.non_max_suppression(
+            #         preds,
+            #         self.conf,
+            #         self.nms_iou,
+            #         classes = None,
+            #         agnostic= False,
+            #         max_det = self.max_det,
+            #         nc      = len(self.class_names),
+            #         in_place= False,
+            #         end2end = False,
+            #         rotated = False,
+            #     )
+            #     if isinstance(preds, list):
+            #         yolo_results += preds
+            #     else:
+            #         yolo_results.append(preds)
+            # yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+            # print(yolo_results_xyxycc)
+            yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
+            # print(yolo_results_xyxycc)
+            return [],yolo_results_xyxycc
+        
 class ImageMatProcessors(BaseModel):
     @staticmethod    
     def dumps(pipes:list[ImageMatProcessor]):
@@ -1389,7 +1604,7 @@ class ImageMatProcessors(BaseModel):
         if validate:
             try:
                 for fn in pipes:
-                    imgs,meta = fn.validate(imgs,meta)            
+                    imgs,meta = fn.validate(imgs,meta)
             except Exception as e:
                 logger(fn.uuid,e)
                 raise e

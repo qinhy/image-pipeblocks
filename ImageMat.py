@@ -134,6 +134,12 @@ class ImageMat(BaseModel):
         self.info = info or ImageMatInfo().build(img_data, color_type=self.color_type)
         self._img_data = img_data
         return self
+    
+    def build_shmIO_writer(self):
+        pass
+
+    def build_shmIO_reader(self):
+        pass
 
     def copy(self) -> 'ImageMat':
         """Return a deep copy of the ImageMat object."""
@@ -211,6 +217,7 @@ class ImageMat(BaseModel):
     def require_square_size(self):
         if self.info.W != self.info.H:
             raise TypeError(f"Expected square size (W==H). Got {self.info.W} != {self.info.H}")
+
 class ImageMatProcessor(BaseModel):
     class MetaData(BaseModel):
         model_config = {"arbitrary_types_allowed": True}
@@ -305,12 +312,11 @@ class ImageMatProcessor(BaseModel):
 
         if len(original_boxes)!=len(self._numpy_pixel_idx_forward_T):
             raise ValueError(f"original_boxes and numpy_pixel_idx_forward_T are not same size. Got {len(original_boxes)} and {len(self._numpy_pixel_idx_forward_T)}")
+        
         for i,(boxes, T) in enumerate(zip(original_boxes, self._numpy_pixel_idx_forward_T)):
             if boxes.size == 0:
                 transformed_boxes.append(boxes)
                 continue
-
-
             # Prepare homogeneous coordinates for top-left and bottom-right corners
             ones = np.ones((boxes.shape[0], 1), dtype=boxes.dtype)
             top_left = np.hstack((boxes[:, :2], ones))      # [x1, y1, 1]
@@ -343,7 +349,8 @@ class ImageMatProcessor(BaseModel):
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
         infos = [img.info for img in imgs]
-        forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos,meta) 
+        forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos,meta)
+        
         if len(self.out_mats)==len(forwarded_imgs):
             output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]
         else:
