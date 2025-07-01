@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 class CommonIO:
     class Base(BaseModel):       
         auto_del:bool = True
+        def model_dump_json_dict(self):
+            return json.loads(self.model_dump_json())
         def write(self,data):
             raise ValueError("[CommonIO.Reader]: This is Reader can not write")
         def read(self):
@@ -48,6 +50,7 @@ class GeneralSharedMemoryIO(CommonIO):
                 del self._buffer
             if hasattr(self,'_shm'):
                 self._shm.close()  # Detach from shared memory
+                print(self.shm_name,self._shm,'Detach')
 
         def __del__(self):
             self.close()
@@ -188,12 +191,12 @@ class NumpyUInt8SharedMemoryStreamIO(NumpyUInt8SharedMemoryIO,CommonStreamIO):
             return self.model_dump()
     class StreamReader(NumpyUInt8SharedMemoryIO.Reader, CommonStreamIO.StreamReader, Base):
         id: str= Field(default_factory=lambda:f"NumpyUInt8SharedMemoryStreamIO.StreamReader:{uuid.uuid4()}")
-        def read(self,copy=True)->tuple[Any,dict]:
-            return super().read(copy),{}
+        def read(self,copy=True):
+            return super().read(copy)
     class StreamWriter(NumpyUInt8SharedMemoryIO.Writer, CommonStreamIO.StreamWriter, Base):
         id: str= Field(default_factory=lambda:f"NumpyUInt8SharedMemoryStreamIO.StreamWriter:{uuid.uuid4()}")
-        def write(self, data: np.ndarray, metadata={}):
-            return super().write(data),{}
+        def write(self, data: np.ndarray):
+            return super().write(data)
         
     @staticmethod
     def reader(stream_key: str, array_shape: tuple):
@@ -210,3 +213,7 @@ class NumpyUInt8SharedMemoryStreamIO(NumpyUInt8SharedMemoryIO,CommonStreamIO):
         return NumpyUInt8SharedMemoryStreamIO.StreamWriter(
             shm_name=shm_name, create=True, stream_key=stream_key,
             array_shape=array_shape,shm_size=shm_size).build_buffer()
+
+# if __name__ == '__main__':
+#     writer = NumpyUInt8SharedMemoryStreamIO.writer('test:1',(10,10))
+#     writer.write(np.ones((10,10),dtype=np.uint8))

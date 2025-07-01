@@ -3,5 +3,5 @@ opencv-python
 pydantic
 # Optional packages
 # torch
-# ultralytics
+# ultralytics==8.3.115
 # xvsdk

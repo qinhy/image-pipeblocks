@@ -1,5 +1,16 @@
-import argparse
+
 import os
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--input_pt', type=str, default='yolov5s6u.pt', help='Input PyTorch model')
+parser.add_argument('--imgsz', type=int, default=1280, help='Image size')
+parser.add_argument('--batch', type=int, default=4, help='Batch size')
+parser.add_argument('--half', action='store_true', help='Use half-precision FP16')
+parser.add_argument('--device', type=str, default='cuda:0', help='Target GPU device (e.g., cuda:0 or cuda:1)')
+args = parser.parse_args()
+if 'cuda:' in args.device:
+    os.environ['CUDA_VISIBLE_DEVICES']=args.device.replace('cuda:','')
+
 import torch
 import ultralytics
 import tensorrt as trt
@@ -34,37 +45,10 @@ def build_static_engine(onnx_file_path, engine_file_path:str, device, fp16=True)
                 f.write(engine)
             print(f"TensorRT engine saved to {engine_file_path}")
 
-def pt2trt(pt_model: str, imgsz=640, batch=1, half=False, device='cuda:0'):
-    torch.cuda.set_device(device)
-    print(f"Using device: {device}")
-    
-    print(f"Loading model from {pt_model}")
-    model = ultralytics.YOLO(pt_model)
-
-    print(f"Exporting to TensorRT with imgsz={imgsz}, batch={batch}, half={half}")
-    try:
-        mp = model.export(
-            format='engine',
-            imgsz=imgsz,
-            batch=batch,
-            half=half,
-            device=device,
-            nms=False,
-        )
-        new_name = mp.replace('.engine', 
-                              f'_imgsz_{imgsz}_batch_{batch}_{"FP16" if half else "FP32"}_{device.replace(":", "@")}.engine')
-        os.rename(mp, new_name)
-        print(f"Export successful: {new_name}")
-    except Exception as e:
-        print(f"Failed to export model: {e}")
-
 def pt2onnx(pt_model: str, imgsz=640, batch=1, half=False, device='cuda:0'):
-    torch.cuda.set_device(device)
-    print(f"Using device: {device}")
-    
+    print(f"Using device: {device}")    
     print(f"Loading model from {pt_model}")
     model = ultralytics.YOLO(pt_model)
-
     print(f"Exporting to onnx with imgsz={imgsz}, batch={batch}, half={half}")
     try:
         mp = model.export(
@@ -94,12 +78,4 @@ def pt2trt(pt_model: str, imgsz=640, batch=1, half=False, device='cuda:0'):
         print(f"Failed to export model: {e}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input_pt', type=str, default='yolov5s6u.pt', help='Input PyTorch model')
-    parser.add_argument('--imgsz', type=int, default=1280, help='Image size')
-    parser.add_argument('--batch', type=int, default=4, help='Batch size')
-    parser.add_argument('--half', action='store_true', help='Use half-precision FP16')
-    parser.add_argument('--device', type=str, default='cuda:0', help='Target GPU device (e.g., cuda:0 or cuda:1)')
-    args = parser.parse_args()
-
     pt2trt(args.input_pt, args.imgsz, args.batch, args.half, args.device)

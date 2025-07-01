@@ -5,7 +5,7 @@ import glob
 import uuid
 import platform
 from enum import IntEnum
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Literal, Optional
 
 import cv2
 import numpy as np
@@ -20,10 +20,11 @@ class ImageMatGenerator(BaseModel):
     sources: list[str]
     color_types: list['ColorType']
     uuid: str = ''
+    shmIO_mode: Literal['None','writer','reader'] = 'None'
 
     _resources: list = []
     _frame_generators: list = []
-    _mats:list[ImageMat] = []
+    ouput_mats:list[ImageMat] = []
 
     def model_post_init(self, context):
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'        
@@ -32,10 +33,17 @@ class ImageMatGenerator(BaseModel):
 
         if len(self._frame_generators)==0:raise ValueError('empty frame_generators.')
         if len(self.color_types)==0:raise ValueError('empty color_types.')
-
-        self._mats = [ImageMat(color_type=color_type).build(next(gen))
-                      for gen,color_type in zip(self._frame_generators, self.color_types)]
-        
+        if len(self.ouput_mats)==0:
+            self.ouput_mats = [ImageMat(color_type=color_type).build(next(gen))
+                        for gen,color_type in zip(self._frame_generators, self.color_types)]
+            
+        for mat in self.ouput_mats:
+            mat.shmIO_mode=self.shmIO_mode
+            if mat.shmIO_writer:
+                mat.shmIO_writer.build_buffer()
+                print(mat.shmIO_writer)
+            elif mat.shmIO_mode=='writer':
+                mat.build_shmIO_writer()
         return super().model_post_init(context)        
 
     def register_resource(self, resource):
@@ -77,9 +85,9 @@ class ImageMatGenerator(BaseModel):
                       for frame_gen in self._frame_generators]
             if not frames or any(f is None for f in frames):
                 raise StopIteration
-            for frame, mat in zip(frames, self._mats):
+            for frame, mat in zip(frames, self.ouput_mats):
                 mat.unsafe_update_mat(frame)
-            return self._mats
+            return self.ouput_mats
         except StopIteration:
             raise StopIteration
     
@@ -93,7 +101,9 @@ class ImageMatGenerator(BaseModel):
     def __del__(self):
         self.release()
 
-class CvVideoFrameGenerator(ImageMatGenerator):
+class CvVideoFrameGenerator(ImageMatGenerator):    
+    color_types: list['ColorType'] = []
+    
     def create_frame_generator(self, idx,source):
         if idx>=len(self.color_types):
             self.color_types.append(ColorType.BGR)

@@ -2,13 +2,15 @@
 # Standard Library Imports
 import enum
 import json
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 
 # Third-Party Library Imports
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 import torch
+
+from shmIO import NumpyUInt8SharedMemoryStreamIO
 
 class DeviceType(str, enum.Enum):
     CPU = 'cpu'
@@ -50,17 +52,23 @@ class ImageMatInfo(BaseModel):
     _dtype: Optional[Union[np.dtype, TorchDtype]] = None
     device: str = ''
     shape_type: Optional[ShapeType] = None
+    raw_shape: List[int] = []
     max_value: Optional[Union[int, float]] = None
     B: Optional[int] = 1
     C: Optional[int] = None
     H: int = 0
     W: int = 0
     color_type: Optional[ColorType] = None
+    uuid: str = ''
 
     @staticmethod
     def torch_img_dtype():return torch_img_dtype
     @staticmethod
     def numpy_img_dtype():return numpy_img_dtype
+
+    def model_post_init(self, context):        
+        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'  
+        return super().model_post_init(context)
 
     def build(self, img_data: Union[np.ndarray, torch.Tensor],
                   color_type: Union[str, ColorType]):
@@ -113,7 +121,7 @@ class ImageMatInfo(BaseModel):
                     f"Expected {expected_channels} channels. Data shape: {img_data.shape}"
                 )
         self.color_type = color_type
-
+        self.raw_shape = [*img_data.shape]
         return self
 
 class ImageMat(BaseModel):
@@ -127,19 +135,39 @@ class ImageMat(BaseModel):
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
     _img_data: Any = None
+    shmIO_mode: Literal['None','writer','reader'] = 'None'
+    shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
+    shmIO_reader:Optional[NumpyUInt8SharedMemoryStreamIO.Reader] = None
 
-    def build(self, img_data: Union[np.ndarray, torch.Tensor], info: Optional[ImageMatInfo] = None):
-        if img_data is None:
-            raise ValueError("img_data cannot be None")
+    def model_post_init(self, context):        
+        if self.shmIO_writer:
+            self.shmIO_writer.build_buffer()   
+        if self.shmIO_reader:
+            self.shmIO_reader.build_buffer()
+        return super().model_post_init(context)
+
+    def build(self, img_data: Union[np.ndarray, torch.Tensor, str], info: Optional[ImageMatInfo] = None):
         self.info = info or ImageMatInfo().build(img_data, color_type=self.color_type)
         self._img_data = img_data
         return self
     
+    def build_shmIO(self, shmIO_mode:str='None',target_mat_info:'ImageMat'=None):
+        self.shmIO_mode = shmIO_mode
+        if self.shmIO_mode == 'writer' and self.info.device=='cpu':
+            self.build_shmIO_writer()
+        if self.shmIO_mode == 'reader' and target_mat_info and self.info.device=='cpu':
+            self.build_shmIO_reader(target_mat_info)
+        return self
+    
     def build_shmIO_writer(self):
-        pass
+        if self.info is None: raise ValueError("self.info cannot be None")
+        self.shmIO_writer = NumpyUInt8SharedMemoryStreamIO.writer(self.info.uuid,self.info.raw_shape)
+        return self
 
-    def build_shmIO_reader(self):
-        pass
+    def build_shmIO_reader(self,target_mat_info:'ImageMat'):
+        if self.info is None: raise ValueError("self.info cannot be None")
+        self.shmIO_reader = NumpyUInt8SharedMemoryStreamIO.reader(target_mat_info.uuid,target_mat_info.raw_shape)
+        return self
 
     def copy(self) -> 'ImageMat':
         """Return a deep copy of the ImageMat object."""
@@ -152,17 +180,21 @@ class ImageMat(BaseModel):
 
     def update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
         """Update image data and refresh metadata."""
-        self._img_data = img_data
         self.info = ImageMatInfo(img_data, color_type=self.info.color_type)
+        self.unsafe_update_mat(img_data)
         return self
 
     def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
         """Update the image data without updating metadata (use with caution)."""
+        if self.shmIO_writer:
+            self._img_data = self.shmIO_writer.write(img_data)
         self._img_data = img_data
         return self
 
     def data(self) -> Union[np.ndarray, torch.Tensor]:
         """Return the image data."""
+        if self.shmIO_reader:
+            self._img_data = self.shmIO_reader.read()
         return self._img_data
 
     # --- Type/Shape/Color Requirement Methods ---
@@ -348,21 +380,25 @@ class ImageMatProcessor(BaseModel):
         raise NotImplementedError()
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
-        infos = [img.info for img in imgs]
-        forwarded_imgs = self.forward_raw([img.data() for img in imgs],infos,meta)
+        input_infos = [img.info for img in imgs]
+        forwarded_imgs = self.forward_raw([img.data() for img in imgs],input_infos,meta)
         
         if len(self.out_mats)==len(forwarded_imgs):
             output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]
         else:
             # Create new ImageMat instances for output
             output_imgs = self.build_out_mats(self.input_mats,forwarded_imgs)
+            for i,o in zip(imgs,output_imgs):
+                if i.shmIO_mode=='writer':
+                    o.shmIO_mode='reader'
+                    print(i.info,'-->>',o.info)
+                    o.build_shmIO_reader(i.info)
    
         if len(self.pixel_idx_forward_T)==0:
-            self.build_pixel_transform_matrix(infos)
+            self.build_pixel_transform_matrix(input_infos)
 
         if self.bounding_box_owner_uuid:
             self.forward_transform_matrix(meta[self.bounding_box_owner_uuid])
-
         return output_imgs, meta
     
     def __call__(self, imgs: List[ImageMat], meta: dict = {}):    

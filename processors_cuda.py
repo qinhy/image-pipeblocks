@@ -7,7 +7,7 @@ import json
 import math
 from multiprocessing import shared_memory
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 # ===============================
@@ -105,11 +105,10 @@ class GeneralTensorRTInferenceModel:
         # self.set_device(self.device.index)
         if self.device.index>0:
             with GeneralTensorRTInferenceModel.CudaDeviceContext(self.device.index):
-                with torch.cuda.device(self.device):
-                    self.load_trt(engine_path,input_name,output_name)
-                    # self warmup
-                    self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
-                    self.load_trt(engine_path,input_name,output_name)
+                self.load_trt(engine_path,input_name,output_name)
+                # self warmup
+                self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
+                self.load_trt(engine_path,input_name,output_name)
         else:
             self.load_trt(engine_path,input_name,output_name)
             # self warmup
@@ -129,10 +128,10 @@ class GeneralTensorRTInferenceModel:
         self.dtype = trt.nptype(self.engine.get_tensor_dtype(input_name))
 
         self.inputs, self.outputs, self.bindings = self._allocate_buffers()
-        if False:
-            logger(f"[TensorRT] Loaded engine: {engine_path}, dtype: {self.dtype}")
-            logger(f"  Input shape: {self.input_shape}")
-            logger(f"  Output shape: {self.output_shape}")
+        if verb:
+            print(f"[TensorRT] Loaded engine: {engine_path}, dtype: {self.dtype}")
+            print(f"  Input shape: {self.input_shape}")
+            print(f"  Output shape: {self.output_shape}")
 
     def _allocate_buffers(self):
         inputs, outputs, bindings = [], [], []
@@ -187,94 +186,15 @@ class GeneralTensorRTInferenceModel:
     def raw_infer(self, x:torch.Tensor):
         [self._transfer_torch2cuda(x, mem) for x, mem in zip([x], self.inputs)]
         self.context.execute_v2(bindings=self.bindings)
-        outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
+        # outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
         self.stream.synchronize()
-        return outputs
+        return []#outputs
         
     def __call__(self, input_data):
         outputs = self.infer([input_data])
         return outputs[0] if len(outputs) == 1 else outputs
 
-class Processors:
-
-    class DoingNothing(ImageMatProcessor):
-        title:str='doing_nothing'
-        def validate_img(self, img_idx, img):
-            pass
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            return imgs_data
-        
-    class CropToDivisibleBy32(ImageMatProcessor):
-        title: str = 'crop_to_divisible_by_32'
-        hs:list[int] = []
-        ws:list[int] = []
-        def validate_img(self, img_idx, img):
-            img.require_np_uint()
-            img.require_HW_or_HWC()
-
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
-            if len(self.hs)==0:
-                for img in imgs_data:
-                    h, w = img.shape[:2]
-                    new_h = h - (h % 32)
-                    new_w = w - (w % 32)
-                    self.hs.append(new_h)
-                    self.ws.append(new_w)
-            processed_imgs = []
-            for img,h,w in zip(imgs_data,self.hs,self.ws):
-                processed_imgs.append(img[:h, :w])
-            return processed_imgs
-  
-    class CvDebayer(ImageMatProcessor):
-        title:str='cv_debayer'
-        format:int=cv2.COLOR_BAYER_BG2BGR
-            
-        def get_output_color_type(self):
-            """Determine output color type based on the OpenCV conversion format."""
-            bayer_to_color_map = {
-                cv2.COLOR_BAYER_BG2BGR: ColorType.BGR,
-                cv2.COLOR_BAYER_GB2BGR: ColorType.BGR,
-                cv2.COLOR_BAYER_RG2BGR: ColorType.BGR,
-                cv2.COLOR_BAYER_GR2BGR: ColorType.BGR,
-                cv2.COLOR_BAYER_BG2RGB: ColorType.RGB,
-                cv2.COLOR_BAYER_GB2RGB: ColorType.RGB,
-                cv2.COLOR_BAYER_RG2RGB: ColorType.RGB,
-                cv2.COLOR_BAYER_GR2RGB: ColorType.RGB,
-                cv2.COLOR_BAYER_BG2GRAY: ColorType.GRAYSCALE,
-                cv2.COLOR_BAYER_GB2GRAY: ColorType.GRAYSCALE,
-                cv2.COLOR_BAYER_RG2GRAY: ColorType.GRAYSCALE,
-                cv2.COLOR_BAYER_GR2GRAY: ColorType.GRAYSCALE,
-            }
-            return bayer_to_color_map.get(self.format, ColorType.UNKNOWN)
-        
-        def validate_img(self, img_idx, img):
-            img.require_BAYER()
-            img.require_np_uint()
-        
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
-            color_type = self.get_output_color_type()
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-        
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            return [cv2.cvtColor(i,self.format) for i in imgs_data]
-
-    class NumpyRGBToNumpyBGR(ImageMatProcessor):
-        title:str='numpy_rgb_to_bgr'
-
-        def validate_img(self, img_idx, img):
-            img.require_RGB()
-            img.require_np_uint()
-        
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.BGR):
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-        
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            return [img[:, :, [2, 1, 0]] for img in imgs_data]
-        
+class Processors:        
     class NumpyBGRToTorchRGB(ImageMatProcessor):
         title:str='numpy_bgr_to_torch_rgb'
         gpu:bool=True
@@ -304,60 +224,6 @@ class Processors:
                 img_tensor = img_tensor.to(device, non_blocking=True).type(self._torch_dtype).div(255.0).unsqueeze(0)
                 torch_images.append(img_tensor)
             return torch_images
-
-    class NumpyPadImage(ImageMatProcessor):
-        """
-        Pads an image using numpy's np.pad.
-        Supports constant, edge, reflect, etc.
-        """
-        title: str = "numpy_pad_image"
-        pad_width: Tuple[Tuple[int, int], Tuple[int, int]] = ((10, 10), (10, 10))  # ((top, bottom), (left, right))
-        pad_value: int = 0
-        mode: str = "constant"  # Options: 'constant', 'edge', 'reflect', 'symmetric', etc.
-
-        def validate_img(self, img_idx: int, img: ImageMat):
-            img.require_np_uint()
-            img.require_HW_or_HWC()
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:                
-            
-            padded_imgs = []
-            for img,info in zip(imgs_data,imgs_info):
-                C = info.C
-                if C == 2:
-                    # Grayscale image: pad HxW
-                    pad_width = self.pad_width
-                elif C == 3:
-                    # Color image: pad HxW only, leave channel unchanged
-                    pad_width = self.pad_width + ((0, 0),)
-                else:
-                    raise ValueError(f"Unsupported image shape: {img.shape}")
-                    
-                padded_img = np.pad(img, pad_width, mode=self.mode, constant_values=self.pad_value)
-                padded_imgs.append(padded_img)
-            return padded_imgs
-
-        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
-            self.pixel_idx_forward_T = []
-            self.pixel_idx_backward_T = []
-
-            for info in imgs_info:
-                transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
-                transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
-
-                pad_top, pad_bottom = self.pad_width[0]
-                pad_left, pad_right = self.pad_width[1]
-
-                # Create transform matrix for pixel mapping
-                T = np.array([
-                    [1, 0, pad_left],
-                    [0, 1, pad_top],
-                    [0, 0, 1]
-                ], dtype=np.float32)
-
-                transform_matrix = T
-                self.pixel_idx_forward_T.append(transform_matrix.tolist())
-                self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
 
     class NumpyBayerToTorchBayer(ImageMatProcessor):
         # to BCHW
@@ -426,7 +292,10 @@ class Processors:
                     ).to(self._to_torch_dtype)
                 img = img.cpu().numpy()
                 img = img[..., [2,1,0]]  # Convert RGB to BGR
-                bgr_images+=[i for i in img]
+                if len(img)>1:
+                    bgr_images+=[i for i in img]
+                else:
+                    bgr_images.append(img)
             return bgr_images
 
     class TorchResize(ImageMatProcessor):
@@ -468,291 +337,7 @@ class Processors:
                     transform_matrix = T
                     self.pixel_idx_forward_T.append(transform_matrix.tolist())
                     self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
-        
-    class CVResize(ImageMatProcessor):
-        title:str='cv_resize'
-        target_size: Tuple[int, int]
-        interpolation:int=cv2.INTER_LINEAR
-
-        def validate_img(self, img_idx, img):            
-            img.require_ndarray()
-            img.require_HW_or_HWC()
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            """
-            Resizes a batch of NumPy images using OpenCV.
-            """
-            resized_images = []
-            for img in imgs_data:
-                resized_img = cv2.resize(img, (self.target_size[1], self.target_size[0]),
-                                        interpolation=self.interpolation)
-                resized_images.append(resized_img)
-            return resized_images
-
-        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
-            self.pixel_idx_forward_T = []
-            self.pixel_idx_backward_T = []
-
-            for info in imgs_info:
-                transform_matrix = np.eye(3, dtype=np.float32)  # Identity base
-      
-                scale_x = self.target_size[1] / info.W
-                scale_y = self.target_size[0] / info.H
-
-                T = np.array([
-                    [scale_x, 0,       0],
-                    [0,       scale_y, 0],
-                    [0,       0,       1]
-                ], dtype=np.float32)
-
-                transform_matrix = T
-                self.pixel_idx_forward_T.append(transform_matrix.tolist())
-                self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
-        
-    class TileNumpyImages(ImageMatProcessor):
-        class Layout(BaseModel):
-            tile_width:int
-            tile_height:int
-
-            col_widths:list[int]
-            row_heights:list[int]
-
-            total_width:int
-            total_height:int
-
-            channels:int # 1, 3
-            _canvas:Any
-
-        title:str='tile_numpy_images'
-        tile_width:int
-        layout:Optional[Layout] = None
-
-        def _init_layout(self, imgs:list[ImageMat]):
-            imgs_info = [i.info for i in imgs]
-            num_images = len(imgs_info)
-            if num_images == 0:
-                raise ValueError("No input images info for doing tile.")
-            tile_width = self.tile_width
-            tile_height = math.ceil(num_images / tile_width)
-
-            # Compute max width for each column, max height for each row
-            col_widths = [0] * tile_width
-            row_heights = [0] * tile_height
-
-            for idx, info in enumerate(imgs_info):
-                row, col = divmod(idx, tile_width)
-                h, w = info.H,info.W
-                if w > col_widths[col]:
-                    col_widths[col] = w
-                if h > row_heights[row]:
-                    row_heights[row] = h
-
-            total_width = sum(col_widths)
-            total_height = sum(row_heights)
-            channels = imgs_info[0].C
-
-            if channels == 1:
-                canvas = np.zeros((total_height, total_width), dtype=imgs[0].data().dtype)
-            else:
-                canvas = np.zeros((total_height, total_width, channels), dtype=imgs[0].data().dtype)
-
-            layout =  Processors.TileNumpyImages.Layout(
-                tile_width=tile_width,
-                tile_height=tile_height,
-                col_widths=col_widths,
-                row_heights=row_heights,
-                total_width=total_width,
-                total_height=total_height,
-                channels=channels)
-            layout._canvas=canvas
-            return layout
-
-        def validate_img(self, img_idx, img):            
-            img.require_np_uint()
-            img.require_HWC()
-        
-        def validate(self, imgs, meta = ...):
-            color_types = {i.info.color_type for i in imgs}
-            if len(color_types) != 1:
-                raise ValueError(f"All images must have the same color_type, got {color_types}")
-            return super().validate(imgs, meta)
-        
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            if self.layout is None:
-                self.layout = self._init_layout(self.input_mats)
-            layout = self.layout
-            tile_width = layout.tile_width
-            tile_height = layout.tile_height
-            col_widths = layout.col_widths
-            row_heights = layout.row_heights
-            channels = layout.channels
-            canvas = layout._canvas
-
-            num_images = len(imgs_data)
-            y_offset = 0
-            for row in range(tile_height):
-                x_offset = 0
-                for col in range(tile_width):
-                    idx = row * tile_width + col
-                    if idx >= num_images:
-                        break
-                    img:np.ndarray = imgs_data[idx]
-                    h, w = img.shape[:2]
-                    if channels == 1:
-                        canvas[y_offset:y_offset + h, x_offset:x_offset + w] = img
-                    else:
-                        canvas[y_offset:y_offset + h, x_offset:x_offset + w, :channels] = img
-                    x_offset += col_widths[col]
-                y_offset += row_heights[row]
-            return [canvas]
-
-        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo]=[]):
-            # Ensure the layout exists (may be first call on this instance)
-            if self.layout is None:
-                raise ValueError("Layout not initialized. Call forward() first to build layout.")
-
-            layout       = self.layout
-            tile_width   = layout.tile_width
-            col_widths   = layout.col_widths
-            row_heights  = layout.row_heights
-
-            # Pre-compute cumulative offsets so we don’t sum inside every loop
-            x_prefix = [0]
-            for w in col_widths[:-1]:
-                x_prefix.append(x_prefix[-1] + w)
-
-            y_prefix = [0]
-            for h in row_heights[:-1]:
-                y_prefix.append(y_prefix[-1] + h)
-
-            self.pixel_idx_forward_T = []
-            self.pixel_idx_backward_T = []
-
-            for idx, _info in enumerate(imgs_info):
-                row, col = divmod(idx, tile_width)
-                x_off    = x_prefix[col]      # left edge of this column in canvas
-                y_off    = y_prefix[row]      # top  edge of this row    in canvas
-
-                # Pure translation (no scale / rotation)
-                T = np.array([[1, 0, x_off],
-                            [0, 1, y_off],
-                            [0, 0,     1]], dtype=np.float32)
-
-                self.pixel_idx_forward_T.append(T.tolist())
-                self.pixel_idx_backward_T.append(np.linalg.inv(T).tolist())
-
-        def forward_transform_matrix(self, proc):
-            res = super().forward_transform_matrix(proc)
-            proc.bounding_box_xyxy = [np.vstack(proc.bounding_box_xyxy)]
-            return res
-        
-    class EncodeNumpyToJpeg(ImageMatProcessor):
-        title:str='encode_numpy_to_jpeg'
-        quality: int = 90
-
-        def validate_img(self, img_idx, img):
-            img.require_ndarray()
-            img.require_HWC()
-            
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.JPEG):
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            """
-            Encodes a batch of NumPy images to JPEG format.
-            """
-            encoded_images = []
-            for img in imgs_data:
-                if self.quality is not None:
-                    success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
-                                                                    int(self.quality)])
-                else:
-                    success, encoded = cv2.imencode('.jpeg', img)
-                
-                if not success:
-                    raise ValueError("JPEG encoding failed.")
-
-                encoded_images.append(encoded)
-                return encoded_images
-
-    class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
-        title:str='np_uint8_shm_writer'
-        writers:list[NumpyUInt8SharedMemoryStreamIO.StreamWriter] = []
-        stream_key_prefix:str
-
-        def validate_img(self, img_idx, img: ImageMat):
-            img.require_ndarray()
-            img.require_np_uint()
-            stream_key = f"{self.stream_key_prefix}:{img_idx}"
-            wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
-            wt.build_buffer()
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            for wt,img in zip(self.writers,imgs_data):
-                wt.write(img)
-            return imgs_data
-
-    class CvVideoRecorder(ImageMatProcessor):
-        output_filename: str = "output.avi",
-        codec: str = 'XVID',
-        fps: int = 30,
-        scale: Optional[float] = None,
-        overlay_text: Optional[str] = None
-        _writer = None
-        recording:bool = False
-        frame_size:Optional[Tuple[int, int]] = None
-
-        def validate_img(self, img_idx, img: ImageMat):
-            if img_idx>0:
-                raise RuntimeError("CvVideoRecorder cannot process multiple images at once")
-            img.require_ndarray()
-            img.require_np_uint()
-            self.start(img.data().shape)
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            for img in imgs_data:self.write_frame(img)
-            return imgs_data
-        
-        def start(self, frame_shape: Tuple[int, int]):
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
-            self._writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
-            self.recording = True
-            logger(f"Started recording to {self.output_filename}")
-
-        def stop(self):
-            if self._writer:
-                self._writer.release()
-                self._writer = None
-            self.recording = False
-            logger("Stopped recording.")
-
-        def write_frame(self, frame: np.ndarray):
-            if not self.recording:
-                raise RuntimeError("Recording has not started. Call start() first.")
-
-            # Resize frame if needed
-            if self.scale is not None:
-                frame = cv2.resize(frame, (0, 0), fx=self.scale, fy=self.scale)
-
-            # Overlay text
-            if self.overlay_text:
-                cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
-
-            # Ensure frame matches output size and type
-            if self.frame_size is not None and (frame.shape[1], frame.shape[0]) != self.frame_size:
-                frame = cv2.resize(frame, self.frame_size)
-            if frame.dtype != np.uint8 or (frame.ndim != 3 or frame.shape[2] != 3):
-                raise ValueError("Frame must be uint8 BGR for VideoWriter")
-
-            self._writer.write(frame)
-
-        def __del__(self):
-            try:
-                self.stop()
-            except Exception:
-                pass
-
+       
     class NumpyImageMask(ImageMatProcessor):
         title: str = "numpy_image_mask"
         mask_image_path: Optional[str] = None
@@ -1104,174 +689,11 @@ class Processors:
                 debayered_imgs.append(img)
             return debayered_imgs
 
-    class SlidingWindowSplitter(ImageMatProcessor):
-
-        title: str = "sliding_window"
-        stride: Optional[Tuple[int, int]] = None
-        window_size: Tuple[int, int] = (1280, 1280)
-        imgs_idx:dict[int,list] = {}
-        # input_imgs_info:list[ImageMatInfo] = []
-        output_offsets_xyxy:list[ List[Tuple[int, int, int, int]] ] = []
-        save_results_to_meta:bool =True
-
-        def validate_img(self, img_idx:int, img:ImageMat):
-            if self.stride is None:
-                self.stride = self.window_size
-            img.require_np_uint()
-            img.require_HW_or_HWC()
-            H, W = img.info.H,img.info.W
-            wH, wW = self.window_size
-            if wH > H or wW > W:
-                raise ValueError(f"Window size ({wH}, {wW}) must be <= image size ({H}, {W}).")
-
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
-            # 1:N mapping
-            out_mats:list[ImageMat] = []
-            for i,v in self.imgs_idx.items():
-                img = validated_imgs[i]
-                out_mats += [img for _ in v]
-
-            self.out_mats = [ImageMat(color_type=i.info.color_type).build(img)
-                for i,img in zip(out_mats,converted_raw_imgs)]
-            return self.out_mats
-            
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            
-            out_imgs:list[np.ndarray] = []
-            output_offsets_xyxy = []
-            imgs_idx = {}
-
-            for i, img in enumerate(imgs_data):
-                # windows, offsets = self._split_numpy(img.data(), meta)            
-                H, W = img.shape[0],img.shape[1]
-                wH, wW = self.window_size
-                sH, sW = self.stride
-
-                windows_list = []
-                offsets_xyxy = []
-                
-                for row_start in range(0, H - wH + 1, sH):
-                    for col_start in range(0, W - wW + 1, sW):
-                        window = img[row_start:row_start + wH, col_start:col_start + wW, :]
-                        windows_list.append(window)
-                        offsets_xyxy.append((col_start, row_start, col_start + wW, row_start + wH))  # Can be adjusted
-            
-                image_mats = [w for w in windows_list]
-
-                imgs_idx[i] = list(range(len(out_imgs), len(out_imgs) + len(image_mats)))
-                out_imgs+=image_mats
-                output_offsets_xyxy.append(offsets_xyxy)
-
-            self.imgs_idx = imgs_idx
-            # self.input_imgs_info = [i.info.model_copy() for i in self.input_mats]
-            self.output_offsets_xyxy = output_offsets_xyxy
-            return out_imgs
-        
-        def build_pixel_transform_matrix(self, imgs_info: List[ImageMatInfo] = []):
-            self.pixel_idx_forward_T = []
-            self.pixel_idx_backward_T = []
-
-            for offsets in self.output_offsets_xyxy:
-                for offset in offsets:
-                    x1, y1, _, _ = offset  # top-left corner of window
-
-                    # Forward: Full image → Window space (shift origin)
-                    transform_matrix = np.array([
-                        [1.0, 0.0, -x1],
-                        [0.0, 1.0, -y1],
-                        [0.0, 0.0,  1.0]
-                    ], dtype=np.float32)
-
-                    self.pixel_idx_forward_T.append(transform_matrix.tolist())
-                    self.pixel_idx_backward_T.append(np.linalg.inv(transform_matrix).tolist())
-
-    class SlidingWindowMerger(ImageMatProcessor):
-        title: str = "sliding_window_merge"
-        sliding_window_splitter_uuid:str = ''
-        yolo_uuid:str = ''
-        _sliding_window_splitter:'Processors.SlidingWindowSplitter'=None
-
-        def validate_img(self, img_idx:int, img:ImageMat):
-            img.require_np_uint()
-            img.require_HW_or_HWC()
-                
-        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLOv5'):
-            detections_per_window = sw_yolo_proc.bounding_box_xyxy
-            transforms = self._sliding_window_splitter.pixel_idx_backward_T
-
-            merged_detections = [np.empty((0, 6), dtype=np.float32)
-                    for i in range(len(self._sliding_window_splitter.input_mats))]
-            
-            if len(detections_per_window) != len(transforms):
-                raise ValueError(f"Number of detections_per_window({len(detections_per_window)}) and transforms({len(transforms)}) must match.")
-
-            transform_detections = [None]*len(transforms)
-
-            for i, (dets, T) in enumerate(zip(detections_per_window, transforms)):
-                transform_detections[i] = dets
-                if len(dets) == 0: continue
-                T = np.array(T)  # 3x3
-                coords = dets[:, :4]
-                ones = np.ones((coords.shape[0], 1))
-                xy1 = np.concatenate([coords[:, :2], ones], axis=1)
-                xy2 = np.concatenate([coords[:, 2:], ones], axis=1)
-                
-                xy1_trans = (T @ xy1.T).T
-                xy2_trans = (T @ xy2.T).T
-                new_boxes = np.concatenate([xy1_trans[:, :2], xy2_trans[:, :2], dets[:, 4:]], axis=1)
-                transform_detections[i] = new_boxes
-            
-            for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
-                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                merged_detections[img_idx] = np.vstack([transform_detections[i] for i in tile_indices])                
-            return merged_detections
-
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
-            color_types = []
-            for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
-                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):pass
-                color_types.append(validated_imgs[tile_idx].info.color_type)
-                
-            self.out_mats = [ImageMat(color_type=color_type if color_type is None else color_type
-                ).build(img)
-                for color_type,img in zip(color_types,converted_raw_imgs)]
-            return self.out_mats
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            """Merge sliding window outputs back into full-size images."""
-            self._sliding_window_splitter = meta[self.sliding_window_splitter_uuid]
-
-            merged_imgs = [None]*len(self._sliding_window_splitter.input_mats)
-            for img_idx,img in enumerate(self._sliding_window_splitter.input_mats):                
-                if self.out_mats and self.out_mats[img_idx].data() is not None:
-                    merged = self.out_mats[img_idx].data()
-                else:
-                    H, W, channels = img.info.H, img.info.W, img.info.C
-                    if channels>1:
-                        merged = np.zeros((H, W, channels), dtype=np.uint8)
-                    else:
-                        merged = np.zeros((H, W), dtype=np.uint8)
-
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
-                tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):
-                    merged[y1:y2, x1:x2] = imgs_data[tile_idx]
-                merged_imgs[img_idx] = merged
-
-            if self.yolo_uuid:
-                yolo:Processors.YOLOv5 = meta[self.yolo_uuid]
-                yolo.bounding_box_xyxy = self.forward_raw_yolo(yolo)
-
-            return merged_imgs
-
     class YOLOv5(ImageMatProcessor):
         title:str='YOLOv5_detections'
         gpu:bool=True
         multi_gpu:int=-1
-        _torch_dtype:Any = ImageMatInfo.torch_img_dtype()
+        _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
 
         modelname: str = 'yolov5s6u.pt'
         imgsz: int = -1
@@ -1319,8 +741,7 @@ class Processors:
                 imgs,yolo_results_xyxycc = self.predict(imgs_data,imgs_info)
 
             self.bounding_box_xyxy = yolo_results_xyxycc
-            res = imgs if len(imgs)>0 else imgs_data
-            return res
+            return imgs if len(imgs)>0 else imgs_data
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
@@ -1334,19 +755,12 @@ class Processors:
 
                     if not self.use_official_predict:
                         model = model.type(self._torch_dtype)
-                        def model_predict(img,model=model):
-                            res = model.model(img)
-                            return res
-                        self._models[d] = model_predict
+                        self._models[d] = lambda img,model=model:model.model(img)
                     else:
-                        def model_predict(img,model=model,device=d,
-                                          conf=self.conf,verbose=self.yolo_verbose,
-                                          imgsz=self.imgsz, half=(self._torch_dtype==torch.float16)):
-                            res = model.predict(source=img,conf=conf,verbose=verbose,half=half)
-                                                # device=device,
-                                                # imgsz=imgsz, half=half)
-                            return res
-                        self._models[d] = model_predict
+                        self._models[d] = lambda img,model=model:model.predict(img,
+                                                      conf=self.conf,verbose=self.yolo_verbose,
+                                                   imgsz=self.imgsz, half=(self._torch_dtype==torch.float16))
+
                         
         def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             imgs = []
@@ -1381,6 +795,7 @@ class Processors:
             for img,info in zip(imgs_data,imgs_info):
                 yolo_model:YOLO = self._models[info.device]
                 preds, feature_maps = yolo_model(img)                
+                print(preds[:,4:,:].max())
                 preds = ops.non_max_suppression(
                     preds,
                     self.conf,
@@ -1399,189 +814,57 @@ class Processors:
             yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
         
-    class CvImageViewer(ImageMatProcessor):
-
-        class DrawYOLO(BaseModel):
-            # === Drawing configuration (Pydantic-managed) ===
-            draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
-            draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
-            draw_font_scale: float = Field(0.5, description="Font scale for label text")
-            draw_thickness: int = Field(2, description="Line thickness for box and text")
-            # === Main method ===
-            def draw(
-                self,
-                img: np.ndarray,
-                detections: np.ndarray,
-                class_names: List[str] = []
-            ) -> np.ndarray:
-                """
-                Draw YOLO-style bounding boxes and labels on the image.
-
-                Parameters:
-                    img (np.ndarray): Image to draw on.
-                    detections (np.ndarray): Array of detections [x1, y1, x2, y2, conf, cls_id].
-                    class_names (List[str], optional): Class names for label display.
-
-                Returns:
-                    np.ndarray: Annotated image.
-                """
-                for det in detections:
-                    x1, y1, x2, y2, conf, cls_id = map(float, det[:6])
-                    cls_id = int(cls_id)
-
-                    # Compose label text
-                    if class_names and 0 <= cls_id < len(class_names):
-                        label = f"{class_names[cls_id]} {conf:.2f}"
-                    else:
-                        label = f"ID {cls_id} {conf:.2f}"
-
-                    # Draw bounding box
-                    cv2.rectangle(
-                        img,
-                        (int(x1), int(y1)),
-                        (int(x2), int(y2)),
-                        self.draw_box_color,
-                        self.draw_thickness
-                    )
-
-                    # Draw label
-                    cv2.putText(
-                        img,
-                        label,
-                        (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        self.draw_font_scale,
-                        self.draw_text_color,
-                        self.draw_thickness,
-                        cv2.LINE_AA
-                    )
-
-                return img
-
-        title:str = 'cv_image_viewer'
-        window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
-        resizable: bool = Field(default=False, description="Whether window is resizable")
-        scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
-        overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
-        save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
-        window_names:list[str] = []
-        mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
-        shmIO_mode: Literal['None','writer','reader'] = 'None'
-
-        yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
-        _yolo_processor: 'Processors.YOLOv5' = None
-        draw_text_color: tuple = (255, 255, 255)  # White
-        draw_font_scale: float = 0.5
-        draw_thickness: int = 2
-        draw_yolo: DrawYOLO = DrawYOLO()
-
-        def validate_img(self, img_idx, img: ImageMat):
-            img.require_ndarray()
-            img.require_np_uint()
-            win_name = f'{self.window_name_prefix}:{img_idx}'
-            self.window_names.append(win_name)
-            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
-
-        def _draw_yolo(self, img: np.ndarray, yolo_detection: np.ndarray, class_names=[]) -> np.ndarray:
-            return self.draw_yolo.draw(img,yolo_detection,class_names)
-            # for det in yolo_detection:
-                # x1, y1, x2, y2, conf, cls_id = det
-                # label = f"{class_names[int(cls_id)]} {conf:.2f}"
-                # # Draw box
-                # cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), self.draw_box_color, self.draw_thickness)
-                # # Draw label
-                # cv2.putText(img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                #             self.draw_font_scale, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
-            # return img
-        
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            if self.yolo_uuid:
-                self._yolo_processor = meta[self.yolo_uuid]
-
-            scale = self.scale
-            overlay_texts = self.overlay_texts
-
-            for idx, img in enumerate(imgs_data):
-                img = img.copy()
-
-                # Optional overlay text
-                text = overlay_texts[idx] if idx < len(overlay_texts) else ""
-                if text:
-                    cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
-
-                # Optional YOLO detection overlays
-                if self._yolo_processor and idx<len(self._yolo_processor.bounding_box_xyxy):
-                    self._draw_yolo(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
-
-                win_name = self.window_names[idx]
-
-                if scale is not None:
-                    img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
-                cv2.imshow(win_name, img)
-                self.cv2_keys(idx,img)
-            return imgs_data
-        
-        def cv2_keys(self,idx,img):
-            key = cv2.waitKey(1) & 0xFF
-            if self.save_on_key and key == self.save_on_key:
-                filename = f'image_{idx}.png'
-                cv2.imwrite(filename, img)
-                logger(f'Saved {filename}')
-            elif key == ord('e'):
-                new_text = input(f"Enter new overlay text for image {idx}: ")
-                if idx < len(self.overlay_texts):
-                    self.overlay_texts[idx] = new_text
-                else:
-                    self.overlay_texts.append(new_text)
-
-        def __del__(self):
-            try:
-                [cv2.destroyWindow(n) for n in self.window_names]
-            except Exception:
-                pass
-
     class YOLOv5TRT(YOLOv5):
         title:str = 'YOLOv5_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
         use_official_predict:bool = False
-        conf: float = 0.6
+        conf: float = 0.0001        
 
         def build_models(self,imgs_info: List[ImageMatInfo]):
+            config = dict(imgsz=self.imgsz,                           
+                        conf=self.conf,verbose=self.yolo_verbose,
+                        half=(self._torch_dtype==torch.float16))
             self._models = {}
             for i,d in enumerate(self.num_devices):
                 with torch.cuda.device(d):
                     modelname = self.modelname.replace('.trt',(f'_{d}.trt').replace(':','@'))
                     yolo = GeneralTensorRTInferenceModel(modelname,d,'images','output0')
-                self._models[d] = yolo                
+                self._models[d] = yolo
+                
             self.use_official_predict = False            
+            self.print('load mode by config :',config)
 
         def predict(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[]):
             yolo_results = []
             for img,info in zip(imgs_data,imgs_info):
                 yolo_model = self._models[info.device]
+                print(img.device,img.dtype,yolo_model.device)
                 preds = yolo_model(img)
-                preds = ops.non_max_suppression(
-                    preds,
-                    self.conf,
-                    self.nms_iou,
-                    classes = None,
-                    agnostic= False,
-                    max_det = self.max_det,
-                    nc      = len(self.class_names),
-                    in_place= False,
-                    end2end = False,
-                    rotated = False,
-                )
-                if isinstance(preds, list):
-                    yolo_results += preds
-                else:
-                    yolo_results.append(preds)
-            yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
-            # yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
+                time.sleep(1)
+                # print(preds.shape,preds.dtype)
+                # print(preds[:,4:,:].max())
+            #     preds = ops.non_max_suppression(
+            #         preds,
+            #         self.conf,
+            #         self.nms_iou,
+            #         classes = None,
+            #         agnostic= False,
+            #         max_det = self.max_det,
+            #         nc      = len(self.class_names),
+            #         in_place= False,
+            #         end2end = False,
+            #         rotated = False,
+            #     )
+            #     if isinstance(preds, list):
+            #         yolo_results += preds
+            #     else:
+            #         yolo_results.append(preds)
+            # yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+            # print(yolo_results_xyxycc)
+            yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
+            # print(yolo_results_xyxycc)
             return [],yolo_results_xyxycc
         
-class ImageMatProcessors(BaseModel):
     @staticmethod    
     def dumps(pipes:list[ImageMatProcessor]):
         return json.dumps([p.model_dump() for p in pipes])

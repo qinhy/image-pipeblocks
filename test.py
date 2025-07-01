@@ -1,9 +1,14 @@
 import json
+import time
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 import torch
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.cuda.empty_cache()
+
 from generator import ImageMatGenerators, CvVideoFrameGenerator, XVSdkRGBDGenerator
 from processors import ImageMatProcessors, Processors
 from ImageMat import ImageMat, ColorType
@@ -299,27 +304,30 @@ def test_vid_show(mp4s=[]):
     if len(mp4s)==0:return print('Not mp4s.')
     pipes = []
     # Create multi-video generator
-    gen = multi_video_gen = CvVideoFrameGenerator(
+    gen = CvVideoFrameGenerator(
         sources=mp4s,
+        shmIO_mode='writer',
         # scale=0.5,        # Resize frames for speed, optional
         # step=1,           # No frame skipping
         # max_frames=10     # Limit to 10 frames for quick testing
     )
+    
     dh = (640-480)//2
     dw = (1280-854)//2
     pipes.append(Processors.NumpyPadImage(pad_width=((dh,dh),(dw,dw)))) # ((top, bottom), (left, right))
-    sws = Processors.SlidingWindowSplitter(window_size=(640,640),save_results_to_meta=True)
-    pipes.append(sws)
-    pipes.append(Processors.NumpyBGRToTorchRGB())
-    plot_imgs=False
-    yolo = Processors.YOLOv5(plot_imgs=plot_imgs,save_results_to_meta=True)
-    pipes.append(yolo)
-    if plot_imgs:
-        pipes.append(Processors.NumpyRGBToNumpyBGR())
-    else:
-        pipes.append(Processors.TorchRGBToNumpyBGR())
-        pipes.append(Processors.SlidingWindowMerger(sliding_window_splitter_uuid=sws.uuid,
-                                                    yolo_uuid=yolo.uuid))
+    # sws = Processors.SlidingWindowSplitter(window_size=(640,640),save_results_to_meta=True)
+    # pipes.append(sws)
+    # pipes.append(Processors.NumpyBGRToTorchRGB())
+    # plot_imgs=False
+    # yolo = Processors.YOLOv5(plot_imgs=plot_imgs,save_results_to_meta=True,use_official_predict=True)
+    # yolo = Processors.YOLOv5TRT(modelname='yolov5s6u_imgsz_640_batch_1_FP16.trt')
+    # pipes.append(yolo)
+    # if plot_imgs:
+    #     pipes.append(Processors.NumpyRGBToNumpyBGR())
+    # else:
+    #     pipes.append(Processors.TorchRGBToNumpyBGR())
+    #     pipes.append(Processors.SlidingWindowMerger(sliding_window_splitter_uuid=sws.uuid,
+    #                                                 yolo_uuid=yolo.uuid))
     
     # pipes.append(NumpyImageMask(
     #     mask_image_path="./data/MaskImage.png"))
@@ -333,13 +341,15 @@ def test_vid_show(mp4s=[]):
         window_name_prefix="MultiVideoTest",
         resizable=False,
         # scale=0.5,
-        yolo_uuid=yolo.uuid if not plot_imgs else None
+        # yolo_uuid=yolo.uuid if not plot_imgs else None
         # overlay_texts=None
     ))
 
     # validate
-    for i, imgs in enumerate(multi_video_gen):
-        ImageMatProcessors.run_once(imgs,pipes=pipes,validate=True)
+    for i, imgs in enumerate(gen):
+        meta={}
+        for fn in pipes:
+            imgs,meta = fn.validate(imgs,meta)
         print("validate complete.")
         break
 
@@ -347,15 +357,17 @@ def test_vid_show(mp4s=[]):
     gen_json = ImageMatGenerators.dumps(gen)
     pipes_json = ImageMatProcessors.dumps(pipes)
     del pipes,gen
+    return gen_json,pipes_json
+
     # print(gen_json)
-    # print(pipes_json)
+    # print(json.loads(pipes_json))
 
-    # loads
-    pipes = ImageMatProcessors.loads(pipes_json)
-    gen = ImageMatGenerators.loads(gen_json)
+    # # loads
+    # gen = ImageMatGenerators.loads(gen_json)
+    # pipes = ImageMatProcessors.loads(pipes_json)
 
-    # return gen, pipes
-    for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
+    # # return gen, pipes
+    # for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
 
 
 # def test_xvsdk_show(output_filename="./out.mp4"):
@@ -394,7 +406,13 @@ def test_vid_show(mp4s=[]):
 # ========== Usage Example ==========
 if __name__ == "__main__":
     # test_xvsdk_show()
-    test_vid_show(['./data/Object Test Area.avi'])
-    test1()
-    test_build_image_pipeline()
-    test_build_image_pipeline_gpu()
+    gen_json,pipes_json = test_vid_show(['./data/Object Test Area.avi'])
+    time.sleep(10)
+    gen = ImageMatGenerators.loads(gen_json)
+    pipes = ImageMatProcessors.loads(pipes_json)
+    # return gen, pipes
+    for imgs in gen:ImageMatProcessors.run_once(imgs,pipes=pipes)
+
+    # test1()
+    # test_build_image_pipeline()
+    # test_build_image_pipeline_gpu()
