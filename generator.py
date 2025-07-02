@@ -1,7 +1,9 @@
 import json
+import multiprocessing
 import os
 import sys
 import glob
+import time
 import uuid
 import platform
 from enum import IntEnum
@@ -11,8 +13,7 @@ import cv2
 import numpy as np
 from pydantic import BaseModel, Field
 
-from ImageMat import ColorType, ImageMat, ImageMatGenerator
-from shmIO import NumpyUInt8SharedMemoryStreamIO
+from ImageMat import ColorType, ImageMat
 
 logger = print
 
@@ -21,12 +22,15 @@ class ImageMatGenerator(BaseModel):
     color_types: list['ColorType']
     uuid: str = ''
     shmIO_mode: Literal['None','writer','reader'] = 'None'
+    fps:int = 30
+    _min_frame_time:float = 0.0
 
     _resources: list = []
     _frame_generators: list = []
     ouput_mats:list[ImageMat] = []
 
     def model_post_init(self, context):
+        self._min_frame_time = 1.0 / self.fps if self.fps != 0 else 0
         self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'        
         if len(self.sources)==0:raise ValueError('empty sources.')
         self._frame_generators = [self.create_frame_generator(i,src) for i,src in enumerate(self.sources)]
@@ -41,7 +45,6 @@ class ImageMatGenerator(BaseModel):
             mat.shmIO_mode=self.shmIO_mode
             if mat.shmIO_writer:
                 mat.shmIO_writer.build_buffer()
-                print(mat.shmIO_writer)
             elif mat.shmIO_mode=='writer':
                 mat.build_shmIO_writer()
         return super().model_post_init(context)        
@@ -80,13 +83,21 @@ class ImageMatGenerator(BaseModel):
         return self
 
     def __next__(self):
+        start_time = time.time()
         try:
-            frames = [next(frame_gen)
-                      for frame_gen in self._frame_generators]
+            frames = [next(frame_gen) for frame_gen in self._frame_generators]
             if not frames or any(f is None for f in frames):
                 raise StopIteration
             for frame, mat in zip(frames, self.ouput_mats):
                 mat.unsafe_update_mat(frame)
+
+            if self.fps:
+                # Enforce FPS limit
+                elapsed = time.time() - start_time
+                sleep_time = self._min_frame_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
             return self.ouput_mats
         except StopIteration:
             raise StopIteration
@@ -96,10 +107,14 @@ class ImageMatGenerator(BaseModel):
         self._frame_generators = [self.create_frame_generator(i,src) for i,src in enumerate(self.sources)]
 
     def release(self):
+        for i in self.ouput_mats:i.release()
         self.release_resources()
 
     def __del__(self):
         self.release()
+
+    def __len__(self):
+        return None
 
 class CvVideoFrameGenerator(ImageMatGenerator):    
     color_types: list['ColorType'] = []
@@ -234,23 +249,6 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
         """Recover float32 depth from green channel of colorized depth image."""
         norm = depth_colored[..., 1].astype(np.float32)
         return norm / 255.0 * (depth_max - depth_min) + depth_min
-
-class NumpyUInt8SharedMemoryReader(ImageMatGenerator):
-    def __init__(self, stream_key_prefix: str, color_type, array_shapes=[]):
-        super().__init__(color_type=color_type)
-        self.readers:list[NumpyUInt8SharedMemoryStreamIO.StreamReader] = []
-        self.stream_key_prefix = stream_key_prefix
-
-    def validate_img(self, img_idx, img: ImageMat):
-        img.require_ndarray()
-        img.require_np_uint()
-        stream_key = f"{self.stream_key_prefix}:{img_idx}"
-        rd = NumpyUInt8SharedMemoryStreamIO.reader(stream_key, img.data().shape)
-        rd.build_buffer()
-        self.readers.append(rd)
-
-    def forward_raw(self, imgs_data: List[np.ndarray]) -> List[np.ndarray]:
-        return [rd.read() for rd in self.readers]
 
 class BitFlowFrameGenerator(ImageMatGenerator):
     class BitFlowCamera:
@@ -404,7 +402,7 @@ class NumpyRawFrameFileGenerator(ImageMatGenerator):
           
 class ImageMatGenerators(BaseModel):
     
-    @staticmethod    
+    @staticmethod
     def dumps(gen:ImageMatGenerator):
         return json.dumps(gen.model_dump())
     
@@ -413,9 +411,23 @@ class ImageMatGenerators(BaseModel):
         gen = {
             'CvVideoFrameGenerator':CvVideoFrameGenerator,
             'XVSdkRGBDGenerator':XVSdkRGBDGenerator,
-            'NumpyUInt8SharedMemoryReader':NumpyUInt8SharedMemoryReader,
             'BitFlowFrameGenerator':BitFlowFrameGenerator,
         }
         g = json.loads(gen_json)
         return gen[f'{g["uuid"].split(":")[0]}'](**g) 
 
+    @staticmethod
+    def worker(gen_serialized):
+        gen = ImageMatGenerators.loads(gen_serialized)
+        for imgs in gen: pass
+        
+    @staticmethod
+    def run_async(gen: 'ImageMatGenerator | str'):
+        if isinstance(gen, str):
+            gen_serialized = gen
+        else:
+            gen_serialized = gen.model_dump_json()
+
+        p = multiprocessing.Process(target=ImageMatGenerators.worker, args=(gen_serialized,))
+        p.start()
+        return p

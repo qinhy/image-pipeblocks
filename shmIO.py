@@ -33,10 +33,11 @@ class GeneralSharedMemoryIO(CommonIO):
         create: bool = Field(default=False, description="Flag indicating whether to create or attach to shared memory")
         shm_size: int = Field(..., description="The size of the shared memory segment in bytes")
 
-        _shm:shared_memory.SharedMemory
-        _buffer:memoryview
+        _shm:shared_memory.SharedMemory = None
+        _buffer:memoryview = None
 
         def build_buffer(self):
+            if hasattr(self,'_shm') and self._shm:return
             # Initialize shared memory with the validated size and sanitized name
             self._shm = shared_memory.SharedMemory(name=self.shm_name, create=self.create, size=self.shm_size)
             self._buffer = memoryview(self._shm.buf)  # View into the shared memory buffer
@@ -45,12 +46,14 @@ class GeneralSharedMemoryIO(CommonIO):
         def close(self):
             """Detach from the shared memory."""
             # Release the memoryview before closing the shared memory
-            if hasattr(self,'_buffer') and self._buffer is not None:
+            if hasattr(self,'_buffer') and self._buffer:
                 self._buffer.release()
                 del self._buffer
-            if hasattr(self,'_shm'):
+            if hasattr(self,'_shm') and self._shm:
                 self._shm.close()  # Detach from shared memory
-                print(self.shm_name,self._shm,'Detach')
+                if 'writer' in self.id.lower():
+                    self._shm.unlink()  # Unlink (remove) the shared memory segment after writing
+                del self._shm
 
         def __del__(self):
             self.close()
@@ -73,10 +76,10 @@ class GeneralSharedMemoryIO(CommonIO):
             # Write the binary data to shared memory
             self._buffer[:len(data)] = data
         
-        def close(self):
-            super().close()
-            if hasattr(self,'_shm'):
-                self._shm.unlink()  # Unlink (remove) the shared memory segment after writing
+        # def close(self):
+        #     super().close()
+        #     if hasattr(self,'_shm') and self._shm:
+        #         self._shm.unlink()  # Unlink (remove) the shared memory segment after writing
     
     @staticmethod
     def reader(shm_name: str, shm_size: int):
@@ -90,7 +93,7 @@ class NumpyUInt8SharedMemoryIO(GeneralSharedMemoryIO):
     class Base(GeneralSharedMemoryIO.Base):
         array_shape: tuple = Field(..., description="Shape of the NumPy array to store in shared memory")
         _dtype: np.dtype = np.uint8
-        _shared_array: np.ndarray
+        _shared_array: np.ndarray = None
         def __init__(self, **kwargs):
             kwargs['shm_size'] = np.prod(kwargs['array_shape']) * np.dtype(np.uint8).itemsize
             super().__init__(**kwargs)
@@ -115,7 +118,7 @@ class NumpyUInt8SharedMemoryIO(GeneralSharedMemoryIO):
             if data.dtype != self._dtype:
                 raise ValueError(f"Data type {data.dtype} does not match expected type {self._dtype}.")            
             self._shared_array[:] = data[:]
-            # super().write(data.tobytes())
+            return data
 
     @staticmethod
     def reader(shm_name: str, array_shape: tuple):

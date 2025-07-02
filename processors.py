@@ -6,6 +6,7 @@ import enum
 import json
 import math
 from multiprocessing import shared_memory
+import multiprocessing
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
@@ -38,7 +39,7 @@ import pycuda.autoinit
 # Custom Modules
 # ===============================
 from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import ColorType, ImageMat, ImageMatGenerator, ImageMatInfo, ImageMatProcessor, ShapeType
+from ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
 
 
 logger = print
@@ -319,8 +320,7 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:                
-            
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:   
             padded_imgs = []
             for img,info in zip(imgs_data,imgs_info):
                 C = info.C
@@ -674,23 +674,6 @@ class Processors:
 
                 encoded_images.append(encoded)
                 return encoded_images
-
-    class NumpyUInt8SharedMemoryWriter(ImageMatProcessor):
-        title:str='np_uint8_shm_writer'
-        writers:list[NumpyUInt8SharedMemoryStreamIO.StreamWriter] = []
-        stream_key_prefix:str
-
-        def validate_img(self, img_idx, img: ImageMat):
-            img.require_ndarray()
-            img.require_np_uint()
-            stream_key = f"{self.stream_key_prefix}:{img_idx}"
-            wt = NumpyUInt8SharedMemoryStreamIO.writer(stream_key, img.data().shape)
-            wt.build_buffer()
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            for wt,img in zip(self.writers,imgs_data):
-                wt.write(img)
-            return imgs_data
 
     class CvVideoRecorder(ImageMatProcessor):
         output_filename: str = "output.avi",
@@ -1466,7 +1449,6 @@ class Processors:
         save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
         window_names:list[str] = []
         mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
-        shmIO_mode: Literal['None','writer','reader'] = 'None'
 
         yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
         _yolo_processor: 'Processors.YOLOv5' = None
@@ -1513,7 +1495,7 @@ class Processors:
                 # Optional YOLO detection overlays
                 if self._yolo_processor and idx<len(self._yolo_processor.bounding_box_xyxy):
                     self._draw_yolo(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
-
+                
                 win_name = self.window_names[idx]
 
                 if scale is not None:
@@ -1535,11 +1517,14 @@ class Processors:
                 else:
                     self.overlay_texts.append(new_text)
 
-        def __del__(self):
+        def release(self):
             try:
                 [cv2.destroyWindow(n) for n in self.window_names]
             except Exception:
                 pass
+
+        def __del__(self):
+            self.release()
 
     class YOLOv5TRT(YOLOv5):
         title:str = 'YOLOv5_TRT_detections'
@@ -1596,22 +1581,45 @@ class ImageMatProcessors(BaseModel):
     def run_once(imgs,meta={},
             pipes:list['ImageMatProcessor']=[],
             validate=False):
-        if validate:
-            try:
-                for fn in pipes:
-                    imgs,meta = fn.validate(imgs,meta)
-            except Exception as e:
-                logger(fn.uuid,e)
-                raise e
-        else:
-            for fn in pipes:
-                imgs,meta = fn(imgs,meta)
+        do = [fn.validate if validate else fn for fn in pipes]
+        try:
+            for d,fn in zip(do,pipes):
+                imgs,meta = d(imgs,meta)
+        except Exception as e:
+            logger(fn.uuid,e)
+            raise e
         return imgs,meta
+        
+    @staticmethod    
+    def run(gen,
+            pipes:list['ImageMatProcessor']=[],
+            meta = {},validate_once=False):
+        if isinstance(pipes, str):
+            pipes = ImageMatProcessors.loads(pipes)
+        for imgs in gen:
+            ImageMatProcessors.run_once(imgs,meta,pipes,validate_once)
+            if validate_once:return
 
     @staticmethod    
-    def validate_once(gen:ImageMatGenerator,
-            pipes:list['ImageMatProcessor']=[],
-            meta = {}):
-        for imgs in gen:
-            ImageMatProcessors.run_once(imgs,meta,pipes,True)
-            break
+    def validate_once(gen,
+            pipes:list['ImageMatProcessor']=[]):
+        ImageMatProcessors.rune(gen,pipes,validate_once=True)
+
+    @staticmethod
+    def worker(pipes_serialized):
+        pipes = ImageMatProcessors.loads(pipes_serialized)
+        imgs,meta = [],{}
+        while True:
+            for fn in pipes:
+                imgs,meta = fn(imgs,meta)
+
+    @staticmethod
+    def run_async(pipes: list[ImageMatProcessor] | str):
+        if isinstance(pipes, str):
+            pipes_serialized = pipes
+        else:
+            pipes_serialized = ImageMatProcessors.dumps(pipes)
+            
+        p = multiprocessing.Process(target=ImageMatProcessors.worker, args=(pipes_serialized,))
+        p.start()
+        return p

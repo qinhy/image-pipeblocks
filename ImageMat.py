@@ -139,9 +139,11 @@ class ImageMat(BaseModel):
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
     shmIO_reader:Optional[NumpyUInt8SharedMemoryStreamIO.Reader] = None
 
-    def model_post_init(self, context):        
+    def model_post_init(self, context):
+        if self.shmIO_writer and self.shmIO_reader:
+            raise ValueError('One ImageMat shmIO cannot have both writer and reader.')
         if self.shmIO_writer:
-            self.shmIO_writer.build_buffer()   
+            self.shmIO_writer.build_buffer()
         if self.shmIO_reader:
             self.shmIO_reader.build_buffer()
         return super().model_post_init(context)
@@ -160,14 +162,32 @@ class ImageMat(BaseModel):
         return self
     
     def build_shmIO_writer(self):
+        self.shmIO_mode='writer'
         if self.info is None: raise ValueError("self.info cannot be None")
         self.shmIO_writer = NumpyUInt8SharedMemoryStreamIO.writer(self.info.uuid,self.info.raw_shape)
         return self
 
     def build_shmIO_reader(self,target_mat_info:'ImageMat'):
+        self.shmIO_mode='reader'
         if self.info is None: raise ValueError("self.info cannot be None")
         self.shmIO_reader = NumpyUInt8SharedMemoryStreamIO.reader(target_mat_info.uuid,target_mat_info.raw_shape)
         return self
+
+    def to_shmIO_writer(self):
+        self.shmIO_mode='writer'
+        self.shmIO_writer = NumpyUInt8SharedMemoryStreamIO.writer(self.shmIO_reader.shm_name,self.shmIO_reader.array_shape)
+        self.shmIO_reader = None
+
+    def to_shmIO_reader(self):
+        self.shmIO_mode='reader'
+        self.shmIO_reader = NumpyUInt8SharedMemoryStreamIO.reader(self.shmIO_writer.shm_name,self.shmIO_writer.array_shape)
+        self.shmIO_writer = None
+
+    def release(self):
+        if self.shmIO_reader:
+            self.shmIO_reader.close()
+        if self.shmIO_writer:
+            self.shmIO_writer.close()
 
     def copy(self) -> 'ImageMat':
         """Return a deep copy of the ImageMat object."""
@@ -186,14 +206,14 @@ class ImageMat(BaseModel):
 
     def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
         """Update the image data without updating metadata (use with caution)."""
-        if self.shmIO_writer:
+        if self.shmIO_mode!='None':
             self._img_data = self.shmIO_writer.write(img_data)
         self._img_data = img_data
         return self
 
     def data(self) -> Union[np.ndarray, torch.Tensor]:
         """Return the image data."""
-        if self.shmIO_reader:
+        if self.shmIO_mode!='None':
             self._img_data = self.shmIO_reader.read()
         return self._img_data
 
@@ -315,11 +335,19 @@ class ImageMatProcessor(BaseModel):
         raise NotImplementedError()
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}):
-        self.input_mats = []
+        input_mats = [None]*len(imgs)
         for i,img in enumerate(imgs):
             self.validate_img(i,img)
-            self.input_mats.append(img)
-        self.input_mats = self.input_mats
+            if img.shmIO_mode=='None':
+                input_mats[i]=img
+            elif img.shmIO_mode=='writer':
+                img = img.model_copy()
+                img.to_shmIO_reader()
+            else:
+                raise ValueError(f"input_mats shmIO_mode must be None or writer. Got {img.shmIO_mode}")
+            input_mats[i]=img
+
+        self.input_mats = input_mats
         return self(self.input_mats, meta)
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
@@ -380,6 +408,12 @@ class ImageMatProcessor(BaseModel):
         raise NotImplementedError()
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
+        if imgs and imgs[0].shmIO_mode=='None':
+            imgs = imgs
+        elif self.input_mats:
+            imgs = self.input_mats
+
+
         input_infos = [img.info for img in imgs]
         forwarded_imgs = self.forward_raw([img.data() for img in imgs],input_infos,meta)
         
@@ -388,11 +422,12 @@ class ImageMatProcessor(BaseModel):
         else:
             # Create new ImageMat instances for output
             output_imgs = self.build_out_mats(self.input_mats,forwarded_imgs)
-            for i,o in zip(imgs,output_imgs):
-                if i.shmIO_mode=='writer':
-                    o.shmIO_mode='reader'
-                    print(i.info,'-->>',o.info)
-                    o.build_shmIO_reader(i.info)
+            shmIO_mode = any([i.shmIO_mode!='None' for i in imgs])          
+            if shmIO_mode:  
+                for o in output_imgs:
+                    o.shmIO_mode='writer'
+                    o.build_shmIO_writer()
+            self.out_mats = output_imgs
    
         if len(self.pixel_idx_forward_T)==0:
             self.build_pixel_transform_matrix(input_infos)
@@ -409,65 +444,10 @@ class ImageMatProcessor(BaseModel):
             meta[self.uuid] = self#[i.copy() for i in output_imgs]
         return output_imgs, meta
 
-class ImageMatGenerator(BaseModel):
-    sources: list[str] = str
-    color_types: list[ColorType] = []
-    _resources = []  # General-purpose resource registry
-    _source_generators = []  # General-purpose resource registry
-
-    def model_post_init(self, context):
-        self._source_generators = [self.create_source_generator(src) for src in self.sources]
-        return super().model_post_init(context)
-
-    def register_resource(self, resource):
-        self._resources.append(resource)
-
-    @staticmethod
-    def has_func(obj, name):
-        return callable(getattr(obj, name, None))
-
-    def release_resources(self):
-        cleanup_methods = [
-            "exit", "end", "teardown",
-            "stop", "shutdown", "terminate",
-            "join", "cleanup", "deactivate",
-            "release", "close", "disconnect",
-            "destroy",
-        ]
-
-        for res in self._resources:
-            for method in cleanup_methods:
-                if self.has_func(res, method):
-                    try:
-                        getattr(res, method)()
-                    except Exception as e:
-                        print(f"Error during {method} on {res}: {e}")
-
-        self._resources.clear()
-
-
-    def create_source_generator(self, source):
-        raise NotImplementedError("Subclasses must implement `create_source_generator`")
-
-    def iterate_raw_images(self):
-        for generator in self._source_generators:
-            yield from generator
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        for raw_image, color_type in zip(self.iterate_raw_images(), self.color_types):
-            yield ImageMat(color_type=color_type).build(raw_image)
-
-    def reset_generators(self):
-        pass
-
     def release(self):
-        self.release_resources()
-
+        for i in self.input_mats:i.release()
+        for i in self.out_mats:i.release()
+    
     def __del__(self):
         self.release()
 
-    def __len__(self):
-        return None
