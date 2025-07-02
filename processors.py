@@ -210,21 +210,20 @@ class Processors:
         title: str = 'crop_to_divisible_by_32'
         hs:list[int] = []
         ws:list[int] = []
+        
         def validate_img(self, img_idx, img):
             img.require_np_uint()
             img.require_HW_or_HWC()
+            h, w = img.info.H,img.info.W
+            new_h = h - (h % 32)
+            new_w = w - (w % 32)
+            self.hs.append(new_h)
+            self.ws.append(new_w)
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
-            if len(self.hs)==0:
-                for img in imgs_data:
-                    h, w = img.shape[:2]
-                    new_h = h - (h % 32)
-                    new_w = w - (w % 32)
-                    self.hs.append(new_h)
-                    self.ws.append(new_w)
             processed_imgs = []
             for img,h,w in zip(imgs_data,self.hs,self.ws):
                 processed_imgs.append(img[:h, :w])
@@ -315,24 +314,26 @@ class Processors:
         pad_width: Tuple[Tuple[int, int], Tuple[int, int]] = ((10, 10), (10, 10))  # ((top, bottom), (left, right))
         pad_value: int = 0
         mode: str = "constant"  # Options: 'constant', 'edge', 'reflect', 'symmetric', etc.
+        _pad_widths:list=[]
 
         def validate_img(self, img_idx: int, img: ImageMat):
             img.require_np_uint()
             img.require_HW_or_HWC()
 
+            C = img.info.C
+            if C == 2:
+                # Grayscale image: pad HxW
+                pad_width = self.pad_width
+            elif C == 3:
+                # Color image: pad HxW only, leave channel unchanged
+                pad_width = self.pad_width + ((0, 0),)
+            else:
+                raise ValueError(f"Unsupported image shape: {img.shape}")
+            self._pad_widths.append(pad_width)
+
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:   
             padded_imgs = []
-            for img,info in zip(imgs_data,imgs_info):
-                C = info.C
-                if C == 2:
-                    # Grayscale image: pad HxW
-                    pad_width = self.pad_width
-                elif C == 3:
-                    # Color image: pad HxW only, leave channel unchanged
-                    pad_width = self.pad_width + ((0, 0),)
-                else:
-                    raise ValueError(f"Unsupported image shape: {img.shape}")
-                    
+            for img,pad_width in zip(imgs_data,self._pad_widths):
                 padded_img = np.pad(img, pad_width, mode=self.mode, constant_values=self.pad_value)
                 padded_imgs.append(padded_img)
             return padded_imgs
@@ -575,11 +576,11 @@ class Processors:
             color_types = {i.info.color_type for i in imgs}
             if len(color_types) != 1:
                 raise ValueError(f"All images must have the same color_type, got {color_types}")
-            return super().validate(imgs, meta)
+            super().validate(imgs, meta, run=False)
+            self.layout = self._init_layout(self.input_mats)
+            return self(self.input_mats, meta)
         
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            if self.layout is None:
-                self.layout = self._init_layout(self.input_mats)
             layout = self.layout
             tile_width = layout.tile_width
             tile_height = layout.tile_height
@@ -663,12 +664,8 @@ class Processors:
             """
             encoded_images = []
             for img in imgs_data:
-                if self.quality is not None:
-                    success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
-                                                                    int(self.quality)])
-                else:
-                    success, encoded = cv2.imencode('.jpeg', img)
-                
+                success, encoded = cv2.imencode('.jpeg', img, [int(cv2.IMWRITE_JPEG_QUALITY),
+                                                                int(self.quality)])
                 if not success:
                     raise ValueError("JPEG encoding failed.")
 
@@ -741,7 +738,7 @@ class Processors:
         mask_image_path: Optional[str] = None
         mask_color: str = "#00000080"
         mask_split: Tuple[int, int] = (2, 2)
-        _masks:list = None
+        _masks:dict = None
 
         def model_post_init(self, context: Any) -> None:
             self._masks = self._make_mask_images(self.mask_image_path, self.mask_split, self.mask_color)
@@ -812,14 +809,15 @@ class Processors:
             img.require_ndarray()
             img.require_np_uint()
             img.require_HW_or_HWC()
-
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            if self._masks is None:
-                return imgs_data
+        
+        def validate(self, imgs, meta = ..., run=True):
+            super().validate(imgs, meta, run=False)
             
             if "resized_masks" not in self._masks:
                 self._adjust_mask([img for img in self.input_mats])
 
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
+            # if self._masks is None: return imgs_data
             masks = self._masks["resized_masks"]
             return [cv2.bitwise_and(image, mask) for image, mask in zip(imgs_data, masks)]
 
@@ -862,14 +860,15 @@ class Processors:
                     resized_mask_torch = resized_mask_torch.to(img.info.device)
                 self._masks["resized_masks"][i] = resized_mask_torch
 
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+        def validate(self, imgs, meta = ..., run=True):
+            super().validate(imgs, meta, run=False)
             
-            if self._masks is None:
-                return imgs_data
-
             if "resized_masks" not in self._masks:
                 self._adjust_mask([img for img in self.input_mats])
 
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
+            # if self._masks is None:
+            #     return imgs_data
             masks = self._masks["resized_masks"]
             return [image * mask for image, mask in zip(imgs_data, masks)]
 

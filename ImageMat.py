@@ -134,10 +134,41 @@ class ImageMat(BaseModel):
 
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
-    _img_data: Any = None
+    _img_data: np.ndarray|torch.Tensor = None
+
     shmIO_mode: Literal['None','writer','reader'] = 'None'
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
     shmIO_reader:Optional[NumpyUInt8SharedMemoryStreamIO.Reader] = None
+
+    @staticmethod
+    def random(color_type,shape,lib='np',device='cpu'):
+        if   lib=='np':
+            data = np.random.randint(0, 255, size=shape, dtype=ImageMatInfo.numpy_img_dtype())
+        elif lib=='torch':
+            data = torch.rand(shape, dtype=ImageMatInfo.torch_img_dtype(), device=device)
+        else:
+            raise TypeError(f"Unsupported image lib type: {lib}")
+        return ImageMat(color_type).build(data)
+    
+    def clone(self):
+        info = self.info.model_copy()
+        data = self._img_data.copy()
+        return ImageMat(self.color_type).build(data,info)
+    
+    def zero_clone(self):
+        info = self.info.model_copy()
+        data = self._img_data.copy() * 0
+        return ImageMat(self.color_type).build(data,info)
+
+    def random_clone(self):
+        info = self.info.model_copy()
+        if isinstance(self._img_data, np.ndarray):
+            data = np.random.randint(0, 255, size=self._img_data.shape, dtype=self.info._dtype)
+        elif isinstance(self._img_data, torch.Tensor):
+            data = torch.rand(self._img_data.shape, dtype=self.info._dtype, device=self.info.device)
+        else:
+            raise TypeError(f"Unsupported image data type: {type(self._img_data)}")
+        return ImageMat(self.color_type).build(data,info)
 
     def model_post_init(self, context):
         if self.shmIO_writer and self.shmIO_reader:
@@ -334,7 +365,7 @@ class ImageMatProcessor(BaseModel):
     def validate_img(self, img_idx:int, img:ImageMat):
         raise NotImplementedError()
 
-    def validate(self, imgs: List[ImageMat], meta: Dict = {}):
+    def validate(self, imgs: List[ImageMat], meta: Dict = {}, run=True):
         input_mats = [None]*len(imgs)
         for i,img in enumerate(imgs):
             self.validate_img(i,img)
@@ -348,7 +379,8 @@ class ImageMatProcessor(BaseModel):
             input_mats[i]=img
 
         self.input_mats = input_mats
-        return self(self.input_mats, meta)
+        if run: return self(self.input_mats, meta)
+        return self.input_mats
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
         if color_type is None:
