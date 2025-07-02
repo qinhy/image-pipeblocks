@@ -1603,7 +1603,7 @@ class ImageMatProcessors(BaseModel):
     @staticmethod    
     def validate_once(gen,
             pipes:list['ImageMatProcessor']=[]):
-        ImageMatProcessors.rune(gen,pipes,validate_once=True)
+        ImageMatProcessors.run(gen,pipes,validate_once=True)
 
     @staticmethod
     def worker(pipes_serialized):
