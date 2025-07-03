@@ -21,7 +21,7 @@ class ImageMatGenerator(BaseModel):
     sources: list[str]
     color_types: list['ColorType']
     uuid: str = ''
-    shmIO_mode: Literal['None','writer','reader'] = 'None'
+    shmIO_mode: Literal[False,'writer','reader'] = False
     fps:int = -1
     _min_frame_time:float = 0.0
 

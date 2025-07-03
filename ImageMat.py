@@ -136,7 +136,7 @@ class ImageMat(BaseModel):
     color_type: Union[str, ColorType]
     _img_data: np.ndarray|torch.Tensor = None
 
-    shmIO_mode: Literal['None','writer','reader'] = 'None'
+    shmIO_mode: Literal[False,'writer','reader'] = False
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
     shmIO_reader:Optional[NumpyUInt8SharedMemoryStreamIO.Reader] = None
 
@@ -184,7 +184,7 @@ class ImageMat(BaseModel):
         self._img_data = img_data
         return self
     
-    def build_shmIO(self, shmIO_mode:str='None',target_mat_info:'ImageMat'=None):
+    def build_shmIO(self, shmIO_mode:str=False,target_mat_info:'ImageMat'=None):
         self.shmIO_mode = shmIO_mode
         if self.shmIO_mode == 'writer' and self.info.device=='cpu':
             self.build_shmIO_writer()
@@ -237,15 +237,15 @@ class ImageMat(BaseModel):
 
     def unsafe_update_mat(self, img_data: Union[np.ndarray, torch.Tensor]) -> 'ImageMat':
         """Update the image data without updating metadata (use with caution)."""
-        if self.shmIO_mode!='None':
-            self._img_data = self.shmIO_writer.write(img_data)
+        if self.shmIO_mode:
+            self.shmIO_writer.write(img_data)
         self._img_data = img_data
         return self
 
     def data(self) -> Union[np.ndarray, torch.Tensor]:
         """Return the image data."""
-        if self.shmIO_mode!='None':
-            self._img_data = self.shmIO_reader.read()
+        if self.shmIO_mode:
+            return self.shmIO_reader.read()
         return self._img_data
 
     # --- Type/Shape/Color Requirement Methods ---
@@ -369,7 +369,7 @@ class ImageMatProcessor(BaseModel):
         input_mats = [None]*len(imgs)
         for i,img in enumerate(imgs):
             self.validate_img(i,img)
-            if img.shmIO_mode=='None':
+            if img.shmIO_mode==False:
                 input_mats[i]=img
             elif img.shmIO_mode=='writer':
                 img = img.model_copy()
@@ -440,7 +440,7 @@ class ImageMatProcessor(BaseModel):
         raise NotImplementedError()
 
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
-        if imgs and imgs[0].shmIO_mode=='None':
+        if imgs and imgs[0].shmIO_mode==False:
             imgs = imgs
         elif self.input_mats:
             imgs = self.input_mats
@@ -454,7 +454,7 @@ class ImageMatProcessor(BaseModel):
         else:
             # Create new ImageMat instances for output
             output_imgs = self.build_out_mats(self.input_mats,forwarded_imgs)
-            shmIO_mode = any([i.shmIO_mode!='None' for i in imgs])          
+            shmIO_mode = any([i.shmIO_mode for i in imgs])          
             if shmIO_mode:  
                 for o in output_imgs:
                     o.shmIO_mode='writer'

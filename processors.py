@@ -186,7 +186,7 @@ class GeneralTensorRTInferenceModel:
         return self.raw_infer(x)
 
     def raw_infer(self, x:torch.Tensor):
-        [self._transfer_torch2cuda(x, mem) for x, mem in zip([x], self.inputs)]
+        self._transfer_torch2cuda(x, self.inputs[0])
         self.context.execute_v2(bindings=self.bindings)
         outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
         self.stream.synchronize()
@@ -225,7 +225,8 @@ class Processors:
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
             processed_imgs = []
-            for img,h,w in zip(imgs_data,self.hs,self.ws):
+            for i,img in enumerate(imgs_data):
+                h,w = self.hs[i],self.ws[i]
                 processed_imgs.append(img[:h, :w])
             return processed_imgs
   
@@ -314,7 +315,7 @@ class Processors:
         pad_width: Tuple[Tuple[int, int], Tuple[int, int]] = ((10, 10), (10, 10))  # ((top, bottom), (left, right))
         pad_value: int = 0
         mode: str = "constant"  # Options: 'constant', 'edge', 'reflect', 'symmetric', etc.
-        _pad_widths:list=[]
+        pad_widths:list=[]
 
         def validate_img(self, img_idx: int, img: ImageMat):
             img.require_np_uint()
@@ -329,11 +330,12 @@ class Processors:
                 pad_width = self.pad_width + ((0, 0),)
             else:
                 raise ValueError(f"Unsupported image shape: {img.shape}")
-            self._pad_widths.append(pad_width)
+            self.pad_widths.append(pad_width)
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:   
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             padded_imgs = []
-            for img,pad_width in zip(imgs_data,self._pad_widths):
+            for i,img in enumerate(imgs_data):
+                pad_width = self.pad_widths[i]
                 padded_img = np.pad(img, pad_width, mode=self.mode, constant_values=self.pad_value)
                 padded_imgs.append(padded_img)
             return padded_imgs
@@ -819,7 +821,7 @@ class Processors:
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             # if self._masks is None: return imgs_data
             masks = self._masks["resized_masks"]
-            return [cv2.bitwise_and(image, mask) for image, mask in zip(imgs_data, masks)]
+            return [cv2.bitwise_and(img, masks[i]) for i,img in enumerate(imgs_data)]
 
     class TorchImageMask(NumpyImageMask):
         title: str = "torch_image_mask"
@@ -870,7 +872,7 @@ class Processors:
             # if self._masks is None:
             #     return imgs_data
             masks = self._masks["resized_masks"]
-            return [image * mask for image, mask in zip(imgs_data, masks)]
+            return [image * masks[i] for i,image in enumerate(imgs_data)]
 
     class TorchDebayer(ImageMatProcessor):
         ### Define the `Debayer5x5` PyTorch Model
@@ -1113,10 +1115,10 @@ class Processors:
                 img = validated_imgs[i]
                 out_mats += [img for _ in v]
 
-            self.out_mats = [ImageMat(color_type=i.info.color_type).build(img)
-                for i,img in zip(out_mats,converted_raw_imgs)]
-            return self.out_mats
-            
+            self.out_mats = [
+                ImageMat(color_type=out_mats[i].info.color_type).build(img)
+                for i,img in enumerate(converted_raw_imgs)]
+            return self.out_mats            
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             
@@ -1190,7 +1192,8 @@ class Processors:
 
             transform_detections = [None]*len(transforms)
 
-            for i, (dets, T) in enumerate(zip(detections_per_window, transforms)):
+            for i,dets in enumerate(detections_per_window):
+                T = transforms[i]
                 transform_detections[i] = dets
                 if len(dets) == 0: continue
                 T = np.array(T)  # 3x3
@@ -1214,12 +1217,11 @@ class Processors:
             for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
                 offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):pass
+                tile_idx = tile_indices[-1]
                 color_types.append(validated_imgs[tile_idx].info.color_type)
                 
-            self.out_mats = [ImageMat(color_type=color_type if color_type is None else color_type
-                ).build(img)
-                for color_type,img in zip(color_types,converted_raw_imgs)]
+            self.out_mats = [ImageMat(color_type=color_types[i]).build(img)
+                for i,img in enumerate(converted_raw_imgs)]
             return self.out_mats
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
@@ -1239,7 +1241,8 @@ class Processors:
 
                 offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
-                for tile_idx, (x1, y1, x2, y2) in zip(tile_indices, offsets):
+                for i,tile_idx in enumerate(tile_indices):
+                    x1, y1, x2, y2 = offsets[i]
                     merged[y1:y2, x1:x2] = imgs_data[tile_idx]
                 merged_imgs[img_idx] = merged
 
@@ -1269,6 +1272,7 @@ class Processors:
 
         nms_iou:float = 0.7
         _models:dict = {}
+        devices:list[str] = []
 
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
@@ -1291,6 +1295,8 @@ class Processors:
                 
                 if self.imgsz<0:
                     self.imgsz = img.info.W
+                
+                self.devices.append(img.info.device)
         
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
@@ -1333,8 +1339,8 @@ class Processors:
         def official_predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             imgs = []
             yolo_results = []
-            for i,(img,info) in enumerate(zip(imgs_data,imgs_info)):
-                device = info.device
+            for i,img in enumerate(imgs_data):
+                device = self.devices[i]
                 yolo_result = self._models[device](img)
                 if isinstance(yolo_result, list):
                     yolo_results += yolo_result
@@ -1360,8 +1366,9 @@ class Processors:
         
         def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             yolo_results = []
-            for img,info in zip(imgs_data,imgs_info):
-                yolo_model:YOLO = self._models[info.device]
+            for i,img in enumerate(imgs_data):
+                device = self.devices[i]
+                yolo_model:YOLO = self._models[device]
                 preds, feature_maps = yolo_model(img)                
                 preds = ops.non_max_suppression(
                     preds,
@@ -1542,7 +1549,8 @@ class Processors:
 
         def predict(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[]):
             yolo_results = []
-            for img,info in zip(imgs_data,imgs_info):
+            for i,img in enumerate(imgs_data):
+                info = imgs_info[i]
                 yolo_model = self._models[info.device]
                 preds = yolo_model(img)
                 preds = ops.non_max_suppression(
@@ -1580,10 +1588,9 @@ class ImageMatProcessors(BaseModel):
     def run_once(imgs,meta={},
             pipes:list['ImageMatProcessor']=[],
             validate=False):
-        do = [fn.validate if validate else fn for fn in pipes]
         try:
-            for d,fn in zip(do,pipes):
-                imgs,meta = d(imgs,meta)
+            for fn in pipes:
+                imgs,meta = (fn.validate if validate else fn)(imgs,meta)
         except Exception as e:
             logger(fn.uuid,e)
             raise e
