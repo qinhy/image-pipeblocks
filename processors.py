@@ -2,11 +2,13 @@
 # Standard Library Imports
 # ===============================
 from collections import defaultdict
+from datetime import datetime
 import enum
 import json
 import math
 from multiprocessing import shared_memory
 import multiprocessing
+import os
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
@@ -675,59 +677,77 @@ class Processors:
                 return encoded_images
 
     class CvVideoRecorder(ImageMatProcessor):
-        output_filename: str = "output.avi",
-        codec: str = 'XVID',
-        fps: int = 30,
-        scale: Optional[float] = None,
+        title: str = "cv_recorder"
+        output_filename: str = "output.avi"
+        codec: str = 'XVID'
+        fps: int = 30
+        frame_interval:float = 0.0
         overlay_text: Optional[str] = None
-        _writer = None
+        _writers:list = []
         recording:bool = False
-        frame_size:Optional[Tuple[int, int]] = None
+        _last_write:int = time.time()
+
+        def model_post_init(self, context):
+            self.frame_interval = 1.0/self.fps
+            return super().model_post_init(context)
 
         def validate_img(self, img_idx, img: ImageMat):
-            if img_idx>0:
-                raise RuntimeError("CvVideoRecorder cannot process multiple images at once")
             img.require_ndarray()
             img.require_np_uint()
-            self.start(img.data().shape)
+            img.require_BGR()
+            img.require_HWC()
+
+        def on(self):
+            self.start()
+            return super().on()
+        
+        def off(self):
+            self.stop()
+            return super().off()
+        
+        def formatfilename(self,add_string):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base, ext = os.path.splitext(self.output_filename)
+            return f"{base}_{add_string}_{timestamp}{ext}"
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            for img in imgs_data:self.write_frame(img)
+            for i,img in enumerate(imgs_data):
+                self.write_frame(self._writers[i],img)
             return imgs_data
         
-        def start(self, frame_shape: Tuple[int, int]):
+        def build_writer(self, output_filename, width, height):
             fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            self.frame_size = (frame_shape[1], frame_shape[0])  # (width, height)
-            self._writer = cv2.VideoWriter(self.output_filename, fourcc, self.fps, self.frame_size)
-            self.recording = True
-            logger(f"Started recording to {self.output_filename}")
+            self._writers.append(cv2.VideoWriter(output_filename, fourcc, self.fps, (width, height)))
+
+        def release(self):
+            res = super().release()
+            self.stop()
+            return res
+        
+        def start(self):            
+            for i,img in enumerate(self.input_mats):
+                self.build_writer(self.formatfilename(str(i)), img.info.H,img.info.W)
+            # logger(f"Started recording to {output_filename}")
 
         def stop(self):
-            if self._writer:
-                self._writer.release()
-                self._writer = None
-            self.recording = False
-            logger("Stopped recording.")
+            for w in self._writers:
+                w.release()
+            self._writers = []
+            # logger("Stopped recording.")
 
-        def write_frame(self, frame: np.ndarray):
-            if not self.recording:
-                raise RuntimeError("Recording has not started. Call start() first.")
-
-            # Resize frame if needed
-            if self.scale is not None:
-                frame = cv2.resize(frame, (0, 0), fx=self.scale, fy=self.scale)
+        def write_frame(self, writer, frame: np.ndarray):
+            # Skip frames if input_fps is set
+            if self.fps:
+                frame_interval = time.time() - self._last_write
+                if frame_interval < self.frame_interval:
+                    return  # Skip this frame
 
             # Overlay text
             if self.overlay_text:
                 cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
 
-            # Ensure frame matches output size and type
-            if self.frame_size is not None and (frame.shape[1], frame.shape[0]) != self.frame_size:
-                frame = cv2.resize(frame, self.frame_size)
-            if frame.dtype != np.uint8 or (frame.ndim != 3 or frame.shape[2] != 3):
-                raise ValueError("Frame must be uint8 BGR for VideoWriter")
-
-            self._writer.write(frame)
+            writer.write(frame)
+            self._last_write=time.time()
 
         def __del__(self):
             try:
@@ -1180,7 +1200,7 @@ class Processors:
             img.require_np_uint()
             img.require_HW_or_HWC()
                 
-        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLOv5'):
+        def forward_raw_yolo(self,sw_yolo_proc: 'Processors.YOLO'):
             detections_per_window = sw_yolo_proc.bounding_box_xyxy
             transforms = self._sliding_window_splitter.pixel_idx_backward_T
 
@@ -1247,13 +1267,13 @@ class Processors:
                 merged_imgs[img_idx] = merged
 
             if self.yolo_uuid:
-                yolo:Processors.YOLOv5 = meta[self.yolo_uuid]
+                yolo:Processors.YOLO = meta[self.yolo_uuid]
                 yolo.bounding_box_xyxy = self.forward_raw_yolo(yolo)
 
             return merged_imgs
 
-    class YOLOv5(ImageMatProcessor):
-        title:str='YOLOv5_detections'
+    class YOLO(ImageMatProcessor):
+        title:str='YOLO_detections'
         gpu:bool=True
         multi_gpu:int=-1
         _torch_dtype:Any = ImageMatInfo.torch_img_dtype()
@@ -1387,7 +1407,82 @@ class Processors:
                     yolo_results.append(preds)
             yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
+
+    class DrawYOLO(ImageMatProcessor):
+        title:str = 'cv_draw_yolo'
+        draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
+        draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
+        draw_font_scale: float = Field(0.5, description="Font scale for label text")
+        draw_thickness: int = Field(2, description="Line thickness for box and text")
+        yolo_uuid:str=''
+        _yolo_processor:'Processors.YOLO'= None
+
+        def validate_img(self, img_idx, img):
+            img.require_np_uint()
+            img.require_BGR()
+            img.require_HWC()
         
+        def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
+            res = []
+            if self.yolo_uuid:
+                self._yolo_processor = meta[self.yolo_uuid]
+            for idx, img in enumerate(imgs_data):
+                res.append(self.draw(img,
+                                     self._yolo_processor.bounding_box_xyxy[idx],
+                                     self._yolo_processor.class_names))
+            return res
+            
+        def draw(
+            self,
+            img: np.ndarray,
+            detections: np.ndarray,
+            class_names: List[str] = []
+        ) -> np.ndarray:
+            """
+            Draw YOLO-style bounding boxes and labels on the image.
+
+            Parameters:
+                img (np.ndarray): Image to draw on.
+                detections (np.ndarray): Array of detections [x1, y1, x2, y2, conf, cls_id].
+                class_names (List[str], optional): Class names for label display.
+
+            Returns:
+                np.ndarray: Annotated image.
+            """
+            for det in detections:
+                x1, y1, x2, y2, conf, cls_id = map(float, det[:6])
+                cls_id = int(cls_id)
+
+                # Compose label text
+                if class_names and 0 <= cls_id < len(class_names):
+                    label = f"{class_names[cls_id]} {conf:.2f}"
+                else:
+                    label = f"ID {cls_id} {conf:.2f}"
+
+                # Draw bounding box
+                cv2.rectangle(
+                    img,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    self.draw_box_color,
+                    self.draw_thickness
+                )
+
+                # Draw label
+                cv2.putText(
+                    img,
+                    label,
+                    (int(x1), int(y1) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    self.draw_font_scale,
+                    self.draw_text_color,
+                    self.draw_thickness,
+                    cv2.LINE_AA
+                )
+
+            return img
+
+
     class CvImageViewer(ImageMatProcessor):
 
         class DrawYOLO(BaseModel):
@@ -1457,7 +1552,7 @@ class Processors:
         mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
 
         yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
-        _yolo_processor: 'Processors.YOLOv5' = None
+        _yolo_processor: 'Processors.YOLO' = None
         draw_text_color: tuple = (255, 255, 255)  # White
         draw_font_scale: float = 0.5
         draw_thickness: int = 2
@@ -1532,8 +1627,8 @@ class Processors:
         def __del__(self):
             self.release()
 
-    class YOLOv5TRT(YOLOv5):
-        title:str = 'YOLOv5_TRT_detections'
+    class YOLOTRT(YOLO):
+        title:str = 'YOLO_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
         use_official_predict:bool = False
         conf: float = 0.6

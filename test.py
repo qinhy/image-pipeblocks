@@ -320,8 +320,8 @@ def test_vid_show(mp4s=[]):
     pipes.append(sws)
     pipes.append(Processors.NumpyBGRToTorchRGB())
     plot_imgs=False
-    yolo = Processors.YOLOv5(plot_imgs=plot_imgs,save_results_to_meta=True,use_official_predict=True)
-    # yolo = Processors.YOLOv5TRT(modelname='yolov5s6u_imgsz_640_batch_1_FP16.trt')
+    yolo = Processors.YOLO(plot_imgs=plot_imgs,save_results_to_meta=True,use_official_predict=True)
+    # yolo = Processors.YOLOTRT(modelname='yolov5s6u_imgsz_640_batch_1_FP16.trt')
     pipes.append(yolo)
     if plot_imgs:
         pipes.append(Processors.NumpyRGBToNumpyBGR())

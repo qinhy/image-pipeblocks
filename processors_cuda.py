@@ -689,8 +689,8 @@ class Processors:
                 debayered_imgs.append(img)
             return debayered_imgs
 
-    class YOLOv5(ImageMatProcessor):
-        title:str='YOLOv5_detections'
+    class YOLO(ImageMatProcessor):
+        title:str='YOLO_detections'
         gpu:bool=True
         multi_gpu:int=-1
         _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
@@ -814,8 +814,8 @@ class Processors:
             yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
         
-    class YOLOv5TRT(YOLOv5):
-        title:str = 'YOLOv5_TRT_detections'
+    class YOLOTRT(YOLO):
+        title:str = 'YOLO_TRT_detections'
         modelname: str = 'yolov5s6u.engine'
         use_official_predict:bool = False
         conf: float = 0.0001        

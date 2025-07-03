@@ -343,6 +343,9 @@ class ImageMatProcessor(BaseModel):
             self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
         return super().model_post_init(context)
     
+    def is_enable(self):
+        return self._enable
+
     def on(self):
         self._enable = True
 
@@ -445,9 +448,13 @@ class ImageMatProcessor(BaseModel):
         elif self.input_mats:
             imgs = self.input_mats
 
-
         input_infos = [img.info for img in imgs]
-        forwarded_imgs = self.forward_raw([img.data() for img in imgs],input_infos,meta)
+        forwarded_imgs = [img.data() for img in imgs]
+
+        if self._enable:
+            forwarded_imgs = self.forward_raw(forwarded_imgs,input_infos,meta)
+            if self.bounding_box_owner_uuid:
+                self.forward_transform_matrix(meta[self.bounding_box_owner_uuid])       
         
         if len(self.out_mats)==len(forwarded_imgs):
             output_imgs = [self.out_mats[i].unsafe_update_mat(forwarded_imgs[i]) for i in range(len(forwarded_imgs))]
@@ -459,22 +466,19 @@ class ImageMatProcessor(BaseModel):
                 for o in output_imgs:
                     o.shmIO_mode='writer'
                     o.build_shmIO_writer()
-            self.out_mats = output_imgs
-   
-        if len(self.pixel_idx_forward_T)==0:
-            self.build_pixel_transform_matrix(input_infos)
 
-        if self.bounding_box_owner_uuid:
-            self.forward_transform_matrix(meta[self.bounding_box_owner_uuid])
-        return output_imgs, meta
-    
-    def __call__(self, imgs: List[ImageMat], meta: dict = {}):    
-        if self._enable:
-            output_imgs, meta = self.forward(imgs, meta)
+            if len(self.pixel_idx_forward_T)==0:
+                self.build_pixel_transform_matrix(input_infos)
+
+        self.out_mats = output_imgs
             
         if self.save_results_to_meta:
-            meta[self.uuid] = self#[i.copy() for i in output_imgs]
+            meta[self.uuid] = self
+
         return output_imgs, meta
+    
+    def __call__(self, imgs: List[ImageMat], meta: dict = {}):
+        return self.forward(imgs, meta)
 
     def release(self):
         for i in self.input_mats:i.release()
