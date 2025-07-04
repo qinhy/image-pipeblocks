@@ -396,7 +396,7 @@ class NumpyRawFrameFileGenerator(ImageMatGenerator):
         arr = np.load(source)
         def gen(arr=arr):
             while True:
-                idx = 0#np.random.choice(len(arr))
+                idx = np.random.choice(len(arr))
                 yield np.ascontiguousarray(arr[idx])
         return gen()    
           

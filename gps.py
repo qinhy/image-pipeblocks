@@ -284,7 +284,7 @@ class UsbGps(BaseGps):
 
         # ----------------------------- GNS -----------------------------
         elif stype == "GNS":
-            self._state.sats_used = int(data[6] or 0)
+            self._state.sats_used = float(data[6] or 0)
             self._state.hdop = float(data[7] or math.nan)
             self._state.alt_msl = float(data[8] or math.nan)
             self._state.geoid_sep = float(data[9] or math.nan)

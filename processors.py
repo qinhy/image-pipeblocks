@@ -216,10 +216,19 @@ class Processors:
         port:str = 'gps.jsonl'
         save_results_to_meta:bool = True
         _gps:BaseGps = None
+
+        def get_state(self):
+            if self._gps:
+                return json.loads(self._gps.get_state().model_dump_json())
+            else:
+                return {}
         
         def get_latlon(self):
-            s = self._gps.get_state()
-            return [s.lat,s.lon]
+            if self._gps:
+                s = self._gps.get_state()
+                return [s.lat,s.lon]
+            else:
+                return []
 
         def on(self):
             self.ini_gps()
