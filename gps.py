@@ -34,7 +34,7 @@ class GpsFix(BaseModel):
 
     # ---------------- Quality / satellites -----------------
     fix_quality: Optional[int] = Field(None, description="Fix quality: 0=invalid, 1=GPS, 2=DGPS, etc.")
-    sats_used: Optional[int] = Field(None, description="Number of satellites used (GGA)")
+    sats_used: Optional[float] = Field(None, description="Number of satellites used (GGA)")
     sats_in_view: Optional[int] = Field(None, description="Number of satellites in view (GSV)")
     hdop: Optional[float] = Field(None, description="Horizontal dilution of precision")
     vdop: Optional[float] = Field(None, description="Vertical dilution of precision")
@@ -70,13 +70,16 @@ class BaseGps(BaseModel):
     _listeners: Dict[str, Callable[[Optional[GpsFix | Exception]], None]] = {}
 
     # --- background watcher ------------------------------------------ #
-    _stop_event = threading.Event()
+    _stop_event:threading.Event = None
     _watch_thread: Optional[threading.Thread] = None
     _watch_interval: float = 0.25  # seconds between updates
 
     # ------------------------------------------------------------------- #
     # Public API
     # ------------------------------------------------------------------- #
+    def model_post_init(self, context):
+        self._stop_event = threading.Event()
+        return super().model_post_init(context)
 
     def on(self, event: str, cb: Callable[[Optional[GpsFix | Exception]], None]) -> None:
         """Subscribe to *opened*, *closed*, *update*, or *error* events."""
@@ -237,7 +240,7 @@ class UsbGps(BaseGps):
         # ----------------------------- GGA -----------------------------
         elif stype == "GGA":
             self._state.fix_quality = int(data[5] or 0)
-            self._state.sats_used = int(data[6] or 0)
+            self._state.sats_used = float(data[6] or 0)
             self._state.hdop = float(data[7] or math.nan)
             if self._state.fix_quality:
                 self._state.lat = self._parse_lat(data[1], data[2])
