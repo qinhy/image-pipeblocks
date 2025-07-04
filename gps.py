@@ -5,8 +5,8 @@ import time
 from typing import Callable, Dict, Optional, List
 from pydantic import BaseModel, ConfigDict, Field
 import datetime
-import serial           # Only needed by UsbGps
-import pynmea2          # Only needed by UsbGps
+import serial           # Only needed by UsbGps pyserial
+import pynmea2          # Only needed by UsbGps pynmea2
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class BaseGps:
     Sub-classes only need to override the three *_device/update hooks.
     """
 
-    _watch_interval: float = 1.0  # seconds between updates
+    _watch_interval: float = 0.25  # seconds between updates
 
     def __init__(self) -> None:
         self._state: GpsFix = GpsFix()
@@ -227,7 +227,7 @@ class UsbGps(BaseGps):
 
         # ------------------------------------------------------ VTG ---------
         elif stype == "VTG":
-            if msg.status == "A":
+            if hasattr(msg,"status") and msg.status == "A":
                 self._state.track_deg = float(msg.true_track or math.nan)
                 self._state.speed_kn  = float(msg.spd_over_grnd_kts or 0)
 
@@ -242,12 +242,11 @@ class UsbGps(BaseGps):
 # Emulator implementation
 # --------------------------------------------------------------------------- #
 
-class EmuGps(BaseGps):
+class EmuGps(UsbGps):
     """Deterministic emulator – instantly ‘fixed’ at Tokyo Station."""
 
     def _open_device(self, port: str, baudrate: int) -> None:
-        LOGGER.info("EmuGps ignoring port=%s baudrate=%s for emulator.", port, baudrate)
-        self._state.state = 0   # fixed immediately
+        self._data = None
 
     def _close_device(self) -> None:
         pass                    # nothing to release
@@ -258,7 +257,7 @@ class EmuGps(BaseGps):
 if __name__ == '__main__':
     gps = UsbGps()           # or EmuGps()
     # gps.on("update", lambda fix: print(fix.model_dump()))
-    gps.open("COM9", 9600)
+    gps.open("COM4", 9600)
     time.sleep(100)
     # … later …
     gps.close()
