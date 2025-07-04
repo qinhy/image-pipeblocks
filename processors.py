@@ -716,37 +716,83 @@ class Processors:
 
     class CvVideoRecorder(ImageMatProcessor):
         class VideoWriterWorker:
-            def __init__(self, queue_size=2):
+            def __init__(self, frame_interval=0.1, overlay_text:str=None, queue_size=2):
                 self.queue = queue.Queue(maxsize=queue_size)
                 self.last_write_time = 0.0
                 self.running = True
                 self.thread = None
+                self.overlay_text = overlay_text
+                self.frame_interval = frame_interval
+
+            def writer_worker(self):
+                while True:
+                    try:
+                        frame = self.queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                    if frame is None:
+                        break
+                    
+                    now = time.time()
+                    if now - self.last_write_time < self.frame_interval:
+                        continue  # skip
+
+                    if isinstance(frame,torch.Tensor):
+                        frame = frame.permute(1,2,0).mul(255.0).clamp(0, 255
+                            ).to(torch.uint8)
+                        frame = frame.cpu().numpy()
+                        frame = frame[..., [2,1,0]]  # Convert RGB to BGR                        
+
+                    if self.overlay_text:
+                        frame = frame.copy()
+                        cv2.putText(frame,self.overlay_text,(10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX,1,(255, 255, 255),2,cv2.LINE_AA,)
+
+                    self.writer.write(frame)
+                    self.last_write_time = now
+                self.writer.release()
 
             def build_writer(self, filename: str, w: int, h: int):
                 fourcc = cv2.VideoWriter_fourcc(*self.codec)                
                 self.writer = cv2.VideoWriter(filename, fourcc, self.fps, (w, h))
                 return self
             
-            def start(self, target, *args):
-                self.thread = threading.Thread(target=target, args=args, daemon=True)
+            def start(self):
+                self.thread = threading.Thread(target=self.writer_worker, args=(), daemon=True)
                 self.thread.start()
 
             def stop(self):
-                self.running = False
-                if self.thread:
-                    self.thread.join()
-                self.writer.release()
+                self.queue.put_nowait(None)
                 
         title: str = "cv_recorder"
         output_filename: str = "output.avi"
         codec: str = "XVID"
         fps: int = 30
         overlay_text: Optional[str] = None
+        total_imgs:int=0
+        WHs:list[tuple[int,int]] = []
         _workers: List['Processors.CvVideoRecorder.VideoWriterWorker'] = []
 
         def model_post_init(self, context):
             self.frame_interval = 1.0 / self.fps
             return super().model_post_init(context)
+
+        def validate_img(self, img_idx, img: ImageMat):
+            if img.is_ndarray():
+                img.require_ndarray()
+                img.require_np_uint()
+                img.require_BGR()
+                img.require_HWC()
+                self.total_imgs+=1
+                self.WHs.append((img.info.W,img.info.H))
+            if img.is_torch_tensor():                
+                img.require_torch_float()
+                img.require_RGB()
+                img.require_BCHW()
+                self.total_imgs+=img.info.B
+                for i in range(img.info.B):
+                    self.WHs.append((img.info.W,img.info.H))
 
         def on(self):
             self.start()
@@ -762,63 +808,33 @@ class Processors:
             res = f"{base}{suffix}_{ts}{ext}"
             return res.replace('_','-')
 
-        def _writer_worker(self, worker: VideoWriterWorker):
-            while worker.running:
-                try:
-                    frame = worker.queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                now = time.time()
-                if now - worker.last_write_time < self.frame_interval:
-                    continue  # skip
-
-                if self.overlay_text:
-                    cv2.putText(
-                        frame,
-                        self.overlay_text,
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-
-                worker.writer.write(frame)
-                worker.last_write_time = now
-
         def start(self):
             self._workers = []
-
-            for idx, mat in enumerate(self.input_mats):
-                filename = self.format_filename(str(idx))
-                w, h = mat.info.W, mat.info.H
-                worker = Processors.CvVideoRecorder.VideoWriterWorker(10
-                                            ).build_writer(filename, w, h)
-                worker.start(self._writer_worker, worker)
-
+            for idx in range(self.total_imgs):
+                filename = self.format_filename(f'_{idx}' if self.total_imgs>1 else '')
+                w,h = self.WHs[idx]
+                worker = Processors.CvVideoRecorder.VideoWriterWorker(
+                                self.frame_interval, 10).build_writer(filename, w, h)
                 self._workers.append(worker)
+            for w in self._workers:w.start()
 
         def stop(self):
-            for worker in self._workers:
-                worker.stop()
+            for w in self._workers: w.stop()
             self._workers = []
 
-        def forward_raw(
-            self,
-            imgs_data: List[np.ndarray],
-            imgs_info: List[ImageMatInfo] = [],
-            meta={},
-        ) -> List[np.ndarray]:
+        def forward_raw(self,imgs_data: List[np.ndarray],imgs_info: List[ImageMatInfo] = [],meta={},) -> List[np.ndarray]:
+            cnt=0
             for idx, frame in enumerate(imgs_data):
-                if idx >= len(self._workers):
-                    break
                 try:
-                    self._workers[idx].queue.put_nowait(frame.copy())
+                    if isinstance(frame,np.ndarray):
+                        self._workers[idx].queue.put_nowait(frame)
+                        cnt+=1
+                    if isinstance(frame,torch.Tensor):
+                        for f in frame:
+                            self._workers[idx].queue.put_nowait(f)
+                            cnt+=1
                 except queue.Full:
                     pass  # drop
-
             return imgs_data
 
         def release(self):
