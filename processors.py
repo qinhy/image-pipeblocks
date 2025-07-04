@@ -9,6 +9,8 @@ import math
 from multiprocessing import shared_memory
 import multiprocessing
 import os
+import queue
+import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
@@ -40,6 +42,7 @@ import pycuda.autoinit
 # ===============================
 # Custom Modules
 # ===============================
+from gps import BaseGps, FileReplayGps, UsbGps
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 from ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
 
@@ -204,6 +207,39 @@ class Processors:
         title:str='doing_nothing'
         def validate_img(self, img_idx, img):
             pass
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            return imgs_data
+        
+    class GPS(ImageMatProcessor):
+        title:str='get_gps'
+        port:str = 'gps.jsonl'
+        save_results_to_meta:bool = True
+        _gps:BaseGps = None
+        
+        def get_latlon(self):
+            s = self._gps.get_state()
+            return [s.lat,s.lon]
+
+        def on(self):
+            self.ini_gps()
+            return super().on()
+        
+        def off(self):
+            self._gps.close()
+            del self._gps
+            return super().off()
+
+        def ini_gps(self):            
+            if os.path.isfile(self.port):
+                self._gps:BaseGps = FileReplayGps()
+            else:                
+                self._gps:BaseGps = UsbGps()
+            self._gps.open(self.port)
+
+        def validate_img(self, img_idx, img):
+            if self._gps is None:
+                self.ini_gps()
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return imgs_data
@@ -675,79 +711,120 @@ class Processors:
 
                 encoded_images.append(encoded)
                 return encoded_images
+                
+
 
     class CvVideoRecorder(ImageMatProcessor):
+        class VideoWriterWorker:
+            def __init__(self, queue_size=2):
+                self.queue = queue.Queue(maxsize=queue_size)
+                self.last_write_time = 0.0
+                self.running = True
+                self.thread = None
+
+            def build_writer(self, filename: str, w: int, h: int):
+                fourcc = cv2.VideoWriter_fourcc(*self.codec)                
+                self.writer = cv2.VideoWriter(filename, fourcc, self.fps, (w, h))
+                return self
+            
+            def start(self, target, *args):
+                self.thread = threading.Thread(target=target, args=args, daemon=True)
+                self.thread.start()
+
+            def stop(self):
+                self.running = False
+                if self.thread:
+                    self.thread.join()
+                self.writer.release()
+                
         title: str = "cv_recorder"
         output_filename: str = "output.avi"
-        codec: str = 'XVID'
+        codec: str = "XVID"
         fps: int = 30
-        frame_interval:float = 0.0
         overlay_text: Optional[str] = None
-        _writers:list = []
-        recording:bool = False
-        _last_write:int = time.time()
+        _workers: List['Processors.CvVideoRecorder.VideoWriterWorker'] = []
 
         def model_post_init(self, context):
-            self.frame_interval = 1.0/self.fps
+            self.frame_interval = 1.0 / self.fps
             return super().model_post_init(context)
-
-        def validate_img(self, img_idx, img: ImageMat):
-            img.require_ndarray()
-            img.require_np_uint()
-            img.require_BGR()
-            img.require_HWC()
 
         def on(self):
             self.start()
             return super().on()
-        
+
         def off(self):
             self.stop()
             return super().off()
-        
-        def formatfilename(self,add_string):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base, ext = os.path.splitext(self.output_filename)
-            return f"{base}_{add_string}_{timestamp}{ext}"
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            for i,img in enumerate(imgs_data):
-                self.write_frame(self._writers[i],img)
+        def format_filename(self, suffix: str) -> str:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base, ext = os.path.splitext(self.output_filename)
+            res = f"{base}{suffix}_{ts}{ext}"
+            return res.replace('_','-')
+
+        def _writer_worker(self, worker: VideoWriterWorker):
+            while worker.running:
+                try:
+                    frame = worker.queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                now = time.time()
+                if now - worker.last_write_time < self.frame_interval:
+                    continue  # skip
+
+                if self.overlay_text:
+                    cv2.putText(
+                        frame,
+                        self.overlay_text,
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                worker.writer.write(frame)
+                worker.last_write_time = now
+
+        def start(self):
+            self._workers = []
+
+            for idx, mat in enumerate(self.input_mats):
+                filename = self.format_filename(str(idx))
+                w, h = mat.info.W, mat.info.H
+                worker = Processors.CvVideoRecorder.VideoWriterWorker(10
+                                            ).build_writer(filename, w, h)
+                worker.start(self._writer_worker, worker)
+
+                self._workers.append(worker)
+
+        def stop(self):
+            for worker in self._workers:
+                worker.stop()
+            self._workers = []
+
+        def forward_raw(
+            self,
+            imgs_data: List[np.ndarray],
+            imgs_info: List[ImageMatInfo] = [],
+            meta={},
+        ) -> List[np.ndarray]:
+            for idx, frame in enumerate(imgs_data):
+                if idx >= len(self._workers):
+                    break
+                try:
+                    self._workers[idx].queue.put_nowait(frame.copy())
+                except queue.Full:
+                    pass  # drop
+
             return imgs_data
-        
-        def build_writer(self, output_filename, width, height):
-            fourcc = cv2.VideoWriter_fourcc(*self.codec)
-            self._writers.append(cv2.VideoWriter(output_filename, fourcc, self.fps, (width, height)))
 
         def release(self):
             res = super().release()
             self.stop()
             return res
-        
-        def start(self):            
-            for i,img in enumerate(self.input_mats):
-                self.build_writer(self.formatfilename(str(i)), img.info.H,img.info.W)
-            # logger(f"Started recording to {output_filename}")
-
-        def stop(self):
-            for w in self._writers:
-                w.release()
-            self._writers = []
-            # logger("Stopped recording.")
-
-        def write_frame(self, writer, frame: np.ndarray):
-            # Skip frames if input_fps is set
-            if self.fps:
-                frame_interval = time.time() - self._last_write
-                if frame_interval < self.frame_interval:
-                    return  # Skip this frame
-
-            # Overlay text
-            if self.overlay_text:
-                cv2.putText(frame, self.overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2, cv2.LINE_AA)
-
-            writer.write(frame)
-            self._last_write=time.time()
 
         def __del__(self):
             try:
