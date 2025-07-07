@@ -25,15 +25,17 @@ class ColorType(str, enum.Enum):
     BAYER = 'bayer'
     GRAYSCALE = 'grayscale'
     RGB = 'RGB'
+    RGBD = 'RGBD'
     BGR = 'BGR'
     JPEG = 'jpeg'
     UNKNOWN = 'unknown'
 
 COLOR_TYPE_CHANNELS = {
-    ColorType.BAYER: [1],
-    ColorType.GRAYSCALE: [1],
-    ColorType.RGB: [3],
-    ColorType.BGR: [3],
+    ColorType.BAYER: 1,
+    ColorType.GRAYSCALE: 1,
+    ColorType.RGB: 3,
+    ColorType.RGBD: 4,
+    ColorType.BGR: 3,
 }
 
 # global setting
