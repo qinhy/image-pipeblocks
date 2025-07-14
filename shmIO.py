@@ -2,7 +2,7 @@
 # Standard Library Imports
 import json
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
 # Third-Party Library Imports
@@ -187,112 +187,34 @@ class CommonStreamIO(CommonIO):
                 ).set('streams:'+self.stream_key,
                 json.loads(json.dumps(data, default=str)))
 
-class GeneralNumpySharedMemoryIO(GeneralSharedMemoryIO):
-    class Base(GeneralSharedMemoryIO.Base):
-        id: str = Field(default_factory=lambda: f"GeneralNumpySharedMemoryIO:{uuid.uuid4()}")
-        array_shape: tuple = Field(..., description="Shape of the NumPy array in shared memory")
-        dtype: Literal[            
-                'uint8',
-                'uint16',
-                'uint32',
-                'uint64',
-                'float16',
-                'float32',
-                'float64'] = Field(default=np.dtype(np.uint8).name, description="Data type of the NumPy array")
-        shm_size:int = 0 # bytes
-        _shared_array: np.ndarray = None
 
-        def model_post_init(self, context):
-            dts = {
-                'uint8':np.uint8,
-                'uint16':np.uint16,
-                'uint32':np.uint32,
-                'uint64':np.uint64,
-                'float16':np.float16,
-                'float32':np.float32,
-                'float64':np.float64,
-            }
-            self.shm_size = np.prod(self.array_shape) * dts[self.dtype].itemsize
-            self.id = self.id.replace('GeneralNumpy',f'Numpy{self.dtype.capitalize()}')
-            return super().model_post_init(context)
-
-        def build_buffer(self):
-            super().build_buffer()
-            self._shared_array = np.ndarray(self.array_shape, dtype=self.dtype, buffer=self._buffer)
-            return self
-
+class NumpyUInt8SharedMemoryStreamIO(NumpyUInt8SharedMemoryIO,CommonStreamIO):
+    class Base(NumpyUInt8SharedMemoryIO.Base,CommonStreamIO.Base):
         def get_steam_info(self)->dict:
             return self.model_dump()
-        
-    class StreamReader(GeneralSharedMemoryIO.Reader, Base):
-        id: str = Field(default_factory=lambda: f"GeneralNumpySharedMemoryIO.Reader:{uuid.uuid4()}")
-        def read(self, copy=True) -> np.ndarray:
-            return self._shared_array.copy() if copy else self._shared_array
-
-    class StreamWriter(GeneralSharedMemoryIO.Writer, Base):
-        id: str = Field(default_factory=lambda: f"GeneralNumpySharedMemoryIO.Writer:{uuid.uuid4()}")
+    class StreamReader(NumpyUInt8SharedMemoryIO.Reader, CommonStreamIO.StreamReader, Base):
+        id: str= Field(default_factory=lambda:f"NumpyUInt8SharedMemoryStreamIO.StreamReader:{uuid.uuid4()}")
+        def read(self,copy=True):
+            return super().read(copy)
+    class StreamWriter(NumpyUInt8SharedMemoryIO.Writer, CommonStreamIO.StreamWriter, Base):
+        id: str= Field(default_factory=lambda:f"NumpyUInt8SharedMemoryStreamIO.StreamWriter:{uuid.uuid4()}")
         def write(self, data: np.ndarray):
-            if data.shape != self.array_shape:
-                raise ValueError(f"Data shape {data.shape} does not match expected shape {self.array_shape}.")
-            if data.dtype != self.dtype:
-                raise ValueError(f"Data dtype {data.dtype} does not match expected dtype {self.dtype}.")
-            self._shared_array[:] = data[:]
-            return data
-
-    @staticmethod
-    def reader(shm_name: str, array_shape: tuple, dtype: np.dtype = np.uint8):
-        shm_size = np.prod(array_shape) * np.dtype(dtype).itemsize
-        return GeneralNumpySharedMemoryIO.Reader(
-            shm_size=shm_size,
-            shm_name=shm_name,
-            create=False,
-            array_shape=array_shape,
-            dtype=np.dtype(dtype).name
-        ).build_buffer()
-
-    @staticmethod
-    def writer(shm_name: str, array_shape: tuple, dtype: np.dtype = np.uint8):
-        shm_size = np.prod(array_shape) * np.dtype(dtype).itemsize
-        return GeneralNumpySharedMemoryIO.Writer(
-            shm_size=shm_size,
-            shm_name=shm_name,
-            create=True,
-            array_shape=array_shape,
-            dtype=np.dtype(dtype).name
-        ).build_buffer()
-    
-class NumpyUInt8SharedMemoryStreamIO(GeneralNumpySharedMemoryIO,CommonStreamIO):        
+            return super().write(data)
+        
     @staticmethod
     def reader(stream_key: str, array_shape: tuple):
         shm_size = np.prod(array_shape) * np.dtype(np.uint8).itemsize
         shm_name = stream_key.replace(':','_')
-        return GeneralNumpySharedMemoryIO.StreamReader(
-            shm_name=shm_name, create=False, stream_key=stream_key,dtype='uint8',
+        return NumpyUInt8SharedMemoryStreamIO.StreamReader(
+            shm_name=shm_name, create=False, stream_key=stream_key,
             array_shape=array_shape,shm_size=shm_size).build_buffer()
     
     @staticmethod
     def writer(stream_key: str, array_shape: tuple):
         shm_size = np.prod(array_shape) * np.dtype(np.uint8).itemsize
         shm_name = stream_key.replace(':','_')
-        return GeneralNumpySharedMemoryIO.StreamWriter(
-            shm_name=shm_name, create=True, stream_key=stream_key,dtype='uint8',
-            array_shape=array_shape,shm_size=shm_size).build_buffer()
-
-class NumpyFloat32SharedMemoryStreamIO(GeneralNumpySharedMemoryIO,CommonStreamIO):        
-    @staticmethod
-    def reader(stream_key: str, array_shape: tuple):
-        shm_size = np.prod(array_shape) * np.dtype(np.float32).itemsize
-        shm_name = stream_key.replace(':','_')
-        return GeneralNumpySharedMemoryIO.StreamReader(
-            shm_name=shm_name, create=False, stream_key=stream_key,dtype='float32',
-            array_shape=array_shape,shm_size=shm_size).build_buffer()
-    
-    @staticmethod
-    def writer(stream_key: str, array_shape: tuple):
-        shm_size = np.prod(array_shape) * np.dtype(np.float32).itemsize
-        shm_name = stream_key.replace(':','_')
-        return GeneralNumpySharedMemoryIO.StreamWriter(
-            shm_name=shm_name, create=True, stream_key=stream_key,dtype='float32',
+        return NumpyUInt8SharedMemoryStreamIO.StreamWriter(
+            shm_name=shm_name, create=True, stream_key=stream_key,
             array_shape=array_shape,shm_size=shm_size).build_buffer()
 
 # if __name__ == '__main__':

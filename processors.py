@@ -1,7 +1,7 @@
 # ===============================
 # Standard Library Imports
 # ===============================
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 import enum
 import json
@@ -20,6 +20,7 @@ import uuid
 # ===============================
 import cv2
 import numpy as np
+import pykakasi
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -217,6 +218,15 @@ class Processors:
         save_results_to_meta:bool = True
         _gps:BaseGps = None
 
+        @staticmethod
+        def coms():
+            return BaseGps.coms()
+
+        def change_port(self,port:str):
+            self.off()
+            self.port = port
+            self.on() 
+
         def get_state(self):
             if self._gps:
                 return json.loads(self._gps.get_state().model_dump_json())
@@ -235,7 +245,8 @@ class Processors:
             return super().on()
         
         def off(self):
-            self._gps.close()
+            if self._gps:
+                self._gps.close()
             del self._gps
             return super().off()
 
@@ -718,10 +729,8 @@ class Processors:
                 if not success:
                     raise ValueError("JPEG encoding failed.")
 
-                encoded_images.append(encoded)
-                return encoded_images
-                
-
+            encoded_images.append(encoded)
+            return encoded_images   
 
     class CvVideoRecorder(ImageMatProcessor):
         class VideoWriterWorker:
@@ -771,7 +780,7 @@ class Processors:
                             # logger(f"Closed video file chunk {self.file_counter}")
 
                         self.file_counter += 1
-                        filename = f"{self.base_filename}-{self.file_counter:03d}.{self.file_ext}"
+                        filename = f"{self.base_filename}-{self.file_counter:03d}{self.file_ext}"
                         fourcc = cv2.VideoWriter_fourcc(*self.codec)
                         self.writer = cv2.VideoWriter(filename, fourcc, self.fps, (self.w, self.h))
                         self.writer_start_time = now
@@ -1438,6 +1447,11 @@ class Processors:
         _models:dict = {}
         devices:list[str] = []
 
+        def change_model(self,modelname:str):
+            self.modelname = modelname
+            self.model_post_init(None)
+            self.build_models()
+
         def model_post_init(self, context):
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
             default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
@@ -1464,7 +1478,7 @@ class Processors:
         
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
-                self.build_models(imgs_info)
+                self.build_models()
             if self.use_official_predict:
                 imgs,yolo_results_xyxycc = self.official_predict(imgs_data,imgs_info)
             else:
@@ -1477,7 +1491,7 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.RGB):
             return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         
-        def build_models(self,imgs_info: List[ImageMatInfo]):
+        def build_models(self):
             for d in self.num_devices:
                 if d not in self._models:
                     model = YOLO(self.modelname, task='detect').to(d)
@@ -1552,14 +1566,84 @@ class Processors:
             yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
 
+    class SimpleTracking(ImageMatProcessor):
+        title:str='simple_tracking'
+        detect_frames_thre:int= 10
+        ignore_frames_thre:int= 3
+        detector_uuid:str
+        frame_cnt:int = 0
+        frame_rec:dict[int,list] = {}
+            # {0:0,1:0,2:0}, # each class continuous cnt
+        class_names:Dict[str,str] = {}
+        all_cls_id:set[int] = set()
+        _det_processor:'Processors.YOLO'= None
+        
+        def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
+            self.frame_cnt += 1
+
+            if self.detector_uuid:
+                self._det_processor = meta[self.detector_uuid]
+            
+            if not self.frame_rec:
+                self.class_names = self._det_processor.class_names
+                self.frame_rec = {k:deque(maxlen=self.ignore_frames_thre+1) for k in self.class_names.keys()}
+                for k,v in self.frame_rec.items():
+                    for i in range(self.ignore_frames_thre+1):v.append(0)
+                self.all_cls_id = set(list(self.class_names.keys()))
+            
+            cls_id = set()
+            for detections in self._det_processor.bounding_box_xyxy:
+                if len(detections)>0:
+                    # x1, y1, x2, y2, conf, cls_id
+                    cls_id = cls_id | set(detections[:,5].flatten().tolist())
+            
+            for i in cls_id:
+                self.frame_rec[i].append(self.frame_rec[i][-1]+1)
+                
+            for i in self.all_cls_id - cls_id:
+                if self.frame_rec[i][-1]>0:
+                    self.frame_rec[i].append(self.frame_rec[i][-1]-1)
+
+            for k,q in self.frame_rec.items():
+                res = True
+                res = res and q[-self.ignore_frames_thre-1]>self.detect_frames_thre
+                if not res: continue
+                
+                for i in range(-self.ignore_frames_thre,0,-1):
+                    res = res and q[i-1] > q[i]
+                    
+                if res:
+                    for _ in range(self.ignore_frames_thre+1):
+                        q.append(0)
+
+            return imgs_data
+        
     class DrawYOLO(ImageMatProcessor):
         title:str = 'cv_draw_yolo'
         draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
         draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
         draw_font_scale: float = Field(0.5, description="Font scale for label text")
         draw_thickness: int = Field(2, description="Line thickness for box and text")
+        class_names:Dict[str,str] = {}
+        class_colors:dict = {0: "FF3838",1: "c58282",2: "FF701F",3: "FFB21D",4: "CFD231",5: "48F90A",
+                            6: "92CC17",7: "3DDB86",8: "1A9334",9: "00D4BB",10: "2C99A8",11: "00C2FF",12: "344593"}
         yolo_uuid:str=''
         _yolo_processor:'Processors.YOLO'= None
+
+        @staticmethod
+        def jp2en(text):
+            kks = pykakasi.kakasi()
+            result = kks.convert(text)
+            return ''.join([i['hepburn'].replace('mono','butsu')  for i in result])
+        
+        @staticmethod
+        def hex_to_bgr(hex_str: str):
+            hex_str = hex_str.lstrip('#')
+            return (int(hex_str[4:6], 16), int(hex_str[2:4], 16), int(hex_str[0:2], 16))
+
+        def model_post_init(self, context):
+            self.class_colors = {k:self.hex_to_bgr(v) for k,v in self.class_colors.items()}
+            return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
             img.require_np_uint()
@@ -1568,19 +1652,26 @@ class Processors:
         
         def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
             res = []
+                
             if self.yolo_uuid:
                 self._yolo_processor = meta[self.yolo_uuid]
+                if len(self.class_names)!=len(self._yolo_processor.class_names):
+                    print(self._yolo_processor.class_names)
+                    self.class_names = {k:self.jp2en(v) for k,v in self._yolo_processor.class_names.items()}
+
             for idx, img in enumerate(imgs_data):
                 res.append(self.draw(img,
                                      self._yolo_processor.bounding_box_xyxy[idx],
-                                     self._yolo_processor.class_names))
+                                     self.class_names,
+                                     self.class_colors,))
             return res
             
         def draw(
             self,
             img: np.ndarray,
             detections: np.ndarray,
-            class_names: List[str] = []
+            class_names: Dict[str,str] = [],
+            class_colors: Dict[str,str] = []
         ) -> np.ndarray:
             """
             Draw YOLO-style bounding boxes and labels on the image.
@@ -1589,7 +1680,7 @@ class Processors:
                 img (np.ndarray): Image to draw on.
                 detections (np.ndarray): Array of detections [x1, y1, x2, y2, conf, cls_id].
                 class_names (List[str], optional): Class names for label display.
-
+                class_colors: 0: "FF3838",1: "c58282",...
             Returns:
                 np.ndarray: Annotated image.
             """
@@ -1603,29 +1694,27 @@ class Processors:
                 else:
                     label = f"ID {cls_id} {conf:.2f}"
 
-                # Draw bounding box
+                box_color = class_colors[cls_id]
+
                 cv2.rectangle(
                     img,
                     (int(x1), int(y1)),
                     (int(x2), int(y2)),
-                    self.draw_box_color,
+                    box_color,
                     self.draw_thickness
                 )
 
-                # Draw label
                 cv2.putText(
                     img,
                     label,
                     (int(x1), int(y1) - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     self.draw_font_scale,
-                    self.draw_text_color,
+                    box_color,  # Use same color for text or choose another
                     self.draw_thickness,
                     cv2.LINE_AA
                 )
-
             return img
-
 
     class CvImageViewer(ImageMatProcessor):
 
@@ -1777,7 +1866,7 @@ class Processors:
         use_official_predict:bool = False
         conf: float = 0.6
 
-        def build_models(self,imgs_info: List[ImageMatInfo]):
+        def build_models(self):
             self._models = {}
             for i,d in enumerate(self.num_devices):
                 with torch.cuda.device(d):

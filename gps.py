@@ -8,6 +8,7 @@ from typing import Callable, Dict, Optional, List, TextIO
 from pydantic import BaseModel, ConfigDict, Field
 import datetime
 import serial           # Only needed by UsbGps pyserial
+import serial.tools.list_ports
 import pynmea2          # Only needed by UsbGps pynmea2
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ LOGGER = logging.getLogger(__name__)
 class GpsFix(BaseModel):
     # ------------------ Validity / position ------------------
     state: int = Field(-2, description="-2 disconnected; -1 no data; 0 valid fix")
+    states_str: list[str] = ["-2 disconnected","-1 no data","0 valid fix"]
     lat: Optional[float] = Field(35.6851, description="Latitude in decimal degrees")
     lon: Optional[float] = Field(139.7527, description="Longitude in decimal degrees")
     alt_msl: Optional[float] = Field(20.0, description="Altitude above mean sea level (meters)")
@@ -77,6 +79,12 @@ class BaseGps(BaseModel):
     # ------------------------------------------------------------------- #
     # Public API
     # ------------------------------------------------------------------- #
+    @staticmethod
+    def coms():
+        ports = serial.tools.list_ports.comports()
+        port_list = [ f'{port.device},{port.hwid}' for port in ports]
+        return port_list
+    
     def model_post_init(self, context):
         self._stop_event = threading.Event()
         return super().model_post_init(context)

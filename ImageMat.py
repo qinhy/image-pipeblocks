@@ -25,17 +25,15 @@ class ColorType(str, enum.Enum):
     BAYER = 'bayer'
     GRAYSCALE = 'grayscale'
     RGB = 'RGB'
-    RGBD = 'RGBD'
     BGR = 'BGR'
     JPEG = 'jpeg'
     UNKNOWN = 'unknown'
 
 COLOR_TYPE_CHANNELS = {
-    ColorType.BAYER: 1,
-    ColorType.GRAYSCALE: 1,
-    ColorType.RGB: 3,
-    ColorType.RGBD: 4,
-    ColorType.BGR: 3,
+    ColorType.BAYER: [1],
+    ColorType.GRAYSCALE: [1],
+    ColorType.RGB: [3],
+    ColorType.BGR: [3],
 }
 
 # global setting
@@ -368,7 +366,7 @@ class ImageMatProcessor(BaseModel):
         return self.num_devices
     
     def validate_img(self, img_idx:int, img:ImageMat):
-        raise NotImplementedError()
+        pass
 
     def validate(self, imgs: List[ImageMat], meta: Dict = {}, run=True):
         input_mats = [None]*len(imgs)
@@ -407,8 +405,8 @@ class ImageMatProcessor(BaseModel):
         if not self._numpy_pixel_idx_forward_T:
             self._numpy_pixel_idx_forward_T  = [np.asarray(i) for i in self.pixel_idx_forward_T ]
 
-        if len(original_boxes)!=len(self._numpy_pixel_idx_forward_T):
-            raise ValueError(f"original_boxes and numpy_pixel_idx_forward_T are not same size. Got {len(original_boxes)} and {len(self._numpy_pixel_idx_forward_T)}")
+        if len(original_boxes)!=len(self._numpy_pixel_idx_forward_T):pass
+            # raise ValueError(f"original_boxes and numpy_pixel_idx_forward_T are not same size. Got {len(original_boxes)} and {len(self._numpy_pixel_idx_forward_T)}")
         
         for i,(boxes, T) in enumerate(zip(original_boxes, self._numpy_pixel_idx_forward_T)):
             if boxes.size == 0:
