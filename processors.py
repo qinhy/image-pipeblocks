@@ -910,31 +910,31 @@ class Processors:
 
     class NumpyImageMask(ImageMatProcessor):
         title: str = "numpy_image_mask"
-        mask_image_path: Optional[str] = None
-        mask_color: str = "#00000080"
-        mask_split: Tuple[int, int] = (2, 2)
-        _masks:dict = None
+        mask_image_path: str
+        mask_color_hex: str = "#000000FF"
+        mask_color: Tuple[int, int, int] = (0,0,0)
+        mask_alpha: float = 0
+        mask_split: Optional[Tuple[int, int]] = (2, 2)
+        _original_masks:list = []
+        _resized_masks:list = []
+        _revert_masks:list = []
 
         def model_post_init(self, context: Any) -> None:
-            self._masks = self._make_mask_images(self.mask_image_path, self.mask_split, self.mask_color)
-            if self._masks is None:
-                logger('[NumpyImageMask] Warning: no mask image loaded. This block will do nothing.')
+            self.mask_color = np.array(hex2rgba(self.mask_color_hex)[:3], dtype=np.uint8)
             return super().model_post_init(context)
+        
+        def reload_masks(self):
+            self.load_masks(self.mask_image_path, self.mask_split)
 
-        def gray2rgba_mask_image(self, gray_mask_img: np.ndarray, hex_color: str) -> Image.Image:
-            """Convert a grayscale mask to an RGBA image with the specified color."""
-            select_color = np.array(hex2rgba(hex_color), dtype=np.uint8)
-            background = np.array([255, 255, 255, 0], dtype=np.uint8)
+        def load_masks(self,mask_image_path: Optional[str], mask_split: Tuple[int, int]):
+            self._original_masks = []
+            self._resized_masks = []
+            self._revert_masks = []
+            self._numpy_make_mask_images(mask_image_path, mask_split)
+            [self._numpy_adjust_mask(i,img) for i,img in enumerate(self.input_mats)]
 
-            condition = gray_mask_img == 0
-            condition = condition[..., None]
-            color_mask_img = np.where(condition, select_color, background)
-
-            return Image.fromarray(cv2.cvtColor(color_mask_img, cv2.COLOR_BGRA2RGBA))
-
-        def _make_mask_images(self, mask_image_path: Optional[str], mask_split: Tuple[int, int], preview_color: str):
-            if mask_image_path is None:
-                return None
+        def _numpy_make_mask_images(self, mask_image_path: Optional[str], mask_split: Tuple[int, int]):
+            if mask_image_path is None: return None
 
             mask_image = cv2.imread(mask_image_path, cv2.IMREAD_COLOR)
             if mask_image is None:
@@ -942,110 +942,166 @@ class Processors:
 
             # Split mask into sub-masks
             try:
-                mask_images = [
-                    sub_mask
-                    for row in np.split(mask_image, mask_split[0], axis=0)
-                    for sub_mask in np.split(row, mask_split[1], axis=1)
-                ]
+                if mask_split:
+                    mask_images = [
+                        y
+                        for x in np.split(mask_image, mask_split[1], axis=1)
+                        for y in np.split(x, mask_split[0], axis=0)
+                    ]
+                else:
+                    mask_images = [mask_image]
             except ValueError:
                 logger("Error: Invalid mask split configuration.")
                 return None
 
             # Convert to grayscale and apply preview color
-            gray_masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
-            preview_masks = [self.gray2rgba_mask_image(gray, preview_color) for gray in gray_masks]
+            self._original_masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
 
-            return {"original": gray_masks, "preview": preview_masks}
+        def _numpy_adjust_mask(self, idx, img:ImageMat):
+            gray_mask: np.ndarray = self._original_masks[idx]
 
-        def _adjust_mask(self, images: List[ImageMat]):
-            self._masks["resized_masks"] = [
-                None for _ in self._masks["original"]
-            ]
+            shape_type = img.info.shape_type
+            h, w = img.info.H, img.info.W
+            c = img.info.C if shape_type == ShapeType.HWC else None
 
-            for i, img in enumerate(images):
-                gray_mask: np.ndarray = self._masks["original"][i]
+            # Resize the mask to match image dimensions
+            resized_mask = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-                shape_type = img.info.shape_type
-                h, w = img.info.H, img.info.W
-                c = img.info.C if shape_type == ShapeType.HWC else None
-
-                # Resize the mask to match image dimensions
-                resized_mask = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-                # Expand dimensions if needed
-                if c:
-                    resized_mask = np.expand_dims(resized_mask, axis=-1)
-                    if c > 1:
-                        resized_mask = resized_mask.repeat(c, axis=-1)
-
-                self._masks["resized_masks"][i] = resized_mask
+            # Expand dimensions if needed
+            if c:
+                resized_mask = np.expand_dims(resized_mask, axis=-1)
+                if c > 1:
+                    resized_mask = resized_mask.repeat(c, axis=-1)
+            if idx!=len(self._resized_masks):raise ValueError('size checking error.')
+            self._resized_masks.append(resized_mask)
+            revert_mask = np.full_like(resized_mask, # to BGR
+                                        self.mask_color[::-1], dtype=resized_mask.dtype)
+            revert_mask = cv2.bitwise_and(revert_mask, ~resized_mask)
+            self._revert_masks.append(revert_mask)
 
         def validate_img(self, img_idx:int, img:ImageMat):
             img.require_ndarray()
             img.require_np_uint()
             img.require_HW_or_HWC()
-        
-        def validate(self, imgs, meta = ..., run=True):
-            super().validate(imgs, meta, run=False)
-            
-            if "resized_masks" not in self._masks:
-                self._adjust_mask([img for img in self.input_mats])
+            if self.mask_alpha>0:
+                img.require_BGR()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
-            # if self._masks is None: return imgs_data
-            masks = self._masks["resized_masks"]
-            return [cv2.bitwise_and(img, masks[i]) for i,img in enumerate(imgs_data)]
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[],
+                        meta={}) -> List[np.ndarray]:
+            if len(self._resized_masks)==0:
+                self.load_masks(self.mask_image_path, self.mask_split)
+
+            keep_pixel = [cv2.bitwise_and(img, self._resized_masks[i]) for i,img in enumerate(imgs_data)]
+            if self.mask_alpha>0:
+                transparent_pixel = [cv2.bitwise_and(img, ~self._resized_masks[i]) for i,img in enumerate(imgs_data)]
+                
+                result = [keep + ((trans*(1-self.mask_alpha)).astype(np.uint8)+(bg*self.mask_alpha).astype(np.uint8))
+                        for keep, trans, bg in zip(keep_pixel, transparent_pixel, self._revert_masks)]
+                return result
+            else:
+                return keep_pixel
 
     class TorchImageMask(NumpyImageMask):
         title: str = "torch_image_mask"
+        img_cnt:int=0
+        _torch_original_masks:list = []
 
+        gpu:bool=True
+        multi_gpu:int=-1
+        _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
+
+        def model_post_init(self, context):
+            self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
+            return super().model_post_init(context)
+        
         def validate_img(self, img_idx: int, img: ImageMat):
             img.require_torch_float()
             img.require_BCHW()
+            if self.mask_alpha>0:
+                img.require_RGB()
 
-        def _make_mask_images(
-            self, mask_image_path: Optional[str], mask_split: Tuple[int, int], preview_color: str
-        ) -> Optional[Dict[str, List[Any]]]:
-            data = super()._make_mask_images(mask_image_path, mask_split, preview_color)
+        def load_masks(self,mask_image_path: Optional[str], mask_split: Tuple[int, int]):
+            self._original_masks = []
+            self._resized_masks = []
+            self._revert_masks = []
+            self._torch_original_masks = []
+            self._numpy_make_mask_images(mask_image_path,mask_split)
+            if self.input_mats:
+                for i,img in enumerate(self.input_mats):
+                    self.torch_adjust_mask(i,img)
+            self._masks_to_devices()
 
-            if data is None:
-                return None
+        def torch_adjust_mask(self, img_idx: int, img: ImageMat):
+            if img.info.B==1:
+                self._torch_adjust_mask(img_idx,img)
+                self.img_cnt+=1
+            else:
+                for i in range(img.info.B):
+                    self._torch_adjust_mask(self.img_cnt,img)
+                    self.img_cnt+=1
+        
+        def _masks_to_devices(self):            
+            imgs_num = 0
+            for i, img in enumerate(self.input_mats):
+                for j in range(img.info.B):
+                    imgs_num += 1
+            device_masks = []
+            for i in range(imgs_num):                
+                device = self.num_devices[i % self.num_gpus]
+                device_masks.append((device,self._resized_masks[i],self._revert_masks[i]))
 
-            # Convert grayscale masks to PyTorch tensors in BCHW format, normalized
-            data["torch_original"] = [
-                torch.as_tensor(mask).unsqueeze(0).unsqueeze(0).to(
-                ImageMatInfo.torch_img_dtype()) / 255.0
-                for mask in data["original"]
-            ]
-            return data
-
-        def _adjust_mask(self, images: List[ImageMat]):
-            self._masks["resized_masks"] = [None for _ in self._masks["original"]]
-
-            for i, img in enumerate(images):
-                gray_mask: np.ndarray = self._masks["original"][i]
-
-                h, w = img.info.H, img.info.W
-                # Resize using OpenCV (still in NumPy), then convert to torch tensor
-                resized_mask_np = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                resized_mask_torch = torch.as_tensor(resized_mask_np
-                                        ).unsqueeze(0).unsqueeze(0).type(
-                                        ImageMatInfo.torch_img_dtype()).div(255.0)
-                if img.info.device != 'cpu':
-                    resized_mask_torch = resized_mask_torch.to(img.info.device)
-                self._masks["resized_masks"][i] = resized_mask_torch
-
-        def validate(self, imgs, meta = ..., run=True):
-            super().validate(imgs, meta, run=False)
+            resized_masks = []
+            revert_masks = []
+            for d in self.num_devices:
+                tmp = [i for i in device_masks if i[0]==d]
+                resized_mask = torch.vstack([i[1] for i in tmp]).to(d)
+                revert_mask = torch.vstack([i[2] for i in tmp]).to(d)
+                resized_masks.append(resized_mask)
+                revert_masks.append(revert_mask)
             
-            if "resized_masks" not in self._masks:
-                self._adjust_mask([img for img in self.input_mats])
+            self._resized_masks = resized_masks
+            self._revert_masks = revert_masks
 
-        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:            
-            # if self._masks is None:
-            #     return imgs_data
-            masks = self._masks["resized_masks"]
-            return [image * masks[i] for i,image in enumerate(imgs_data)]
+        def _torch_make_mask_images(self, mask_image_path: Optional[str],
+                              mask_split: Tuple[int, int]) -> Optional[Dict[str, List[Any]]]:
+            self._numpy_make_mask_images(mask_image_path, mask_split)
+            # Convert grayscale masks to PyTorch tensors in BCHW format, normalized
+            self._torch_original_masks = [
+                torch.as_tensor(mask).unsqueeze(0).unsqueeze(0).type(
+                ImageMatInfo.torch_img_dtype()) / 255.0
+                for mask in self._original_masks
+            ]
+
+        def _torch_adjust_mask(self, idx, img:ImageMat):
+            gray_mask: np.ndarray = self._original_masks[idx%len(self._original_masks)]
+
+            h, w = img.info.H, img.info.W
+            # Resize using OpenCV (still in NumPy), then convert to torch tensor
+            resized_mask_np = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            resized_mask_torch = torch.as_tensor(resized_mask_np
+                                    ).unsqueeze(0).unsqueeze(0).type(
+                                    ImageMatInfo.torch_img_dtype()).div(255.0)
+            
+            revert_mask_torch = torch.tensor(self.mask_color, dtype=resized_mask_torch.dtype).view(1, 3, 1, 1)
+            revert_mask_torch = revert_mask_torch.expand(1, 3, h, w).clone().type(
+                                    ImageMatInfo.torch_img_dtype()).div(255.0)
+            revert_mask_torch = revert_mask_torch*(1.0 - resized_mask_torch)
+
+            self._resized_masks.append(resized_mask_torch)
+            self._revert_masks.append(revert_mask_torch)
+
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+            if len(self._resized_masks)==0:
+                self.load_masks(self.mask_image_path, self.mask_split)
+
+            keep_pixel = [image * self._resized_masks[i] for i,image in enumerate(imgs_data)]
+
+            if self.mask_alpha>0:
+                transparent_pixel = [image * (1.0 - self._resized_masks[i]) for i,image in enumerate(imgs_data)]          
+                return [keep + ((trans*(1-self.mask_alpha))+(bg*self.mask_alpha))
+                        for keep, trans, bg in zip(keep_pixel, transparent_pixel, self._revert_masks)]
+            else:
+                return keep_pixel
 
     class TorchDebayer(ImageMatProcessor):
         ### Define the `Debayer5x5` PyTorch Model

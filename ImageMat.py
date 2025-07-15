@@ -348,9 +348,11 @@ class ImageMatProcessor(BaseModel):
 
     def on(self):
         self._enable = True
+        return self
 
     def off(self):
         self._enable = False
+        return self
         
     def devices_info(self,gpu=True,multi_gpu=-1):
         self.num_devices = ['cpu']
@@ -383,7 +385,7 @@ class ImageMatProcessor(BaseModel):
 
         self.input_mats = input_mats
         if run: return self(self.input_mats, meta)
-        return self.input_mats
+        return self.input_mats,meta
     
     def build_out_mats(self,validated_imgs: List[ImageMat],converted_raw_imgs,color_type=None):
         if color_type is None:
