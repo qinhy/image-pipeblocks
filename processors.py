@@ -2,7 +2,7 @@
 # Standard Library Imports
 # ===============================
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import enum
 import json
 import math
@@ -1632,7 +1632,7 @@ class Processors:
         frame_cnt:int = 0
         frame_recs:list[dict[int,deque[Tuple[int,ImageMat|None]]]] = []
             # {0:0,1:0,2:0}, # each class continuous cnt
-        frame_save_queue:queue.Queue[list[ImageMat]] = queue.Queue()
+        frame_save_queue:queue.Queue[tuple[str,list[ImageMat]]] = queue.Queue()
         frame_save_queue_len:int= 1000
         class_names:Dict[str,str] = {}
         all_cls_id:set[int] = set()
@@ -1643,6 +1643,7 @@ class Processors:
         save_dir:str=''
         gps_uuid:str=''
 
+        timezone:int=9#(UTC+9)
         _det_processor:'Processors.YOLO'= None
         _gps_processor:'Processors.GPS'= None
         
@@ -1682,24 +1683,32 @@ class Processors:
 
         def _save_worker(self):
             while True:
-                imagemat_list = self.frame_save_queue.get()
+                class_name,imagemat_list = self.frame_save_queue.get()
                 if imagemat_list is None:return
                 timestamp = imagemat_list[len(imagemat_list)//2].timestamp
-                filename = f'{self.save_dir}/{timestamp}'
+                # Create timezone-aware UTC datetime
+                dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                # Convert to (UTC+N)
+                dt_jst = dt_utc + timedelta(hours=self.timezone)
+                # Create file name string (JST)
+                timestamp = dt_jst.strftime("%Y%m%d_%H%M%S")
+                filename = f'{self.save_dir}/{timestamp}_{class_name}'
+
                 os.makedirs(filename,exist_ok=True)
 
                 for i,img in enumerate(imagemat_list):
-                    i-=len(imagemat_list)//2
-                    if i==0:i=''
-                    filename = f'{filename}/{timestamp}{i}.jpeg'
-                    cv2.imwrite(filename, img.data())
+                    fn = f'{filename}/{i}.jpeg'
+                    cv2.imwrite(fn, img.data())
                     if self.save_jpeg_gps:
                         self._gps_processor._gps.set_jpeg_gps_location(
-                            filename,img.info.latlon[0],img.info.latlon[1],filename)
+                            fn,img.info.latlon[0],img.info.latlon[1],fn)
                 
                 if self.save_mp4:
-                    filename = f'{filename}/{timestamp}.mp4'
-
+                    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                    writer = cv2.VideoWriter(f'{filename}/video.mp4', fourcc, 1, (img.info.W, img.info.H))
+                    for i,img in enumerate(imagemat_list):
+                        writer.write(img.data())
+                    writer.release()
                 self.frame_save_queue.task_done()
 
         def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
@@ -1723,7 +1732,8 @@ class Processors:
                 for i in cls_id:
                     imgc = None
                     if  self.save_jpeg or self.save_mp4:
-                        imgc = img.copy()
+                        info = imgs_info[idx]
+                        imgc = ImageMat(color_type=ColorType.BGR,info=info).unsafe_update_mat(img.copy())
                     frame_rec[i].append((frame_rec[i][-1][0]+1,imgc))
                     
                 for i in self.all_cls_id - cls_id:
@@ -1739,6 +1749,7 @@ class Processors:
                         
                     if res:# vertify 
                         # do saving
+                        print('save_jpeg',)
                         if  self.save_jpeg or self.save_mp4:
                             to_save=[q.pop()[1] for _ in range(self.queue_len)][::-1]
                             to_save=[i for i in to_save if i is not None]
@@ -1746,8 +1757,8 @@ class Processors:
                                 for i in to_save:
                                     latlon=self._gps_processor.get_latlon()
                                     if latlon:
-                                        i.info.latlon[0] = latlon[0]
-                                        i.info.latlon[1] = latlon[1]
+                                        i.info.latlon = (latlon[0],latlon[1])
+                            self.frame_save_queue.put((self.class_names[k],to_save))
                         # clear up
                         for _ in range(self.queue_len):
                             q.append((0,None))
@@ -1796,7 +1807,6 @@ class Processors:
             if self.yolo_uuid:
                 self._yolo_processor = meta[self.yolo_uuid]
                 if len(self.class_names)!=len(self._yolo_processor.class_names):
-                    print(self._yolo_processor.class_names)
                     self.class_names = {k:self.jp2en(v) for k,v in self._yolo_processor.class_names.items()}
 
             for idx, img in enumerate(imgs_data):
