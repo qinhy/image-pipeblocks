@@ -85,6 +85,66 @@ class BaseGps(BaseModel):
         port_list = [ f'{port.device},{port.hwid}' for port in ports]
         return port_list
     
+    @staticmethod
+    def deg_to_dms_rational(deg_float):
+        """Convert decimal degrees to degrees, minutes, seconds as rational numbers."""
+        deg_abs = abs(deg_float)
+        deg = int(deg_abs)
+        min_float = (deg_abs - deg) * 60
+        minute = int(min_float)
+        sec = round((min_float - minute) * 60 * 10000)
+        return ((deg, 1), (minute, 1), (sec, 10000))
+    
+    @staticmethod
+    def dms_rational_to_deg(dms, ref):
+        """Convert EXIF DMS rational to decimal degrees."""
+        degrees = dms[0][0] / dms[0][1]
+        minutes = dms[1][0] / dms[1][1]
+        seconds = dms[2][0] / dms[2][1]
+
+        decimal = degrees + (minutes / 60.0) + (seconds / 3600.0)
+        if ref in ['S', 'W']:
+            decimal = -decimal
+        return decimal
+    
+    @staticmethod
+    def set_jpeg_gps_location(file_path, lat, lon, output_path):
+        import piexif
+        exif_dict = piexif.load(file_path)
+        gps_ifd = {
+            piexif.GPSIFD.GPSLatitudeRef: 'N' if lat >= 0 else 'S',
+            piexif.GPSIFD.GPSLatitude: BaseGps.deg_to_dms_rational(lat),
+            piexif.GPSIFD.GPSLongitudeRef: 'E' if lon >= 0 else 'W',
+            piexif.GPSIFD.GPSLongitude: BaseGps.deg_to_dms_rational(lon),
+        }
+        exif_dict['GPS'] = gps_ifd
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, file_path, output_path)
+
+    @staticmethod
+    def get_jpeg_gps_location(file_path):
+        """Read GPS info from a JPEG file, return (latitude, longitude)."""
+        import piexif
+        exif_dict = piexif.load(file_path)
+        gps_ifd = exif_dict.get("GPS", {})
+
+        if not gps_ifd:
+            return None
+
+        lat = lon = None
+
+        gps_latitude = gps_ifd.get(piexif.GPSIFD.GPSLatitude)
+        gps_latitude_ref = gps_ifd.get(piexif.GPSIFD.GPSLatitudeRef).decode() if gps_ifd.get(piexif.GPSIFD.GPSLatitudeRef) else None
+
+        gps_longitude = gps_ifd.get(piexif.GPSIFD.GPSLongitude)
+        gps_longitude_ref = gps_ifd.get(piexif.GPSIFD.GPSLongitudeRef).decode() if gps_ifd.get(piexif.GPSIFD.GPSLongitudeRef) else None
+
+        if gps_latitude and gps_latitude_ref and gps_longitude and gps_longitude_ref:
+            lat = BaseGps.dms_rational_to_deg(gps_latitude, gps_latitude_ref)
+            lon = BaseGps.dms_rational_to_deg(gps_longitude, gps_longitude_ref)
+
+        return (lat, lon)
+
     def model_post_init(self, context):
         self._stop_event = threading.Event()
         return super().model_post_init(context)

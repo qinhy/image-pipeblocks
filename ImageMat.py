@@ -2,6 +2,7 @@
 # Standard Library Imports
 import enum
 import json
+import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 
@@ -59,6 +60,7 @@ class ImageMatInfo(BaseModel):
     H: int = 0
     W: int = 0
     color_type: Optional[ColorType] = None
+    latlon: Tuple[float,float] = (0.0,0.0) #gps
     uuid: str = ''
 
     @staticmethod
@@ -134,6 +136,7 @@ class ImageMat(BaseModel):
 
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
+    timestamp:float = 0
     _img_data: np.ndarray|torch.Tensor = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False
@@ -181,7 +184,7 @@ class ImageMat(BaseModel):
 
     def build(self, img_data: Union[np.ndarray, torch.Tensor, str], info: Optional[ImageMatInfo] = None):
         self.info = info or ImageMatInfo().build(img_data, color_type=self.color_type)
-        self._img_data = img_data
+        self.unsafe_update_mat(img_data)
         return self
     
     def build_shmIO(self, shmIO_mode:str=False,target_mat_info:'ImageMat'=None):
@@ -240,6 +243,7 @@ class ImageMat(BaseModel):
         if self.shmIO_mode:
             self.shmIO_writer.write(img_data)
         self._img_data = img_data
+        self.timestamp = time.time()
         return self
 
     def data(self) -> Union[np.ndarray, torch.Tensor]:

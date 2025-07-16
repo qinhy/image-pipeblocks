@@ -233,7 +233,7 @@ class Processors:
             else:
                 return {}
         
-        def get_latlon(self):
+        def get_latlon(self)->list[float]:
             if self._gps:
                 s = self._gps.get_state()
                 return [s.lat,s.lon]
@@ -1519,7 +1519,7 @@ class Processors:
                 if img.is_ndarray():
                     img.require_ndarray()
                     img.require_HWC()
-                    img.require_RGB()
+                    img.require_RGB() # TODO:YOLO input form?
                 elif img.is_torch_tensor():
                     img.require_torch_tensor()
                     img.require_BCHW()
@@ -1626,54 +1626,138 @@ class Processors:
         title:str='simple_tracking'
         detect_frames_thre:int= 10
         ignore_frames_thre:int= 3
+        queue_len:int= 20
+        
         detector_uuid:str
         frame_cnt:int = 0
-        frame_rec:dict[int,list] = {}
+        frame_recs:list[dict[int,deque[Tuple[int,ImageMat|None]]]] = []
             # {0:0,1:0,2:0}, # each class continuous cnt
+        frame_save_queue:queue.Queue[list[ImageMat]] = queue.Queue()
+        frame_save_queue_len:int= 1000
         class_names:Dict[str,str] = {}
         all_cls_id:set[int] = set()
+
+        save_jpeg:bool=False
+        save_mp4:bool=False
+        save_jpeg_gps:bool=False
+        save_dir:str=''
+        gps_uuid:str=''
+
         _det_processor:'Processors.YOLO'= None
+        _gps_processor:'Processors.GPS'= None
         
+        def model_post_init(self, context):
+            self.queue_len = self.detect_frames_thre+self.ignore_frames_thre+1
+            if  self.save_jpeg or self.save_mp4 or self.save_jpeg_gps:
+                if not os.path.isdir(self.save_dir):
+                    raise ValueError(f'save_dir {self.save_dir} not exist')
+                self.save_dir = os.path.abspath(self.save_dir)
+                self.frame_save_queue = queue.Queue(maxsize=self.frame_save_queue_len)
+                save_thread = threading.Thread(target=self._save_worker, daemon=True)
+                save_thread.start()
+            return super().model_post_init(context)
+
+        def validate_img(self, img_idx, img):
+            img.require_ndarray()
+            img.require_HWC()
+            img.require_BGR()
+
+        def validate(self, imgs, meta = ..., run=True):
+            if self.detector_uuid and self.detector_uuid not in meta:
+                raise ValueError(f"detector_uuid {self.detector_uuid} not found in meta")
+            if self.gps_uuid and self.gps_uuid not in meta:
+                raise ValueError(f"gps_uuid {self.gps_uuid} not found in meta")
+            return super().validate(imgs, meta, run)
+
+        def _init_frame_recs(self,size=0):
+            self.class_names = self._det_processor.class_names
+            self.all_cls_id = set(list(self.class_names.keys()))
+        
+            for _ in range(size):
+                frame_rec = {k:deque(maxlen=self.queue_len) for k in self.class_names.keys()}
+                for k,v in frame_rec.items():
+                    for i in range(self.queue_len):
+                        v.append((0,None))
+                self.frame_recs.append(frame_rec)
+
+        def _save_worker(self):
+            while True:
+                imagemat_list = self.frame_save_queue.get()
+                if imagemat_list is None:return
+                timestamp = imagemat_list[len(imagemat_list)//2].timestamp
+                filename = f'{self.save_dir}/{timestamp}'
+                os.makedirs(filename,exist_ok=True)
+
+                for i,img in enumerate(imagemat_list):
+                    i-=len(imagemat_list)//2
+                    if i==0:i=''
+                    filename = f'{filename}/{timestamp}{i}.jpeg'
+                    cv2.imwrite(filename, img.data())
+                    if self.save_jpeg_gps:
+                        self._gps_processor._gps.set_jpeg_gps_location(
+                            filename,img.info.latlon[0],img.info.latlon[1],filename)
+                
+                if self.save_mp4:
+                    filename = f'{filename}/{timestamp}.mp4'
+
+                self.frame_save_queue.task_done()
+
         def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
             self.frame_cnt += 1
-
             if self.detector_uuid:
                 self._det_processor = meta[self.detector_uuid]
-            
-            if not self.frame_rec:
-                self.class_names = self._det_processor.class_names
-                self.frame_rec = {k:deque(maxlen=self.ignore_frames_thre+1) for k in self.class_names.keys()}
-                for k,v in self.frame_rec.items():
-                    for i in range(self.ignore_frames_thre+1):v.append(0)
-                self.all_cls_id = set(list(self.class_names.keys()))
-            
-            cls_id = set()
-            for detections in self._det_processor.bounding_box_xyxy:
+            if self.gps_uuid:         
+                self._gps_processor = meta[self.gps_uuid]         
+            if not self.frame_recs:
+                self._init_frame_recs(len(imgs_data))
+
+            for idx,img in enumerate(imgs_data):
+                frame_rec = self.frame_recs[idx]
+                detections = self._det_processor.bounding_box_xyxy[idx]
+
+                cls_id = set()
                 if len(detections)>0:
                     # x1, y1, x2, y2, conf, cls_id
-                    cls_id = cls_id | set(detections[:,5].flatten().tolist())
+                    cls_id = set(detections[:,5].flatten().tolist())
             
-            for i in cls_id:
-                self.frame_rec[i].append(self.frame_rec[i][-1]+1)
-                
-            for i in self.all_cls_id - cls_id:
-                if self.frame_rec[i][-1]>0:
-                    self.frame_rec[i].append(self.frame_rec[i][-1]-1)
-
-            for k,q in self.frame_rec.items():
-                res = True
-                res = res and q[-self.ignore_frames_thre-1]>self.detect_frames_thre
-                if not res: continue
-                
-                for i in range(-self.ignore_frames_thre,0,-1):
-                    res = res and q[i-1] > q[i]
+                for i in cls_id:
+                    imgc = None
+                    if  self.save_jpeg or self.save_mp4:
+                        imgc = img.copy()
+                    frame_rec[i].append((frame_rec[i][-1][0]+1,imgc))
                     
-                if res:
-                    for _ in range(self.ignore_frames_thre+1):
-                        q.append(0)
+                for i in self.all_cls_id - cls_id:
+                    if frame_rec[i][-1][0]>0:
+                        frame_rec[i].append((frame_rec[i][-1][0]-1,None))
+
+                for k,q in frame_rec.items():
+                    res = q[-self.ignore_frames_thre-1][0]>self.detect_frames_thre
+                    if not res: continue
+
+                    for i in range(-self.ignore_frames_thre,0,-1):
+                        res = res and q[i-1][0] > q[i][0]
+                        
+                    if res:# vertify 
+                        # do saving
+                        if  self.save_jpeg or self.save_mp4:
+                            to_save=[q.pop()[1] for _ in range(self.queue_len)][::-1]
+                            to_save=[i for i in to_save if i is not None]
+                            if self.save_jpeg_gps:
+                                for i in to_save:
+                                    latlon=self._gps_processor.get_latlon()
+                                    if latlon:
+                                        i.info.latlon[0] = latlon[0]
+                                        i.info.latlon[1] = latlon[1]
+                        # clear up
+                        for _ in range(self.queue_len):
+                            q.append((0,None))
 
             return imgs_data
         
+        def release(self):
+            self.frame_save_queue.put(None)
+            return super().release()
+    
     class DrawYOLO(ImageMatProcessor):
         title:str = 'cv_draw_yolo'
         draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
