@@ -9,9 +9,9 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.cuda.empty_cache()
 
-from generator import ImageMatGenerators, CvVideoFrameGenerator, XVSdkRGBDGenerator
-from processors import ImageMatProcessors, Processors
-from ImageMat import ImageMat, ColorType, ImageMatProcessor
+from image_pipeblocks.generator import ImageMatGenerators, CvVideoFrameGenerator, XVSdkRGBDGenerator
+from image_pipeblocks.processors import ImageMatProcessors, Processors
+from image_pipeblocks.ImageMat import ImageMat, ColorType, ImageMatProcessor
 
 def test1():
     # Test ImageMat creation for a Bayer numpy image

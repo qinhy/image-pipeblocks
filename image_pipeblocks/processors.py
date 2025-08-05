@@ -35,9 +35,8 @@ from ultralytics.utils import ops
 # ===============================
 # Custom Modules
 # ===============================
-from gps import BaseGps, FileReplayGps, UsbGps
-from shmIO import NumpyUInt8SharedMemoryStreamIO
-from ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
+from .shmIO import NumpyUInt8SharedMemoryStreamIO
+from .ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
 
 
 logger = print
@@ -212,59 +211,62 @@ class Processors:
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return imgs_data
-        
-    class GPS(ImageMatProcessor):
-        title:str='get_gps'
-        port:str = 'gps.jsonl'
-        save_results_to_meta:bool = True
-        _gps:BaseGps = None
+    try:        
+        from .gps import BaseGps, FileReplayGps, UsbGps
+        class GPS(ImageMatProcessor):
+            title:str='get_gps'
+            port:str = 'gps.jsonl'
+            save_results_to_meta:bool = True
+            _gps:BaseGps = None
 
-        @staticmethod
-        def coms():
-            return BaseGps.coms()
+            @staticmethod
+            def coms():
+                return BaseGps.coms()
 
-        def change_port(self,port:str):
-            self.off()
-            self.port = port
-            self.on() 
+            def change_port(self,port:str):
+                self.off()
+                self.port = port
+                self.on() 
 
-        def get_state(self):
-            if self._gps:
-                return json.loads(self._gps.get_state().model_dump_json())
-            else:
-                return {}
-        
-        def get_latlon(self)->list[float]:
-            if self._gps:
-                s = self._gps.get_state()
-                return [s.lat,s.lon]
-            else:
-                return []
+            def get_state(self):
+                if self._gps:
+                    return json.loads(self._gps.get_state().model_dump_json())
+                else:
+                    return {}
+            
+            def get_latlon(self)->list[float]:
+                if self._gps:
+                    s = self._gps.get_state()
+                    return [s.lat,s.lon]
+                else:
+                    return []
 
-        def on(self):
-            self.ini_gps()
-            return super().on()
-        
-        def off(self):
-            if self._gps:
-                self._gps.close()
-            del self._gps
-            return super().off()
-
-        def ini_gps(self):            
-            if os.path.isfile(self.port):
-                self._gps:BaseGps = FileReplayGps()
-            else:                
-                self._gps:BaseGps = UsbGps()
-            self._gps.open(self.port)
-
-        def validate_img(self, img_idx, img):
-            if self._gps is None:
+            def on(self):
                 self.ini_gps()
+                return super().on()
+            
+            def off(self):
+                if self._gps:
+                    self._gps.close()
+                del self._gps
+                return super().off()
 
-        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            return imgs_data
-        
+            def ini_gps(self):            
+                if os.path.isfile(self.port):
+                    self._gps:BaseGps = FileReplayGps()
+                else:                
+                    self._gps:BaseGps = UsbGps()
+                self._gps.open(self.port)
+
+            def validate_img(self, img_idx, img):
+                if self._gps is None:
+                    self.ini_gps()
+
+            def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+                return imgs_data
+    except:
+        pass
+
     class CropToDivisibleBy32(ImageMatProcessor):
         title: str = 'crop_to_divisible_by_32'
         hs:list[int] = []
@@ -1515,7 +1517,7 @@ class Processors:
             for xyxycc in yolo_results_xyxycc:
                 confs = xyxycc[:,4]
                 ids = xyxycc[:,5]
-                thresholds = [self.conf[int(i)] for i in ids]
+                thresholds = [self.conf[int(i)] if isinstance(self.conf,dict) else self.conf for i in ids]
                 self.bounding_box_xyxy.append(xyxycc[confs>thresholds])
 
             res = imgs if len(imgs)>0 else imgs_data
@@ -1755,8 +1757,9 @@ class Processors:
         draw_font_scale: float = Field(0.5, description="Font scale for label text")
         draw_thickness: int = Field(2, description="Line thickness for box and text")
         class_names:Dict[str,str] = {}
-        class_colors:dict = {0: "FF3838",1: "FF9D97",2: "FF701F",3: "FFB21D",4: "CFD231",5: "48F90A",
+        class_colors_code:dict = {0: "FF3838",1: "FF9D97",2: "FF701F",3: "FFB21D",4: "CFD231",5: "48F90A",
                             6: "92CC17",7: "3DDB86",8: "1A9334",9: "00D4BB",10: "2C99A8",11: "00C2FF",12: "344593"}
+        class_colors:Dict = {}
         yolo_uuid:str=''
         _yolo_processor:'Processors.YOLO'= None
 
@@ -1776,7 +1779,7 @@ class Processors:
             return (int(hex_str[4:6], 16), int(hex_str[2:4], 16), int(hex_str[0:2], 16))
 
         def model_post_init(self, context):
-            self.class_colors = {k:self.hex_to_bgr(v) for k,v in self.class_colors.items()}
+            self.class_colors = {k:self.hex_to_bgr(v) for k,v in self.class_colors_code.items()}
             return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
@@ -1824,7 +1827,7 @@ class Processors:
                 else:
                     label = f"ID {cls_id} {conf:.2f}"
 
-                box_color = class_colors[cls_id]
+                box_color = class_colors[cls_id] if len(class_colors)>0 else (0,255,0)
 
                 cv2.rectangle(
                     img,

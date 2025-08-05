@@ -11,7 +11,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
-from shmIO import NumpyUInt8SharedMemoryStreamIO
+from .shmIO import NumpyUInt8SharedMemoryStreamIO
 
 class DeviceType(str, enum.Enum):
     CPU = 'cpu'
