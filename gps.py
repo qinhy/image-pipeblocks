@@ -309,7 +309,10 @@ class UsbGps(BaseGps):
         elif stype == "GGA":
             self._state.fix_quality = int(data[5] or 0)
             self._state.sats_used = float(data[6] or 0)
-            self._state.hdop = float(data[7] or math.nan)
+            try:
+                self._state.hdop = float(data[7] or math.nan)
+            except:
+                self._state.hdop = math.nan
             if self._state.fix_quality:
                 self._state.lat = self._parse_lat(data[1], data[2])
                 self._state.lon = self._parse_lon(data[3], data[4])
@@ -353,9 +356,15 @@ class UsbGps(BaseGps):
         # ----------------------------- GNS -----------------------------
         elif stype == "GNS":
             self._state.sats_used = float(data[6] or 0)
-            self._state.hdop = float(data[7] or math.nan)
+            try:
+                self._state.hdop = float(data[7] or math.nan)
+            except:
+                self._state.hdop = math.nan
             self._state.alt_msl = float(data[8] or math.nan)
-            self._state.geoid_sep = float(data[9] or math.nan)
+            try:
+                self._state.geoid_sep = float(data[9] or math.nan)
+            except:
+                self._state.geoid_sep = math.nan
 
             self._state.lat = self._parse_lat(data[1], data[2])
             self._state.lon = self._parse_lon(data[3], data[4])
@@ -397,7 +406,10 @@ class UsbGps(BaseGps):
         if not lon_str or not hemi:
             return math.nan
         deg = float(lon_str[:3])
-        min_ = float(lon_str[3:])
+        try:
+            min_ = float(lon_str[3:])
+        except:
+            min_ = math.nan
         dec = deg + min_ / 60
         if hemi == "W":
             dec = -dec

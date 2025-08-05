@@ -945,15 +945,14 @@ class Processors:
                 if mask_split:
                     mask_images = [
                         y
-                        for x in np.split(mask_image, mask_split[1], axis=1)
-                        for y in np.split(x, mask_split[0], axis=0)
+                        for x in np.split(mask_image, mask_split[1], axis=0)
+                        for y in np.split(x, mask_split[0], axis=1)
                     ]
                 else:
                     mask_images = [mask_image]
             except ValueError:
                 logger("Error: Invalid mask split configuration.")
-                return None
-
+                return None        
             # Convert to grayscale and apply preview color
             self._original_masks = [cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) for mask in mask_images]
 
@@ -1026,69 +1025,33 @@ class Processors:
             self._revert_masks = []
             self._torch_original_masks = []
             self._numpy_make_mask_images(mask_image_path,mask_split)
+            img_cnt = 0
             if self.input_mats:
                 for i,img in enumerate(self.input_mats):
-                    self.torch_adjust_mask(i,img)
-            self._masks_to_devices()
+                    h, w = img.info.H, img.info.W
+                    if img.info.B>1:
+                        img_masks=[]
+                        for j in range(img.info.B):
+                            resized_mask_np = cv2.resize(self._original_masks[img_cnt], (w, h), interpolation=cv2.INTER_NEAREST)
+                            img_masks.append(resized_mask_np)
+                            img_cnt+=1
+                        self._resized_masks.append(np.vstack(img_masks))
+                    else:
+                        resized_mask_np = cv2.resize(self._original_masks[img_cnt], (w, h), interpolation=cv2.INTER_NEAREST)
+                        self._resized_masks.append(resized_mask_np)
+                        img_cnt+=1
 
-        def torch_adjust_mask(self, img_idx: int, img: ImageMat):
-            if img.info.B==1:
-                self._torch_adjust_mask(img_idx,img)
-                self.img_cnt+=1
-            else:
-                for i in range(img.info.B):
-                    self._torch_adjust_mask(self.img_cnt,img)
-                    self.img_cnt+=1
-        
-        def _masks_to_devices(self):            
-            imgs_num = 0
-            for i, img in enumerate(self.input_mats):
-                for j in range(img.info.B):
-                    imgs_num += 1
-            device_masks = []
-            for i in range(imgs_num):                
-                device = self.num_devices[i % self.num_gpus]
-                device_masks.append((device,self._resized_masks[i],self._revert_masks[i]))
-
-            resized_masks = []
-            revert_masks = []
-            for d in self.num_devices:
-                tmp = [i for i in device_masks if i[0]==d]
-                resized_mask = torch.vstack([i[1] for i in tmp]).to(d)
-                revert_mask = torch.vstack([i[2] for i in tmp]).to(d)
-                resized_masks.append(resized_mask)
-                revert_masks.append(revert_mask)
-            
-            self._resized_masks = resized_masks
-            self._revert_masks = revert_masks
-
-        def _torch_make_mask_images(self, mask_image_path: Optional[str],
-                              mask_split: Tuple[int, int]) -> Optional[Dict[str, List[Any]]]:
-            self._numpy_make_mask_images(mask_image_path, mask_split)
-            # Convert grayscale masks to PyTorch tensors in BCHW format, normalized
-            self._torch_original_masks = [
-                torch.as_tensor(mask).unsqueeze(0).unsqueeze(0).type(
-                ImageMatInfo.torch_img_dtype()) / 255.0
-                for mask in self._original_masks
-            ]
-
-        def _torch_adjust_mask(self, idx, img:ImageMat):
-            gray_mask: np.ndarray = self._original_masks[idx%len(self._original_masks)]
-
-            h, w = img.info.H, img.info.W
-            # Resize using OpenCV (still in NumPy), then convert to torch tensor
-            resized_mask_np = cv2.resize(gray_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            resized_mask_torch = torch.as_tensor(resized_mask_np
-                                    ).unsqueeze(0).unsqueeze(0).type(
-                                    ImageMatInfo.torch_img_dtype()).div(255.0)
-            
-            revert_mask_torch = torch.tensor(self.mask_color, dtype=resized_mask_torch.dtype).view(1, 3, 1, 1)
-            revert_mask_torch = revert_mask_torch.expand(1, 3, h, w).clone().type(
-                                    ImageMatInfo.torch_img_dtype()).div(255.0)
-            revert_mask_torch = revert_mask_torch*(1.0 - resized_mask_torch)
-
-            self._resized_masks.append(resized_mask_torch)
-            self._revert_masks.append(revert_mask_torch)
+                for i,img in enumerate(self.input_mats):
+                    h, w = img.info.H, img.info.W
+                    self._resized_masks[i] = torch.as_tensor(self._resized_masks[i]
+                                            ).unsqueeze(0).unsqueeze(0).to(img.info.device
+                                            ).type(ImageMatInfo.torch_img_dtype()).div(255.0)
+                                            
+                    revert_mask_torch = torch.tensor(self.mask_color, dtype=self._resized_masks[i].dtype).view(1, 3, 1, 1)
+                    revert_mask_torch = revert_mask_torch.expand(1, 3, h, w).clone().to(img.info.device).type(
+                                            ImageMatInfo.torch_img_dtype()).div(255.0)
+                    revert_mask_torch = revert_mask_torch*(1.0 - self._resized_masks[i])
+                    self._revert_masks.append(revert_mask_torch)
 
         def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
             if len(self._resized_masks)==0:
@@ -1515,7 +1478,7 @@ class Processors:
             return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
-                img.require_square_size()
+                # img.require_square_size()
                 if img.is_ndarray():
                     img.require_ndarray()
                     img.require_HWC()
@@ -1574,7 +1537,7 @@ class Processors:
             imgs = []
             yolo_results = []
             for i,img in enumerate(imgs_data):
-                device = self.devices[i]
+                device = self.num_devices[i % self.num_gpus]
                 yolo_result = self._models[device](img)
                 if isinstance(yolo_result, list):
                     yolo_results += yolo_result
@@ -1601,7 +1564,7 @@ class Processors:
         def predict(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[]):
             yolo_results = []
             for i,img in enumerate(imgs_data):
-                device = self.devices[i]
+                device = self.num_devices[i % self.num_gpus]
                 yolo_model:YOLO = self._models[device]
                 preds, feature_maps = yolo_model(img)                
                 preds = ops.non_max_suppression(
@@ -1644,6 +1607,7 @@ class Processors:
         gps_uuid:str=''
 
         timezone:int=9#(UTC+9)
+
         _det_processor:'Processors.YOLO'= None
         _gps_processor:'Processors.GPS'= None
         
@@ -1685,6 +1649,7 @@ class Processors:
             while True:
                 class_name,imagemat_list = self.frame_save_queue.get()
                 if imagemat_list is None:return
+
                 timestamp = imagemat_list[len(imagemat_list)//2].timestamp
                 # Create timezone-aware UTC datetime
                 dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -1776,7 +1741,7 @@ class Processors:
         draw_font_scale: float = Field(0.5, description="Font scale for label text")
         draw_thickness: int = Field(2, description="Line thickness for box and text")
         class_names:Dict[str,str] = {}
-        class_colors:dict = {0: "FF3838",1: "c58282",2: "FF701F",3: "FFB21D",4: "CFD231",5: "48F90A",
+        class_colors:dict = {0: "FF3838",1: "FF9D97",2: "FF701F",3: "FFB21D",4: "CFD231",5: "48F90A",
                             6: "92CC17",7: "3DDB86",8: "1A9334",9: "00D4BB",10: "2C99A8",11: "00C2FF",12: "344593"}
         yolo_uuid:str=''
         _yolo_processor:'Processors.YOLO'= None
@@ -1854,16 +1819,16 @@ class Processors:
                     self.draw_thickness
                 )
 
-                cv2.putText(
-                    img,
-                    label,
-                    (int(x1), int(y1) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    self.draw_font_scale,
-                    box_color,  # Use same color for text or choose another
-                    self.draw_thickness,
-                    cv2.LINE_AA
-                )
+                # cv2.putText(
+                #     img,
+                #     label,
+                #     (int(x1), int(y1) - 10),
+                #     cv2.FONT_HERSHEY_SIMPLEX,
+                #     self.draw_font_scale,
+                #     box_color,  # Use same color for text or choose another
+                #     self.draw_thickness,
+                #     cv2.LINE_AA
+                # )
             return img
 
     class CvImageViewer(ImageMatProcessor):
