@@ -1035,18 +1035,18 @@ class Processors:
                             resized_mask_np = cv2.resize(self._original_masks[img_cnt], (w, h), interpolation=cv2.INTER_NEAREST)
                             img_masks.append(resized_mask_np)
                             img_cnt+=1
-                        self._resized_masks.append(np.vstack(img_masks))
+                        self._resized_masks.append( torch.as_tensor(np.asarray(img_masks)
+                                            ).unsqueeze(0).permute(1, 0, 2, 3).to(img.info.device
+                                            ).type(ImageMatInfo.torch_img_dtype()).div(255.0))
                     else:
                         resized_mask_np = cv2.resize(self._original_masks[img_cnt], (w, h), interpolation=cv2.INTER_NEAREST)
-                        self._resized_masks.append(resized_mask_np)
+                        self._resized_masks.append( torch.as_tensor(resized_mask_np
+                                            ).unsqueeze(0).unsqueeze(0).to(img.info.device
+                                            ).type(ImageMatInfo.torch_img_dtype()).div(255.0))
                         img_cnt+=1
 
                 for i,img in enumerate(self.input_mats):
-                    h, w = img.info.H, img.info.W
-                    self._resized_masks[i] = torch.as_tensor(self._resized_masks[i]
-                                            ).unsqueeze(0).unsqueeze(0).to(img.info.device
-                                            ).type(ImageMatInfo.torch_img_dtype()).div(255.0)
-                                            
+                    h, w = img.info.H, img.info.W                                            
                     revert_mask_torch = torch.tensor(self.mask_color, dtype=self._resized_masks[i].dtype).view(1, 3, 1, 1)
                     revert_mask_torch = revert_mask_torch.expand(1, 3, h, w).clone().to(img.info.device).type(
                                             ImageMatInfo.torch_img_dtype()).div(255.0)
@@ -1735,7 +1735,7 @@ class Processors:
             return super().release()
     
     class DrawYOLO(ImageMatProcessor):
-        title:str = 'cv_draw_yolo'
+        title:str = 'draw_yolo'
         draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
         draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
         draw_font_scale: float = Field(0.5, description="Font scale for label text")
@@ -1781,13 +1781,10 @@ class Processors:
                                      self.class_colors,))
             return res
             
-        def draw(
-            self,
-            img: np.ndarray,
-            detections: np.ndarray,
-            class_names: Dict[str,str] = [],
-            class_colors: Dict[str,str] = []
-        ) -> np.ndarray:
+        def draw(self, img: np.ndarray,
+                detections: np.ndarray,
+                class_names: Dict[str,str] = [],
+                class_colors: Dict[str,str] = []) -> np.ndarray:
             """
             Draw YOLO-style bounding boxes and labels on the image.
 
@@ -1819,76 +1816,32 @@ class Processors:
                     self.draw_thickness
                 )
 
-                # cv2.putText(
-                #     img,
-                #     label,
-                #     (int(x1), int(y1) - 10),
-                #     cv2.FONT_HERSHEY_SIMPLEX,
-                #     self.draw_font_scale,
-                #     box_color,  # Use same color for text or choose another
-                #     self.draw_thickness,
-                #     cv2.LINE_AA
-                # )
+                # First: draw text with thicker stroke in edge color (e.g., black)
+                cv2.putText(
+                    img,
+                    label,
+                    (int(x1), int(y1) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    self.draw_font_scale,
+                    (0, 0, 0),  # Black edge
+                    self.draw_thickness + 2,  # Thicker for outline
+                    cv2.LINE_AA
+                )
+
+                # Then: draw the text with actual text color on top
+                cv2.putText(
+                    img,
+                    label,
+                    (int(x1), int(y1) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    self.draw_font_scale,
+                    self.draw_text_color,  # Main color
+                    self.draw_thickness,
+                    cv2.LINE_AA
+                )
             return img
 
     class CvImageViewer(ImageMatProcessor):
-
-        class DrawYOLO(BaseModel):
-            # === Drawing configuration (Pydantic-managed) ===
-            draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
-            draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
-            draw_font_scale: float = Field(0.5, description="Font scale for label text")
-            draw_thickness: int = Field(2, description="Line thickness for box and text")
-            # === Main method ===
-            def draw(
-                self,
-                img: np.ndarray,
-                detections: np.ndarray,
-                class_names: List[str] = []
-            ) -> np.ndarray:
-                """
-                Draw YOLO-style bounding boxes and labels on the image.
-
-                Parameters:
-                    img (np.ndarray): Image to draw on.
-                    detections (np.ndarray): Array of detections [x1, y1, x2, y2, conf, cls_id].
-                    class_names (List[str], optional): Class names for label display.
-
-                Returns:
-                    np.ndarray: Annotated image.
-                """
-                for det in detections:
-                    x1, y1, x2, y2, conf, cls_id = map(float, det[:6])
-                    cls_id = int(cls_id)
-
-                    # Compose label text
-                    if class_names and 0 <= cls_id < len(class_names):
-                        label = f"{class_names[cls_id]} {conf:.2f}"
-                    else:
-                        label = f"ID {cls_id} {conf:.2f}"
-
-                    # Draw bounding box
-                    cv2.rectangle(
-                        img,
-                        (int(x1), int(y1)),
-                        (int(x2), int(y2)),
-                        self.draw_box_color,
-                        self.draw_thickness
-                    )
-
-                    # Draw label
-                    cv2.putText(
-                        img,
-                        label,
-                        (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        self.draw_font_scale,
-                        self.draw_text_color,
-                        self.draw_thickness,
-                        cv2.LINE_AA
-                    )
-
-                return img
 
         title:str = 'cv_image_viewer'
         window_name_prefix: str = Field(default='ImageViewer', description="Prefix for window name")
@@ -1904,7 +1857,11 @@ class Processors:
         draw_text_color: tuple = (255, 255, 255)  # White
         draw_font_scale: float = 0.5
         draw_thickness: int = 2
-        draw_yolo: DrawYOLO = DrawYOLO()
+        draw_yolo: Optional['Processors.DrawYOLO'] = None
+
+        def model_post_init(self, context):
+            self.draw_yolo = Processors.DrawYOLO()
+            return super().model_post_init(context)
 
         def validate_img(self, img_idx, img: ImageMat):
             img.require_ndarray()
@@ -1913,18 +1870,6 @@ class Processors:
             self.window_names.append(win_name)
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
 
-        def _draw_yolo(self, img: np.ndarray, yolo_detection: np.ndarray, class_names=[]) -> np.ndarray:
-            return self.draw_yolo.draw(img,yolo_detection,class_names)
-            # for det in yolo_detection:
-                # x1, y1, x2, y2, conf, cls_id = det
-                # label = f"{class_names[int(cls_id)]} {conf:.2f}"
-                # # Draw box
-                # cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), self.draw_box_color, self.draw_thickness)
-                # # Draw label
-                # cv2.putText(img, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                #             self.draw_font_scale, self.draw_text_color, self.draw_thickness, cv2.LINE_AA)
-            # return img
-        
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:            
             if self.yolo_uuid:
                 self._yolo_processor = meta[self.yolo_uuid]
@@ -1943,7 +1888,7 @@ class Processors:
 
                 # Optional YOLO detection overlays
                 if self._yolo_processor and idx<len(self._yolo_processor.bounding_box_xyxy):
-                    self._draw_yolo(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
+                    self.draw_yolo.draw(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
                 
                 win_name = self.window_names[idx]
 
