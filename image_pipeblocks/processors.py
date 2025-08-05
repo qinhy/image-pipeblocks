@@ -1981,6 +1981,74 @@ class Processors:
             # yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
             return [],yolo_results_xyxycc
         
+    try:       
+        import pytorch_lightning as pl 
+        class SegmentationModelsPytorch(ImageMatProcessor):
+            import pytorch_lightning as pl 
+            class SegmentationModel(pl.LightningModule):
+                def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
+                                encoder_weights='imagenet', in_channels=1, lr=1e-4):
+                    super().__init__()
+                    import segmentation_models_pytorch as smp
+                    # self.loss_fn = nn.BCEWithLogitsLoss()
+                    self.arch_name=arch_name
+                    self.encoder_name=encoder_name
+                    self.encoder_weights=encoder_weights
+                    self.lr=lr
+                    
+                    self.save_hyperparameters()
+                    self.model = smp.create_model(
+                        self.arch_name,
+                        self.encoder_name,
+                        self.encoder_weights,
+                        in_channels=in_channels,
+                        classes=1,
+                    )
+                    # preprocessing parameteres for image
+                    params = smp.encoders.get_preprocessing_params(self.encoder_name)
+                    std = torch.tensor(params["std"]).view(1, 3, 1, 1)
+                    mean = torch.tensor(params["mean"]).view(1, 3, 1, 1)
+                    if in_channels==1:
+                        std = std.mean(1,keepdim=True)
+                        mean = mean.mean(1,keepdim=True)
+                    self.register_buffer("std", std)
+                    self.register_buffer("mean", mean)
+
+                def forward(self, x:torch.Tensor):
+                    # normalize image here
+                    x = (x - self.mean) / self.std
+                    return self.model(x)
+
+            title:str='segmentation_models_pytorch'
+            ckpt_path:str
+            device:str
+            _model:SegmentationModel = None
+
+            def model_post_init(self, context):
+                self._model = self.SegmentationModel.load_from_checkpoint(
+                    self.ckpt_path,map_location=torch.device(self.device))
+                self._model.eval()
+                return super().model_post_init(context)
+            
+            def infer(self,imgs):
+                with torch.no_grad():
+                    test_inputs = imgs.to(self._model.device)
+                    pred_logits = self._model(test_inputs)
+                    pred_masks = (torch.sigmoid(pred_logits) > 0.5).float()
+                    return pred_masks
+                    
+            def validate_img(self, img_idx, img):
+                img.require_RGB()
+                img.require_BCHW()
+                img.require_torch_float()
+
+            def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+                imgs_data = [self.infer(i) for i in imgs_data]
+                return imgs_data        
+    except:
+        pass
+
+        
 class ImageMatProcessors(BaseModel):
     @staticmethod    
     def dumps(pipes:list[ImageMatProcessor]):
