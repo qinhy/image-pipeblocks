@@ -214,11 +214,15 @@ class Processors:
     
     class Lambda(ImageMatProcessor):
         title:str='lambda'
+        out_color_type:ColorType = ColorType.UNKNOWN
         _forward_raw:Callable = lambda imgs_data, imgs_info, meta:None
 
         def validate_img(self, img_idx, img):
             pass
-            
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
+            if self.out_color_type != ColorType.UNKNOWN:
+                color_type = self.out_color_type
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return self._forward_raw(imgs_data, imgs_info, meta)
         
@@ -1961,7 +1965,7 @@ class Processors:
                 if self._yolo_processor and idx<len(self._yolo_processor.bounding_box_xyxy):
                     self.draw_yolo.draw(img,self._yolo_processor.bounding_box_xyxy[idx],self._yolo_processor.class_names)
                 
-                win_name = self.window_names[idx]
+                win_name = f'{self.window_name_prefix}:{self.uuid}:{idx}'
 
                 if scale is not None:
                     img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
