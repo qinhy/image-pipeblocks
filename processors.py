@@ -1452,7 +1452,8 @@ class Processors:
 
         modelname: str = 'yolov5s6u.pt'
         imgsz: int = -1
-        conf: float = 0.6
+        conf: Union[float,dict[int,float]] = 0.6
+        min_conf: float = 0.6
         max_det: int = 300
         class_names: Optional[Dict[int, str]] = None
         save_results_to_meta: bool = True
@@ -1475,6 +1476,10 @@ class Processors:
             self.num_devices = self.devices_info(gpu=self.gpu,multi_gpu=self.multi_gpu)
             default_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
             self.class_names = self.class_names if self.class_names is not None else default_names
+            if isinstance(self.conf,dict):
+                self.min_conf=min(list(self.conf.values()))
+            else:
+                self.min_conf=self.conf
             return super().model_post_init(context)
 
         def validate_img(self, img_idx, img):
@@ -1494,7 +1499,7 @@ class Processors:
                     self.imgsz = img.info.W
                 
                 self.devices.append(img.info.device)
-        
+
         def forward_raw(self, imgs_data: List[Union[np.ndarray, torch.Tensor]], imgs_info: List[ImageMatInfo]=[], meta={}) -> List["Any"]:
             if len(self._models)==0:
                 self.build_models()
@@ -1503,7 +1508,15 @@ class Processors:
             else:
                 imgs,yolo_results_xyxycc = self.predict(imgs_data,imgs_info)
 
-            self.bounding_box_xyxy = yolo_results_xyxycc
+            # After prediction
+            # x1, y1, x2, y2, conf, class_id
+            self.bounding_box_xyxy = []
+            for xyxycc in yolo_results_xyxycc:
+                confs = xyxycc[:,4]
+                ids = xyxycc[:,5]
+                thresholds = [self.conf[int(i)] for i in ids]
+                self.bounding_box_xyxy.append(xyxycc[confs>thresholds])
+
             res = imgs if len(imgs)>0 else imgs_data
             return res
 
@@ -1525,7 +1538,7 @@ class Processors:
                         self._models[d] = model_predict
                     else:
                         def model_predict(img,model=model,device=d,
-                                          conf=self.conf,verbose=self.yolo_verbose,
+                                          conf=self.min_conf,verbose=self.yolo_verbose,
                                           imgsz=self.imgsz, half=(self._torch_dtype==torch.float16)):
                             res = model.predict(source=img,conf=conf,verbose=verbose,half=half)
                                                 # device=device,
@@ -1569,7 +1582,7 @@ class Processors:
                 preds, feature_maps = yolo_model(img)                
                 preds = ops.non_max_suppression(
                     preds,
-                    self.conf,
+                    self.min_conf,
                     self.nms_iou,
                     classes = None,
                     agnostic= False,                    
@@ -1828,14 +1841,13 @@ class Processors:
                     cv2.LINE_AA
                 )
 
-                # Then: draw the text with actual text color on top
                 cv2.putText(
                     img,
                     label,
                     (int(x1), int(y1) - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     self.draw_font_scale,
-                    self.draw_text_color,  # Main color
+                    box_color,  # Use same color for text or choose another
                     self.draw_thickness,
                     cv2.LINE_AA
                 )
@@ -1943,7 +1955,7 @@ class Processors:
                 preds = yolo_model(img)
                 preds = ops.non_max_suppression(
                     preds,
-                    self.conf,
+                    self.min_conf,
                     self.nms_iou,
                     classes = None,
                     agnostic= False,
