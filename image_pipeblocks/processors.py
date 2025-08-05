@@ -470,6 +470,22 @@ class Processors:
             #     torch_images.append(tensor_img)
             return torch_images
 
+    class NumpyGrayToTorchGray(ImageMatProcessor):
+        # to BCHW
+        title:str='numpy_gray_to_torch_gray'
+        gpu:bool=True
+        multi_gpu:int=-1
+        _torch_dtype:ImageMat.TorchDtype = ImageMatInfo.torch_img_dtype()
+        _tensor_models:list = []
+
+        def validate_img(self, img_idx, img):
+            img.require_ndarray()
+            img.require_HW()
+            img.require_GRAYSCALE
+            
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.GRAYSCALE):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
+
     class TorchRGBToNumpyBGR(ImageMatProcessor):
         title:str='torch_rgb_to_numpy_bgr'
         _numpy_dtype:Any = ImageMatInfo.numpy_img_dtype()
