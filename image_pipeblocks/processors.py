@@ -12,7 +12,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 
 # ===============================
@@ -211,16 +211,29 @@ class Processors:
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return imgs_data
+    
+    class Lambda(ImageMatProcessor):
+        title:str='lambda'
+        _forward_raw:Callable = lambda imgs_data, imgs_info, meta:None
+
+        def validate_img(self, img_idx, img):
+            pass
+            
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            return self._forward_raw(imgs_data, imgs_info, meta)
+        
     try:        
-        from .gps import BaseGps, FileReplayGps, UsbGps
         class GPS(ImageMatProcessor):
+            from .gps import BaseGps, FileReplayGps, UsbGps
+
             title:str='get_gps'
             port:str = 'gps.jsonl'
             save_results_to_meta:bool = True
             _gps:BaseGps = None
 
             @staticmethod
-            def coms():
+            def coms():                
+                from .gps import BaseGps
                 return BaseGps.coms()
 
             def change_port(self,port:str):
