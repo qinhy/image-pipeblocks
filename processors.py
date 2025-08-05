@@ -20,7 +20,6 @@ import uuid
 # ===============================
 import cv2
 import numpy as np
-import pykakasi
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -1761,9 +1760,13 @@ class Processors:
 
         @staticmethod
         def jp2en(text):
-            kks = pykakasi.kakasi()
-            result = kks.convert(text)
-            return ''.join([i['hepburn'].replace('mono','butsu')  for i in result])
+            try:                
+                import pykakasi
+                kks = pykakasi.kakasi()
+                text = kks.convert(text)
+            except:
+                pass
+            return ''.join([i['hepburn'].replace('mono','butsu')  for i in text])
         
         @staticmethod
         def hex_to_bgr(hex_str: str):
