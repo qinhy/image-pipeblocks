@@ -28,13 +28,6 @@ from ultralytics import YOLO
 from ultralytics.utils import ops
 
 # ===============================
-# TensorRT & CUDA Imports
-# ===============================
-import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
-
-# ===============================
 # Custom Modules
 # ===============================
 from shmIO import NumpyUInt8SharedMemoryStreamIO
@@ -50,149 +43,159 @@ def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     alpha = int(hex_color[6:8], 16) if len(hex_color) == 8 else 255
     return rgba + (alpha,)
 
-class GeneralTensorRTInferenceModel:
-    class CudaDeviceContext:
-        def __init__(self, device_index):
-            self.device = cuda.Device(device_index)
+
+try:
+    # ===============================
+    # TensorRT & CUDA Imports
+    # ===============================
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    class GeneralTensorRTInferenceModel:
+        class CudaDeviceContext:
+            def __init__(self, device_index):
+                self.device = cuda.Device(device_index)
+                self.context = None
+
+            def __enter__(self):
+                self.context = self.device.make_context()
+                return self.context  # optional, in case you want to access it
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                # Pop and destroy context on exit
+                self.context.pop()
+                # self.context.detach()
+
+        np2torch_dtype = {
+            np.float32: torch.float32,
+            np.float16: torch.float16,
+            np.int32: torch.int32,
+        }
+
+        class HostDeviceMem:
+            def __init__(self, host_mem, device_mem,name,shape,dtype,size):
+                self.host = host_mem
+                self.device = device_mem
+                self.name = name
+                self.shape = shape
+                self.dtype = dtype
+                self.size = size
+
+            def __repr__(self):
+                return ( f"{self.__class__.__name__}(host=0x{id(self.host):x}"
+                        f",device=0x{id(self.device):x})"
+                        f",name={self.name}"
+                        f",shape={self.shape}"
+                        f",dtype={self.dtype}"
+                        f",size={self.size})")
+
+        def __init__(self,engine_path, device, input_name='input', output_name='output'):
+            self.engine_path=engine_path
+            self.logger = trt.Logger(trt.Logger.WARNING)
+            self.runtime = trt.Runtime(self.logger)
+            self.engine = None
             self.context = None
-
-        def __enter__(self):
-            self.context = self.device.make_context()
-            return self.context  # optional, in case you want to access it
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            # Pop and destroy context on exit
-            self.context.pop()
-            # self.context.detach()
-
-    np2torch_dtype = {
-        np.float32: torch.float32,
-        np.float16: torch.float16,
-        np.int32: torch.int32,
-    }
-
-    class HostDeviceMem:
-        def __init__(self, host_mem, device_mem,name,shape,dtype,size):
-            self.host = host_mem
-            self.device = device_mem
-            self.name = name
-            self.shape = shape
-            self.dtype = dtype
-            self.size = size
-
-        def __repr__(self):
-            return ( f"{self.__class__.__name__}(host=0x{id(self.host):x}"
-                     f",device=0x{id(self.device):x})"
-                     f",name={self.name}"
-                     f",shape={self.shape}"
-                     f",dtype={self.dtype}"
-                     f",size={self.size})")
-
-    def __init__(self,engine_path, device, input_name='input', output_name='output'):
-        self.engine_path=engine_path
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        self.runtime = trt.Runtime(self.logger)
-        self.engine = None
-        self.context = None
-        self.inputs = []
-        self.outputs = []
-        self.bindings = []
-        self.stream = cuda.Stream()
-        self.input_shape = None
-        self.output_shape = None
-        self.dtype = None
-        self.device = torch.device(device)
-        # self.set_device(self.device.index)
-        if self.device.index>0:
-            with GeneralTensorRTInferenceModel.CudaDeviceContext(self.device.index):
+            self.inputs = []
+            self.outputs = []
+            self.bindings = []
+            self.stream = cuda.Stream()
+            self.input_shape = None
+            self.output_shape = None
+            self.dtype = None
+            self.device = torch.device(device)
+            # self.set_device(self.device.index)
+            if self.device.index>0:
+                with GeneralTensorRTInferenceModel.CudaDeviceContext(self.device.index):
+                    self.load_trt(engine_path,input_name,output_name)
+                    # self warmup
+                    self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
+                    self.load_trt(engine_path,input_name,output_name)
+            else:
                 self.load_trt(engine_path,input_name,output_name)
                 # self warmup
                 self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
                 self.load_trt(engine_path,input_name,output_name)
-        else:
-            self.load_trt(engine_path,input_name,output_name)
-            # self warmup
-            self(torch.rand(*self.input_shape,device=self.device,dtype=self.np2torch_dtype[self.dtype]))
-            self.load_trt(engine_path,input_name,output_name)
 
 
-    def load_trt(self, engine_path, input_name='input', output_name='output',verb=True):
-        """Load a TensorRT engine file and prepare context and buffers."""
-        with open(engine_path, "rb") as f:
-            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+        def load_trt(self, engine_path, input_name='input', output_name='output',verb=True):
+            """Load a TensorRT engine file and prepare context and buffers."""
+            with open(engine_path, "rb") as f:
+                self.engine = self.runtime.deserialize_cuda_engine(f.read())
 
-        self.context = self.engine.create_execution_context()
+            self.context = self.engine.create_execution_context()
 
-        self.input_shape = [*self.engine.get_tensor_shape(input_name)]
-        self.output_shape = [*self.engine.get_tensor_shape(output_name)]
-        self.dtype = trt.nptype(self.engine.get_tensor_dtype(input_name))
+            self.input_shape = [*self.engine.get_tensor_shape(input_name)]
+            self.output_shape = [*self.engine.get_tensor_shape(output_name)]
+            self.dtype = trt.nptype(self.engine.get_tensor_dtype(input_name))
 
-        self.inputs, self.outputs, self.bindings = self._allocate_buffers()
-        if verb:
-            print(f"[TensorRT] Loaded engine: {engine_path}, dtype: {self.dtype}")
-            print(f"  Input shape: {self.input_shape}")
-            print(f"  Output shape: {self.output_shape}")
+            self.inputs, self.outputs, self.bindings = self._allocate_buffers()
+            if verb:
+                print(f"[TensorRT] Loaded engine: {engine_path}, dtype: {self.dtype}")
+                print(f"  Input shape: {self.input_shape}")
+                print(f"  Output shape: {self.output_shape}")
 
-    def _allocate_buffers(self):
-        inputs, outputs, bindings = [], [], []
-        num_io = self.engine.num_io_tensors
-        for i in range(num_io):
-            name = self.engine.get_tensor_name(i)
-            shape = self.engine.get_tensor_shape(name)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-            size = trt.volume(shape)
+        def _allocate_buffers(self):
+            inputs, outputs, bindings = [], [], []
+            num_io = self.engine.num_io_tensors
+            for i in range(num_io):
+                name = self.engine.get_tensor_name(i)
+                shape = self.engine.get_tensor_shape(name)
+                dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+                size = trt.volume(shape)
 
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            bindings.append(int(device_mem))
-            hdm = self.HostDeviceMem(host_mem,device_mem,name,shape,dtype,size)
+                host_mem = cuda.pagelocked_empty(size, dtype)
+                device_mem = cuda.mem_alloc(host_mem.nbytes)
+                bindings.append(int(device_mem))
+                hdm = self.HostDeviceMem(host_mem,device_mem,name,shape,dtype,size)
 
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                inputs.append(hdm)
-            else:
-                outputs.append(hdm)
-        return inputs, outputs, bindings
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    inputs.append(hdm)
+                else:
+                    outputs.append(hdm)
+            return inputs, outputs, bindings
 
-    def _transfer_torch2cuda(self, tensor: torch.Tensor, device_mem: HostDeviceMem):
-        num_bytes = tensor.element_size() * tensor.nelement()
-        cuda.memcpy_dtod_async(
-            dest=int(device_mem.device),
-            src=int(tensor.data_ptr()),
-            size=num_bytes,
-            stream=self.stream
-        )
+        def _transfer_torch2cuda(self, tensor: torch.Tensor, device_mem: HostDeviceMem):
+            num_bytes = tensor.element_size() * tensor.nelement()
+            cuda.memcpy_dtod_async(
+                dest=int(device_mem.device),
+                src=int(tensor.data_ptr()),
+                size=num_bytes,
+                stream=self.stream
+            )
 
-    def _transfer_cuda2torch(self, device_mem: HostDeviceMem):
-        torch_dtype = self.np2torch_dtype[self.dtype]
-        out_tensor = torch.empty(self.output_shape, device=self.device, dtype=torch_dtype)
+        def _transfer_cuda2torch(self, device_mem: HostDeviceMem):
+            torch_dtype = self.np2torch_dtype[self.dtype]
+            out_tensor = torch.empty(self.output_shape, device=self.device, dtype=torch_dtype)
 
-        num_bytes = out_tensor.element_size() * out_tensor.nelement()
-        cuda.memcpy_dtod_async(
-            dest=int(out_tensor.data_ptr()),
-            src=int(device_mem.device),
-            size=num_bytes,
-            stream=self.stream
-        )
-        return out_tensor
+            num_bytes = out_tensor.element_size() * out_tensor.nelement()
+            cuda.memcpy_dtod_async(
+                dest=int(out_tensor.data_ptr()),
+                src=int(device_mem.device),
+                size=num_bytes,
+                stream=self.stream
+            )
+            return out_tensor
 
-    def infer(self, inputs: list[torch.Tensor]):
-        x = inputs[0]
-        assert torch.is_tensor(x), "Input must be a torch.Tensor!"
-        assert x.is_cuda, "Torch input must be on CUDA!"
-        assert x.dtype == self.np2torch_dtype[self.dtype], f"Expected dtype {self.np2torch_dtype[self.dtype]}, got {x.dtype}"
-        assert x.device == self.device, "Torch input must be on same CUDA!"
-        return self.raw_infer(x)
+        def infer(self, inputs: list[torch.Tensor]):
+            x = inputs[0]
+            assert torch.is_tensor(x), "Input must be a torch.Tensor!"
+            assert x.is_cuda, "Torch input must be on CUDA!"
+            assert x.dtype == self.np2torch_dtype[self.dtype], f"Expected dtype {self.np2torch_dtype[self.dtype]}, got {x.dtype}"
+            assert x.device == self.device, "Torch input must be on same CUDA!"
+            return self.raw_infer(x)
 
-    def raw_infer(self, x:torch.Tensor):
-        [self._transfer_torch2cuda(x, mem) for x, mem in zip([x], self.inputs)]
-        self.context.execute_v2(bindings=self.bindings)
-        # outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
-        self.stream.synchronize()
-        return []#outputs
-        
-    def __call__(self, input_data):
-        outputs = self.infer([input_data])
-        return outputs[0] if len(outputs) == 1 else outputs
+        def raw_infer(self, x:torch.Tensor):
+            [self._transfer_torch2cuda(x, mem) for x, mem in zip([x], self.inputs)]
+            self.context.execute_v2(bindings=self.bindings)
+            # outputs = [self._transfer_cuda2torch(mem) for mem in self.outputs]
+            self.stream.synchronize()
+            return []#outputs
+            
+        def __call__(self, input_data):
+            outputs = self.infer([input_data])
+            return outputs[0] if len(outputs) == 1 else outputs
+except:
+    pass
 
 class Processors:        
     class NumpyBGRToTorchRGB(ImageMatProcessor):
@@ -814,56 +817,56 @@ class Processors:
             yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
         
-    class YOLOTRT(YOLO):
-        title:str = 'YOLO_TRT_detections'
-        modelname: str = 'yolov5s6u.engine'
-        use_official_predict:bool = False
-        conf: float = 0.0001        
+    # class YOLOTRT(YOLO):
+    #     title:str = 'YOLO_TRT_detections'
+    #     modelname: str = 'yolov5s6u.engine'
+    #     use_official_predict:bool = False
+    #     conf: float = 0.0001        
 
-        def build_models(self,imgs_info: List[ImageMatInfo]):
-            config = dict(imgsz=self.imgsz,                           
-                        conf=self.conf,verbose=self.yolo_verbose,
-                        half=(self._torch_dtype==torch.float16))
-            self._models = {}
-            for i,d in enumerate(self.num_devices):
-                with torch.cuda.device(d):
-                    modelname = self.modelname.replace('.trt',(f'_{d}.trt').replace(':','@'))
-                    yolo = GeneralTensorRTInferenceModel(modelname,d,'images','output0')
-                self._models[d] = yolo
+    #     def build_models(self,imgs_info: List[ImageMatInfo]):
+    #         config = dict(imgsz=self.imgsz,                           
+    #                     conf=self.conf,verbose=self.yolo_verbose,
+    #                     half=(self._torch_dtype==torch.float16))
+    #         self._models = {}
+    #         for i,d in enumerate(self.num_devices):
+    #             with torch.cuda.device(d):
+    #                 modelname = self.modelname.replace('.trt',(f'_{d}.trt').replace(':','@'))
+    #                 yolo = GeneralTensorRTInferenceModel(modelname,d,'images','output0')
+    #             self._models[d] = yolo
                 
-            self.use_official_predict = False            
-            self.print('load mode by config :',config)
+    #         self.use_official_predict = False            
+    #         self.print('load mode by config :',config)
 
-        def predict(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[]):
-            yolo_results = []
-            for img,info in zip(imgs_data,imgs_info):
-                yolo_model = self._models[info.device]
-                print(img.device,img.dtype,yolo_model.device)
-                preds = yolo_model(img)
-                time.sleep(1)
-                # print(preds.shape,preds.dtype)
-                # print(preds[:,4:,:].max())
-            #     preds = ops.non_max_suppression(
-            #         preds,
-            #         self.conf,
-            #         self.nms_iou,
-            #         classes = None,
-            #         agnostic= False,
-            #         max_det = self.max_det,
-            #         nc      = len(self.class_names),
-            #         in_place= False,
-            #         end2end = False,
-            #         rotated = False,
-            #     )
-            #     if isinstance(preds, list):
-            #         yolo_results += preds
-            #     else:
-            #         yolo_results.append(preds)
-            # yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
-            # print(yolo_results_xyxycc)
-            yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
-            # print(yolo_results_xyxycc)
-            return [],yolo_results_xyxycc
+    #     def predict(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[]):
+    #         yolo_results = []
+    #         for img,info in zip(imgs_data,imgs_info):
+    #             yolo_model = self._models[info.device]
+    #             print(img.device,img.dtype,yolo_model.device)
+    #             preds = yolo_model(img)
+    #             time.sleep(1)
+    #             # print(preds.shape,preds.dtype)
+    #             # print(preds[:,4:,:].max())
+    #         #     preds = ops.non_max_suppression(
+    #         #         preds,
+    #         #         self.conf,
+    #         #         self.nms_iou,
+    #         #         classes = None,
+    #         #         agnostic= False,
+    #         #         max_det = self.max_det,
+    #         #         nc      = len(self.class_names),
+    #         #         in_place= False,
+    #         #         end2end = False,
+    #         #         rotated = False,
+    #         #     )
+    #         #     if isinstance(preds, list):
+    #         #         yolo_results += preds
+    #         #     else:
+    #         #         yolo_results.append(preds)
+    #         # yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+    #         # print(yolo_results_xyxycc)
+    #         yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
+    #         # print(yolo_results_xyxycc)
+    #         return [],yolo_results_xyxycc
         
     @staticmethod    
     def dumps(pipes:list[ImageMatProcessor]):
