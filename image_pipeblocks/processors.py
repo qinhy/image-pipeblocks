@@ -470,7 +470,7 @@ class Processors:
             #     torch_images.append(tensor_img)
             return torch_images
 
-    class NumpyGrayToTorchGray(ImageMatProcessor):
+    class NumpyGrayToTorchGray(NumpyBayerToTorchBayer):
         # to BCHW
         title:str='numpy_gray_to_torch_gray'
         gpu:bool=True
@@ -506,6 +506,28 @@ class Processors:
                     ).to(self._to_torch_dtype)
                 img = img.cpu().numpy()
                 img = img[..., [2,1,0]]  # Convert RGB to BGR
+                bgr_images+=[i for i in img]
+            return bgr_images
+
+    class TorchGrayToNumpyGray(ImageMatProcessor):
+        title:str='torchgay_to_numpy_gray'
+        _numpy_dtype:Any = ImageMatInfo.numpy_img_dtype()
+        _to_torch_dtype:Any = torch.uint8
+
+        def validate_img(self, img_idx, img):
+            img.require_torch_tensor()
+            img.require_BCHW()
+            img.require_GRAYSCALE()
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=ColorType.GRAYSCALE):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
+
+        def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            bgr_images = []
+            for img in imgs_data:
+                img = img.permute(0, 2, 3, 1).mul(255.0).clamp(0, 255
+                    ).to(self._to_torch_dtype)
+                img = img.cpu().numpy()
                 bgr_images+=[i for i in img]
             return bgr_images
 
@@ -1998,10 +2020,9 @@ class Processors:
             return [],yolo_results_xyxycc
         
     try:       
-        import pytorch_lightning as pl 
         class SegmentationModelsPytorch(ImageMatProcessor):
-            import pytorch_lightning as pl 
-            class SegmentationModel(pl.LightningModule):
+            import pytorch_lightning as _pl
+            class SegmentationModel(_pl.LightningModule):
                 def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
                                 encoder_weights='imagenet', in_channels=1, lr=1e-4):
                     super().__init__()
@@ -2038,7 +2059,11 @@ class Processors:
             title:str='segmentation_models_pytorch'
             ckpt_path:str
             device:str
-            _model:SegmentationModel = None
+            arch_name:str='Segformer'
+            encoder_name:str='efficientnet-b7'
+            encoder_weights:str='imagenet'
+            in_channels:int=1
+            _model:Optional[SegmentationModel] = None
 
             def model_post_init(self, context):
                 self._model = self.SegmentationModel.load_from_checkpoint(
@@ -2054,7 +2079,6 @@ class Processors:
                     return pred_masks
                     
             def validate_img(self, img_idx, img):
-                img.require_RGB()
                 img.require_BCHW()
                 img.require_torch_float()
 
