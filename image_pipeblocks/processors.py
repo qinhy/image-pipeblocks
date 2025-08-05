@@ -1924,7 +1924,7 @@ class Processors:
         def validate_img(self, img_idx, img: ImageMat):
             img.require_ndarray()
             img.require_np_uint()
-            win_name = f'{self.window_name_prefix}:{img_idx}'
+            win_name = f'{self.window_name_prefix}:{self.uuid}:{img_idx}'
             self.window_names.append(win_name)
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL if self.resizable else cv2.WINDOW_AUTOSIZE)
 
