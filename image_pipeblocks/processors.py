@@ -298,9 +298,6 @@ class Processors:
             self.hs.append(new_h)
             self.ws.append(new_w)
 
-        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
-            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
-
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
             processed_imgs = []
             for i,img in enumerate(imgs_data):
@@ -308,6 +305,30 @@ class Processors:
                 processed_imgs.append(img[:h, :w])
             return processed_imgs
   
+    class GaussianBlur(ImageMatProcessor):
+        title: str = 'gaussian_blur'
+        ksize: int = 5
+        sigma: float = 0
+
+        def model_post_init(self, context):
+            self.ksize = self.ksize if self.ksize % 2 == 1 else self.ksize + 1  # Ensure it's odd
+            return super().model_post_init(context)
+
+        def validate_img(self, img_idx, img):
+            img.require_np_uint()
+            img.require_HW_or_HWC()
+            # Optionally validate that image is large enough for blur
+            h, w = img.info.H, img.info.W
+            if h < self.ksize or w < self.ksize:
+                raise ValueError(f"Image at index {img_idx} is smaller than the kernel size.")
+
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
+            processed_imgs = []
+            for img in imgs_data:
+                blurred = cv2.GaussianBlur(img, (self.ksize, self.ksize), self.sigma)
+                processed_imgs.append(blurred)
+            return processed_imgs
+        
     class CvDebayer(ImageMatProcessor):
         title:str='cv_debayer'
         format:int=cv2.COLOR_BAYER_BG2BGR
