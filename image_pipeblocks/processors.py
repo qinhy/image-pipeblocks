@@ -12,7 +12,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 import uuid
 
 # ===============================
@@ -181,7 +181,7 @@ try:
             )
             return out_tensor
 
-        def infer(self, inputs: list[torch.Tensor]):
+        def infer(self, inputs: List[torch.Tensor]):
             x = inputs[0]
             assert torch.is_tensor(x), "Input must be a torch.Tensor!"
             assert x.is_cuda, "Torch input must be on CUDA!"
@@ -230,10 +230,10 @@ class Processors:
 
         def forward_raw(
             self,
-            imgs_data: List[np.ndarray|torch.Tensor],
+            imgs_data: List[Union[np.ndarray,torch.Tensor]],
             imgs_info: Optional[List[ImageMatInfo]] = None,
             meta: Optional[dict] = None
-        ) -> List[np.ndarray|torch.Tensor]:
+        ) -> List[Union[np.ndarray,torch.Tensor]]:
             self._backup_mats = []
             for i,img in enumerate(imgs_data):
                 img = self._mat_funcs[i].copy_mat(img)                
@@ -288,7 +288,7 @@ class Processors:
                 else:
                     return {}
             
-            def get_latlon(self)->list[float]:
+            def get_latlon(self)->List[float]:
                 if self._gps:
                     s = self._gps.get_state()
                     return [s.lat,s.lon]
@@ -323,8 +323,8 @@ class Processors:
 
     class CropToDivisibleBy32(ImageMatProcessor):
         title: str = 'crop_to_divisible_by_32'
-        hs:list[int] = []
-        ws:list[int] = []
+        hs:List[int] = []
+        ws:List[int] = []
         
         def validate_img(self, img_idx, img):
             img.require_np_uint()
@@ -691,8 +691,8 @@ class Processors:
             tile_width:int
             tile_height:int
 
-            col_widths:list[int]
-            row_heights:list[int]
+            col_widths:List[int]
+            row_heights:List[int]
 
             total_width:int
             total_height:int
@@ -704,7 +704,7 @@ class Processors:
         tile_width:int
         layout:Optional[Layout] = None
 
-        def _init_layout(self, imgs:list[ImageMat]):
+        def _init_layout(self, imgs:List[ImageMat]):
             imgs_info = [i.info for i in imgs]
             num_images = len(imgs_info)
             if num_images == 0:
@@ -942,7 +942,7 @@ class Processors:
         fps: int = 30
         overlay_text: Optional[str] = None
         total_imgs:int=0
-        WHs:list[tuple[int,int]] = []
+        WHs:List[Tuple[int,int]] = []
         frame_interval:float=0.0
         subset_s:int = 20 # seconds
         _workers: List['Processors.CvVideoRecorder.VideoWriterWorker'] = []
@@ -1401,9 +1401,9 @@ class Processors:
         title: str = "sliding_window"
         stride: Optional[Tuple[int, int]] = None
         window_size: Tuple[int, int] = (1280, 1280)
-        imgs_idx:dict[int,list] = {}
-        # input_imgs_info:list[ImageMatInfo] = []
-        output_offsets_xyxy:list[ List[Tuple[int, int, int, int]] ] = []
+        imgs_idx:Dict[int,list] = {}
+        # input_imgs_info:List[ImageMatInfo] = []
+        output_offsets_xyxy:List[ List[Tuple[int, int, int, int]] ] = []
         save_results_to_meta:bool =True
 
         def validate_img(self, img_idx:int, img:ImageMat):
@@ -1418,7 +1418,7 @@ class Processors:
 
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             # 1:N mapping
-            out_mats:list[ImageMat] = []
+            out_mats:List[ImageMat] = []
             for i,v in self.imgs_idx.items():
                 img = validated_imgs[i]
                 out_mats += [img for _ in v]
@@ -1430,7 +1430,7 @@ class Processors:
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             
-            out_imgs:list[np.ndarray] = []
+            out_imgs:List[np.ndarray] = []
             output_offsets_xyxy = []
             imgs_idx = {}
 
@@ -1523,7 +1523,7 @@ class Processors:
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             color_types = []
             for img_idx,info in enumerate(self._sliding_window_splitter.input_mats):
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
+                offsets:List[Tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 tile_idx = tile_indices[-1]
                 color_types.append(validated_imgs[tile_idx].info.color_type)
@@ -1547,7 +1547,7 @@ class Processors:
                     else:
                         merged = np.zeros((H, W), dtype=np.uint8)
 
-                offsets:list[tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
+                offsets:List[Tuple[int,int,int,int]] = self._sliding_window_splitter.output_offsets_xyxy[img_idx]
                 tile_indices:list = self._sliding_window_splitter.imgs_idx[img_idx]
                 for i,tile_idx in enumerate(tile_indices):
                     x1, y1, x2, y2 = offsets[i]
@@ -1568,7 +1568,7 @@ class Processors:
 
         modelname: str = 'yolov5s6u.pt'
         imgsz: int = -1
-        conf: Union[float,dict[int,float]] = 0.6
+        conf: Union[float,Dict[int,float]] = 0.6
         min_conf: float = 0.6
         max_det: int = 300
         class_names: Optional[Dict[int, str]] = None
@@ -1581,7 +1581,7 @@ class Processors:
 
         nms_iou:float = 0.7
         _models:dict = {}
-        devices:list[str] = []
+        devices:List[str] = []
 
         def change_model(self,modelname:str):
             self.modelname = modelname
@@ -1711,7 +1711,7 @@ class Processors:
                     yolo_results += preds
                 else:
                     yolo_results.append(preds)
-            yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+            yolo_results_xyxycc:List[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
 
     class SimpleTracking(ImageMatProcessor):
@@ -1722,12 +1722,14 @@ class Processors:
         
         detector_uuid:str
         frame_cnt:int = 0
-        frame_recs:list[dict[int,deque[Tuple[int,ImageMat|None]]]] = []
+        # frame_recs:List[Dict[int,deque[Tuple[int,Optional[ImageMat]]]]] = []
+        frame_recs:List = []
             # {0:0,1:0,2:0}, # each class continuous cnt
-        frame_save_queue:queue.Queue[tuple[str,list[ImageMat]]] = queue.Queue()
+        # frame_save_queue:queue.Queue[Tuple[str,List[ImageMat]]] = queue.Queue()
+        frame_save_queue:List = queue.Queue()
         frame_save_queue_len:int= 1000
         class_names:Dict[str,str] = {}
-        all_cls_id:set[int] = set()
+        all_cls_id:Set[int] = set()
 
         save_jpeg:bool=False
         save_mp4:bool=False
@@ -1779,7 +1781,7 @@ class Processors:
                 class_name,imagemat_list = self.frame_save_queue.get()
                 if imagemat_list is None:return
 
-                timestamp = imagemat_list[len(imagemat_list)//2].timestamp
+                timestamp = imagemat_List[len(imagemat_list)//2].timestamp
                 # Create timezone-aware UTC datetime
                 dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                 # Convert to (UTC+N)
@@ -1805,7 +1807,7 @@ class Processors:
                     writer.release()
                 self.frame_save_queue.task_done()
 
-        def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
+        def forward_raw(self, imgs_data:List[np.ndarray], imgs_info = ..., meta=...):
             self.frame_cnt += 1
             if self.detector_uuid:
                 self._det_processor = meta[self.detector_uuid]
@@ -1900,7 +1902,7 @@ class Processors:
             img.require_BGR()
             img.require_HWC()
         
-        def forward_raw(self, imgs_data:list[np.ndarray], imgs_info = ..., meta=...):
+        def forward_raw(self, imgs_data:List[np.ndarray], imgs_info = ..., meta=...):
             res = []
                 
             if self.yolo_uuid:
@@ -1982,8 +1984,8 @@ class Processors:
         scale: Optional[float] = Field(default=None, description="Scale factor for displayed image")
         overlay_texts: List[str] = Field(default_factory=list, description="Text overlays for images")
         save_on_key: Optional[int] = Field(default=ord('s'), description="Key code to trigger image save")
-        window_names:list[str] = []
-        mouse_pos:tuple[int,int] = (0, 0)  # for showing mouse coords
+        window_names:List[str] = []
+        mouse_pos:Tuple[int,int] = (0, 0)  # for showing mouse coords
 
         yolo_uuid: Optional[str] = Field(default=None, description="UUID key to fetch YOLO results from meta")
         _yolo_processor: 'Processors.YOLO' = None
@@ -2090,8 +2092,8 @@ class Processors:
                     yolo_results += preds
                 else:
                     yolo_results.append(preds)
-            yolo_results_xyxycc:list[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
-            # yolo_results_xyxycc:list[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
+            yolo_results_xyxycc:List[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
+            # yolo_results_xyxycc:List[np.ndarray] = [np.empty((0, 6), dtype=np.float32) for _ in range(4)]
             return [],yolo_results_xyxycc
         
     try:       
@@ -2166,18 +2168,18 @@ class Processors:
         
 class ImageMatProcessors(BaseModel):
     @staticmethod    
-    def dumps(pipes:list[ImageMatProcessor]):
+    def dumps(pipes:List[ImageMatProcessor]):
         return json.dumps([p.model_dump() for p in pipes])
     
     @staticmethod
-    def loads(pipes_json:str)->list[ImageMatProcessor]:
+    def loads(pipes_json:str)->List[ImageMatProcessor]:
         processors = {k: v for k, v in Processors.__dict__.items() if '__' not in k}
         return [processors[f'{p["uuid"].split(":")[0]}'](**p) 
                 for p in json.loads(pipes_json)]
 
     @staticmethod    
     def run_once(imgs,meta={},
-            pipes:list['ImageMatProcessor']=[],
+            pipes:List['ImageMatProcessor']=[],
             validate=False):
         try:
             for fn in pipes:
@@ -2189,7 +2191,7 @@ class ImageMatProcessors(BaseModel):
         
     @staticmethod    
     def run(gen,
-            pipes:list['ImageMatProcessor']=[],
+            pipes:List['ImageMatProcessor']=[],
             meta = {},validate_once=False):
         if isinstance(pipes, str):
             pipes = ImageMatProcessors.loads(pipes)
@@ -2199,7 +2201,7 @@ class ImageMatProcessors(BaseModel):
 
     @staticmethod    
     def validate_once(gen,
-            pipes:list['ImageMatProcessor']=[]):
+            pipes:List['ImageMatProcessor']=[]):
         ImageMatProcessors.run(gen,pipes,validate_once=True)
 
     @staticmethod
@@ -2211,7 +2213,7 @@ class ImageMatProcessors(BaseModel):
                 imgs,meta = fn(imgs,meta)
 
     @staticmethod
-    def run_async(pipes: list[ImageMatProcessor] | str):
+    def run_async(pipes: Union[List[ImageMatProcessor] , str]):
         if isinstance(pipes, str):
             pipes_serialized = pipes
         else:

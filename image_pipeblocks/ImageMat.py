@@ -241,7 +241,7 @@ class ImageMat(BaseModel):
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
     timestamp:float = 0
-    _img_data: np.ndarray|torch.Tensor = None
+    _img_data: Union[np.ndarray,torch.Tensor] = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
@@ -430,12 +430,12 @@ class ImageMatProcessor(BaseModel):
     out_mats: List[ImageMat] = []
     meta:dict = {}
     
-    num_devices:list[str] = ['cpu']
+    num_devices:List[str] = ['cpu']
     num_gpus:int = 0
     _enable:bool = True
-    _eye:list = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    _eye:List = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 
-    _mat_funcs:list[MatOps] = []
+    _mat_funcs:List[MatOps] = []
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True
