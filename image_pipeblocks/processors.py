@@ -2100,7 +2100,7 @@ class Processors:
         class SegmentationModelsPytorch(ImageMatProcessor):
             import pytorch_lightning as _pl
             class SegmentationModel(_pl.LightningModule):
-                def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
+                def __init__(self, arch_name='DeepLabV3Plus', encoder_name='efficientnet-b7',
                                 encoder_weights='imagenet', in_channels=1, lr=1e-4):
                     super().__init__()
                     import segmentation_models_pytorch as smp
@@ -2136,7 +2136,7 @@ class Processors:
             title:str='segmentation_models_pytorch'
             ckpt_path:str
             device:str
-            arch_name:str='Segformer'
+            arch_name:str='DeepLabV3Plus'
             encoder_name:str='efficientnet-b7'
             encoder_weights:str='imagenet'
             in_channels:int=1
