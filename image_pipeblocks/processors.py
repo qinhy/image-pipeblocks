@@ -251,6 +251,7 @@ class Processors:
         
     class Lambda(ImageMatProcessor):
         title:str='lambda'
+        config:dict={}
         out_color_type:ColorType = ColorType.UNKNOWN
         _forward_raw:Callable = lambda imgs_data, imgs_info, meta:None
 
