@@ -212,6 +212,43 @@ class Processors:
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
             return imgs_data
     
+    class BackUp(ImageMatProcessor):
+        title: str = 'output_backup'
+        device: str = ''
+        save_results_to_meta: bool = True
+        _backup_mats: List[ImageMat] = []
+
+        def validate_img(self, idx, img:ImageMat):
+            self.init_common_utility_methods(idx,img.is_ndarray())
+
+        def get_backup_mats(self) -> List[ImageMat]:
+            backup_mats = [
+                ImageMat(color_type=inimg.info.color_type).build(img)
+                for img,inimg in zip(self._backup_mats, self.input_mats)
+            ]
+            return backup_mats
+
+        def forward_raw(
+            self,
+            imgs_data: List[np.ndarray|torch.Tensor],
+            imgs_info: Optional[List[ImageMatInfo]] = None,
+            meta: Optional[dict] = None
+        ) -> List[np.ndarray|torch.Tensor]:
+            self._backup_mats = []
+            for i,img in enumerate(imgs_data):
+                img = self._mat_funcs[i].copy_mat(img)                
+                if self.device == 'cpu' and isinstance(img, torch.Tensor):
+                    if img.dtype != np.uint8 or img.dtype != torch.uint8:
+                        img = img*255.0
+                        img = self._mat_funcs[i].astype_uint8(img)
+                    img = self._mat_funcs[i].to_numpy(img)
+                    if img.shape[0] == 1:
+                        img = img[0]
+                    if img.shape[-1] == 1:
+                        img = img[..., 0]
+                self._backup_mats.append(img)
+            return imgs_data
+        
     class Lambda(ImageMatProcessor):
         title:str='lambda'
         out_color_type:ColorType = ColorType.UNKNOWN
