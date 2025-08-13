@@ -956,13 +956,13 @@ class Processors:
             if img.is_ndarray():
                 img.require_ndarray()
                 img.require_np_uint()
-                img.require_BGR()
-                img.require_HWC()
+                # img.require_BGR()
+                img.require_HW_or_HWC()
                 self.total_imgs+=1
                 self.WHs.append((img.info.W,img.info.H))
             if img.is_torch_tensor():                
                 img.require_torch_float()
-                img.require_RGB()
+                # img.require_RGB()
                 img.require_BCHW()
                 self.total_imgs+=img.info.B
                 for i in range(img.info.B):
@@ -999,9 +999,31 @@ class Processors:
             for w in self._workers: w.stop()
             self._workers = []
 
+        def _ensure_three_channels(self, x: Union[np.ndarray, torch.Tensor]):            
+            if isinstance(x, np.ndarray):
+                if x.ndim == 2:                 # H,W -> H,W,3
+                    x = np.repeat(x[..., None], 3, axis=-1)
+                elif x.ndim == 3:
+                    # H,W,1 -> H,W,3
+                    if x.shape[-1] == 1:
+                        x = np.repeat(x, 3, axis=-1)
+                return x
+            if isinstance(x, torch.Tensor):
+                if x.ndim == 4:
+                    # NCHW
+                    if x.shape[1] in (1, 3):
+                        if x.shape[1] == 1:      # N,1,H,W -> N,3,H,W
+                            x = x.repeat(1, 3, 1, 1)
+                return x
+            return x
+        
         def forward_raw(self,imgs_data: List[np.ndarray],imgs_info: List[ImageMatInfo] = [],meta={},) -> List[np.ndarray]:
             cnt=0
+            if len(self._workers)==0:
+                self.start()
+
             for idx, frame in enumerate(imgs_data):
+                frame = self._ensure_three_channels(frame)
                 try:
                     if isinstance(frame,np.ndarray):
                         self._workers[cnt].queue.put_nowait(frame)
