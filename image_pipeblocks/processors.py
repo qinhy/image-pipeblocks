@@ -255,8 +255,9 @@ class Processors:
         out_color_type:ColorType = ColorType.UNKNOWN
         _forward_raw:Callable = lambda imgs_data, imgs_info, meta:None
 
-        def validate_img(self, img_idx, img):
-            pass
+        def validate_img(self, img_idx, img):            
+            self.init_common_utility_methods(img_idx,img.is_ndarray())
+
         def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
             if self.out_color_type != ColorType.UNKNOWN:
                 color_type = self.out_color_type
@@ -622,7 +623,7 @@ class Processors:
             """
             resized_images = []
             for img in imgs_data:
-                resized_img = F.interpolate(img, size=self.target_size, mode=self.mode, align_corners=False)
+                resized_img = F.interpolate(img, size=self.target_size, mode=self.mode)
                 resized_images.append(resized_img)
             return resized_images
 
