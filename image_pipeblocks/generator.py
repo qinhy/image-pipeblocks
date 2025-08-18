@@ -382,10 +382,20 @@ class BitFlowFrameGenerator(ImageMatGenerator):
     _frame_generators: list = []    
     _mats:list[ImageMat] = []
 
-    def create_frame_generator(self, idx,source):
+    def create_frame_generator(self, idx, source):    
         try:
             self.color_types = [ColorType.BAYER for _ in range(len(self.sources))]
-            return self.register_resource(BitFlowFrameGenerator.BitFlowCamera(source))
+            cap = self.register_resource(BitFlowFrameGenerator.BitFlowCamera(source))     
+            def gen(cap=cap):
+                cnt=-1
+                while True:
+                    frame = cap.read()
+                    if frame is None:
+                        # No frame arrived within timeout -> end the iteration step
+                        raise StopIteration("No frame available (timed out).")
+                    cnt += 1
+                    yield frame
+            return gen()
         except Exception as e:
             self.release()
             raise e

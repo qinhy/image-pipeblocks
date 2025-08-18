@@ -37,7 +37,11 @@ from ultralytics.utils import ops
 # ===============================
 from .shmIO import NumpyUInt8SharedMemoryStreamIO
 from .ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, ShapeType
-
+  
+try:    
+    from .gps import BaseGps, FileReplayGps, UsbGps
+except Exception as e:
+    print(e)
 
 logger = print
 
@@ -227,17 +231,15 @@ class Processors:
             return self._forward_raw(imgs_data, imgs_info, meta)
         
     try:        
+        from .gps import BaseGps, FileReplayGps, UsbGps 
         class GPS(ImageMatProcessor):
-            from .gps import BaseGps, FileReplayGps, UsbGps
-
             title:str='get_gps'
             port:str = 'gps.jsonl'
             save_results_to_meta:bool = True
-            _gps:BaseGps = None
+            _gps:Optional[BaseGps] = None
 
             @staticmethod
-            def coms():                
-                from .gps import BaseGps
+            def coms():
                 return BaseGps.coms()
 
             def change_port(self,port:str):
@@ -268,7 +270,7 @@ class Processors:
                 del self._gps
                 return super().off()
 
-            def ini_gps(self):            
+            def ini_gps(self):   
                 if os.path.isfile(self.port):
                     self._gps:BaseGps = FileReplayGps()
                 else:                
@@ -281,8 +283,8 @@ class Processors:
 
             def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
                 return imgs_data
-    except:
-        pass
+    except Exception as e:
+        print(e)
 
     class CropToDivisibleBy32(ImageMatProcessor):
         title: str = 'crop_to_divisible_by_32'
