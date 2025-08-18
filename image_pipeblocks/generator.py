@@ -18,8 +18,8 @@ from .ImageMat import ColorType, ImageMat
 logger = print
 
 class ImageMatGenerator(BaseModel):
-    sources: list[str]
-    color_types: list['ColorType']
+    sources: List[str]
+    color_types: List['ColorType']
     uuid: str = ''
     shmIO_mode: Literal[False,'writer','reader'] = False
     fps:int = -1
@@ -27,7 +27,7 @@ class ImageMatGenerator(BaseModel):
 
     _resources: list = []
     _frame_generators: list = []
-    ouput_mats:list[ImageMat] = []
+    ouput_mats:List[ImageMat] = []
 
     def model_post_init(self, context):
         self._min_frame_time = 1.0 / self.fps if self.fps != 0 else 0
@@ -117,7 +117,7 @@ class ImageMatGenerator(BaseModel):
         return None
 
 class CvVideoFrameGenerator(ImageMatGenerator):    
-    color_types: list['ColorType'] = []
+    color_types: List['ColorType'] = []
     
     def create_frame_generator(self, idx,source):
         if idx>=len(self.color_types):
@@ -145,8 +145,8 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
     """
     Generator that produces synchronized [depth, rgb] ImageMat frames from an XVSDK RGB-D camera.
     """
-    sources:list[str]=[]
-    color_types:list[str]=["bgr", "bgr"]
+    sources:List[str]=[]
+    color_types:List[str]=["bgr", "bgr"]
     max_frames: Optional[int] = None
 
     def model_post_init(self, context):
@@ -183,10 +183,10 @@ class XVSdkRGBDGenerator(ImageMatGenerator):
                 pass
             self._running = False
 
-    def __iter__(self) -> Iterator[list[ImageMat]]:
+    def __iter__(self) -> Iterator[List[ImageMat]]:
         return self
 
-    def __next__(self) -> list[ImageMat]:
+    def __next__(self) -> List[ImageMat]:
         if not self._running or (self.max_frames is not None and self._frame_idx >= self.max_frames):
             self.release()
             raise StopIteration
@@ -377,10 +377,10 @@ class BitFlowFrameGenerator(ImageMatGenerator):
     """
     Frame generator for multiple BitFlow cameras.
     """
-    sources:list[str] = ['bitflow-0']
-    _resources:list['BitFlowFrameGenerator.BitFlowCamera'] = []
+    sources:List[str] = ['bitflow-0']
+    _resources:List['BitFlowFrameGenerator.BitFlowCamera'] = []
     _frame_generators: list = []    
-    _mats:list[ImageMat] = []
+    _mats:List[ImageMat] = []
 
     def create_frame_generator(self, idx, source):    
         try:
@@ -401,7 +401,7 @@ class BitFlowFrameGenerator(ImageMatGenerator):
             raise e
 
 class NumpyRawFrameFileGenerator(ImageMatGenerator):
-    color_types: list['ColorType']
+    color_types: List['ColorType']
     def create_frame_generator(self, idx,source):
         arr = np.load(source)
         def gen(arr=arr):

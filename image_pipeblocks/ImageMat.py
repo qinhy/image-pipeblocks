@@ -41,6 +41,110 @@ COLOR_TYPE_CHANNELS = {
 torch_img_dtype = torch.float16
 numpy_img_dtype = np.uint8
 
+class MatOps:
+    int32=np.int32
+    uint8=np.uint8
+    float32=np.float32
+    float16=np.float16
+    def mat(self, pylist, dtype, device=None): raise NotImplementedError()
+    def eye(self, size, dtype, device=None): raise NotImplementedError()
+    def ones(self, shape, dtype, device=None): raise NotImplementedError()
+    def zeros(self, shape, dtype, device=None): raise NotImplementedError() 
+    def hstack(self, arrays): raise NotImplementedError()
+    def norm(self, x): raise NotImplementedError()
+    def dot(self, a, b): raise NotImplementedError()
+    def cross(self, a, b): raise NotImplementedError()
+    def matmul(self, a, b): raise NotImplementedError()
+    def to_numpy(self, x)->np.ndarray: raise NotImplementedError()
+    def mean(self, x, dim=0): raise NotImplementedError()
+    def median(self, x, dim=0): raise NotImplementedError()
+    def std(self, x, dim=0): raise NotImplementedError()
+    def max(self, x, dim=0): raise NotImplementedError()
+    def min(self, x, dim=0): raise NotImplementedError()
+    def abs(self, x): raise NotImplementedError()
+    def stack(self, xs, dim=0): raise NotImplementedError()
+    def cat(self, xs, dim=0): raise NotImplementedError()
+    def reshape(self, x, shape): raise NotImplementedError()
+    def copy_mat(self, x): raise NotImplementedError()
+    def logical_and(self, a, b): raise NotImplementedError()
+    def logical_or(self, a, b): raise NotImplementedError()
+    def clip(self, x, min_val, max_val): raise NotImplementedError()    
+    def astype_int32(self, x): raise NotImplementedError()
+    def astype_uint8(self, x): raise NotImplementedError()
+    def astype_float32(self, x): raise NotImplementedError()    
+    def astype_float16(self, x): raise NotImplementedError()
+    def nonzero(self, x): raise NotImplementedError()
+
+class NumpyMatOps(MatOps):
+    int32=np.int32
+    uint8=np.uint8
+    float32=np.float32
+    float16=np.float16
+    def mat(self, pylist, dtype, device=None): return np.array(pylist, dtype=dtype)
+    def eye(self, size, dtype, device=None): return np.eye(size, dtype=dtype)
+    def ones(self, shape, dtype, device=None): return np.ones(shape, dtype=dtype)
+    def zeros(self, shape, dtype, device=None): return np.zeros(shape, dtype=dtype)
+    def hstack(self, arrays): return np.hstack(arrays)
+    def norm(self, x): return np.linalg.norm(x)
+    def dot(self, a, b): return np.dot(a, b)
+    def cross(self, a, b): return np.cross(a, b)
+    def matmul(self, a, b): return a @ b
+    def to_numpy(self, x)->np.ndarray: return x
+    def mean(self, x, dim=0): return np.mean(x, axis=dim)
+    def median(self, x, dim=0): return np.median(x, axis=dim)
+    def std(self, x, dim=0): return np.std(x, axis=dim)
+    def max(self, x, dim=0): return np.max(x, axis=dim)
+    def min(self, x, dim=0): return np.min(x, axis=dim)
+    def abs(self, x): return np.abs(x)
+    def stack(self, xs, dim=0): return np.stack(xs, axis=dim)
+    def cat(self, xs, dim=0): return np.concatenate(xs, axis=dim)
+    def reshape(self, x, shape): return np.reshape(x, shape)
+    def copy_mat(self, x): return x.copy()
+    def logical_and(self, a, b): return np.logical_and(a, b)
+    def logical_or(self, a, b): return np.logical_or(a, b)
+    def clip(self, x, min_val, max_val): return np.clip(x, min_val, max_val)  
+    def astype_int32(self, x): return x.astype(np.int32)
+    def astype_uint8(self, x): return x.astype(np.uint8)
+    def astype_float32(self, x): return x.astype(np.float32)        
+    def astype_float16(self, x): return x.astype(np.float16)
+    def nonzero(self, x) : return np.nonzero(x)
+
+
+class TorchMatOps(MatOps):
+    int32=torch.int32
+    uint8=torch.uint8
+    float32=torch.float32
+    float16=torch.float16
+    def mat(self, pylist, dtype, device=None): return torch.tensor(pylist, dtype=dtype, device=device)
+    def eye(self, size, dtype, device=None): return torch.eye(size, dtype=dtype, device=device)
+    def ones(self, shape, dtype, device=None): return torch.ones(shape, dtype=dtype, device=device)
+    def zeros(self, shape, dtype, device=None): return torch.zeros(shape, dtype=dtype, device=device)
+    def hstack(self, arrays): return torch.cat(arrays, dim=1)
+    def norm(self, x): return torch.norm(x)
+    def dot(self, a, b): return torch.dot(a, b)
+    def cross(self, a, b): return torch.cross(a, b)
+    def matmul(self, a, b): return torch.matmul(a, b)
+    def to_numpy(self, x)->np.ndarray: return x.detach().permute(0, 2, 3, 1).cpu().numpy()
+    def mean(self, x, dim=0): return torch.mean(x, dim=dim)
+    def median(self, x, dim=0): return torch.median(x, dim=dim).values
+    def std(self, x, dim=0): return torch.std(x, dim=dim, unbiased=False)
+    def max(self, x, dim=0): return torch.max(x, dim=dim).values
+    def min(self, x, dim=0): return torch.min(x, dim=dim).values
+    def abs(self, x): return torch.abs(x)
+    def stack(self, xs, dim=0): return torch.stack(xs, dim=dim)
+    def cat(self, xs, dim=0): return torch.cat(xs, dim=dim)
+    def reshape(self, x, shape): return x.reshape(shape)
+    def copy_mat(self, x): return x.clone()
+    def logical_and(self, a, b): return torch.logical_and(a, b)
+    def logical_or(self, a, b): return torch.logical_or(a, b)
+    def clip(self, x, min_val, max_val): return torch.clamp(x, min=min_val, max=max_val)
+    def astype_int32(self, x): return x.type(dtype=torch.int32)
+    def astype_uint8(self, x): return x.type(dtype=torch.uint8)
+    def astype_float32(self, x): return x.type(dtype=torch.float32)
+    def astype_float16(self, x): return x.type(dtype=torch.float16)
+    def nonzero(self, x) : return torch.nonzero(x)
+
+
 class ImageMatInfo(BaseModel):
 
     class TorchDtype(BaseModel):
@@ -137,7 +241,7 @@ class ImageMat(BaseModel):
     info: Optional[ImageMatInfo] = None
     color_type: Union[str, ColorType]
     timestamp:float = 0
-    _img_data: np.ndarray|torch.Tensor = None
+    _img_data: Union[np.ndarray,torch.Tensor] = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
@@ -326,14 +430,22 @@ class ImageMatProcessor(BaseModel):
     out_mats: List[ImageMat] = []
     meta:dict = {}
     
-    num_devices:list[str] = ['cpu']
+    num_devices:List[str] = ['cpu']
     num_gpus:int = 0
     _enable:bool = True
-    _eye:list = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    _eye:List = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+    _mat_funcs:List[MatOps] = []
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True
     )
+
+    def init_common_utility_methods(self,idx,is_ndarray=True):
+        if idx<len(self._mat_funcs):
+            self._mat_funcs[idx] = NumpyMatOps() if is_ndarray else TorchMatOps()
+        else:            
+            self._mat_funcs.append( NumpyMatOps() if is_ndarray else TorchMatOps() )
 
     def print(self,*args):
         print(f'##############[{self.uuid}]#################')

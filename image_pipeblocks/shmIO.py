@@ -161,7 +161,7 @@ class CommonStreamIO(CommonIO):
     class StreamReader(CommonIO.Reader, Base):
         id: str= Field(default_factory=lambda:f"CommonStreamIO.StreamReader:{uuid.uuid4()}")
         
-        def read(self)->tuple[Any,dict]:
+        def read(self)->Tuple[Any,dict]:
             return super().read(),{}
         
         def __iter__(self):
