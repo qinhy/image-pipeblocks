@@ -2158,6 +2158,7 @@ class Processors:
 
             title:str='segmentation_models_pytorch'
             ckpt_path:str
+            current_ckpt_path:str=''
             device:str
             arch_name:str='DeepLabV3Plus'
             encoder_name:str='efficientnet-b7'
@@ -2166,11 +2167,15 @@ class Processors:
             _model:Optional[SegmentationModel] = None
 
             def model_post_init(self, context):
-                self._model = self.SegmentationModel.load_from_checkpoint(
-                    self.ckpt_path,map_location=torch.device(self.device))
-                self._model.eval()
+                self.load_segmentation_model()
                 return super().model_post_init(context)
             
+            def load_segmentation_model(self):
+                self._model = self.SegmentationModel.load_from_checkpoint(
+                    self.ckpt_path,map_location=torch.device(self.device))
+                self.current_ckpt_path = self.ckpt_path
+                self._model.eval()
+
             def infer(self,imgs):
                 with torch.no_grad():
                     test_inputs = imgs.to(self._model.device)
@@ -2183,6 +2188,8 @@ class Processors:
                 img.require_torch_float()
 
             def forward_raw(self, imgs_data: List[torch.Tensor], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[torch.Tensor]:
+                if self.current_ckpt_path != self.ckpt_path:
+                    self.load_segmentation_model()
                 imgs_data = [self.infer(i) for i in imgs_data]
                 return imgs_data        
     except:
