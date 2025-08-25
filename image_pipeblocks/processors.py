@@ -2289,10 +2289,10 @@ class Processors:
                             logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
                         return self._unpad(logits, pad_hw)
                     
-                class BCEDiceLoss(nn.Module):
+                class BCEDiceLoss(torch.nn.Module):
                     def __init__(self, bce_weight=0.5, dice_weight=0.5):
                         super().__init__()
-                        self.bce = nn.BCEWithLogitsLoss()
+                        self.bce = torch.nn.BCEWithLogitsLoss()
                         self.bce_weight = bce_weight
                         self.dice_weight = dice_weight
 
@@ -2305,7 +2305,7 @@ class Processors:
                         dice_loss = 1 - dice
                         return self.bce_weight * bce_loss + self.dice_weight * dice_loss.mean()
                     
-                class FocalDiceLoss(nn.Module):
+                class FocalDiceLoss(torch.nn.Module):
                     def __init__(self, alpha=0.8, gamma=2.0, dice_weight=0.5):
                         super().__init__()
                         self.alpha = alpha
@@ -2332,7 +2332,7 @@ class Processors:
                         dl = self.dice_loss(probs, targets)
                         return (1 - self.dice_weight) * fl + self.dice_weight * dl        
 
-                class TverskyDiceLoss(nn.Module):
+                class TverskyDiceLoss(torch.nn.Module):
                     def __init__(self, alpha=0.3, beta=0.7, tversky_weight=0.5, smooth=1e-6):
                         super().__init__()
                         self.alpha = alpha
@@ -2357,9 +2357,10 @@ class Processors:
                         return self.tversky_weight * tversky_loss + (1 - self.tversky_weight) * dice_loss
 
                 def __init__(self, arch_name='DeepLabV3Plus', encoder_name='efficientnet-b7',
-                            encoder_weights='imagenet', in_channels=1, lr=1e-4):
+                            encoder_weights='imagenet', in_channels=1, lr=1e-4,
+                            dinov3_hub_repo_dir:str=None, dinov3_hub_weights:str=None):
                     super().__init__()
-                    self.loss_fn = SegmentationModel.BCEDiceLoss()
+                    self.loss_fn = self.BCEDiceLoss()
                     self.arch_name = arch_name
                     self.encoder_name = encoder_name
                     self.encoder_weights = encoder_weights
@@ -2371,10 +2372,14 @@ class Processors:
 
                     if "dinov3" in str(arch_name).lower():
                         # ---- DINOv3 branch (LOCAL hub) ----
-                        self.model = SegmentationModel.DINOv3Seg(
+                        if dinov3_hub_repo_dir is None:
+                            dinov3_hub_repo_dir=self.arch_name
+                        if dinov3_hub_weights is None:
+                            dinov3_hub_weights=self.encoder_weights
+                        self.model = self.DINOv3Seg(
                             variant=encoder_name,
-                            hub_repo_dir=arch_name,
-                            hub_weights=encoder_weights,
+                            hub_repo_dir=dinov3_hub_repo_dir,
+                            hub_weights=dinov3_hub_weights,
                             in_channels=in_channels,
                         )
                         # Use ImageNet normalization by default (DINO pretraining uses RGB stats)
@@ -2387,6 +2392,7 @@ class Processors:
                         self.register_buffer("std", std)
 
                     else:
+                        import segmentation_models_pytorch as smp
                         # --- your original SMP path ---
                         self.model = smp.create_model(
                             self.arch_name,
