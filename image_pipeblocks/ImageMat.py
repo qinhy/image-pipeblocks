@@ -238,10 +238,10 @@ class ImageMat(BaseModel):
         is_signed: bool
         itemsize: int
 
-    info: Optional[ImageMatInfo] = None
+    info: ImageMatInfo = ImageMatInfo()
     color_type: Union[str, ColorType]
     timestamp:float = 0
-    _img_data: Union[np.ndarray,torch.Tensor] = None
+    _img_data: np.ndarray|torch.Tensor = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
@@ -419,8 +419,8 @@ class ImageMatProcessor(BaseModel):
     bounding_box_owner_uuid: Optional[str] = None
     bounding_box_xyxy: List[ np.ndarray ] = Field([],exclude=True) # [img1_xyxy ... ] [ [[x,y,x,y]...] ... ]
 
-    pixel_idx_forward_T : List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    pixel_idx_backward_T: List[ List[List[float]] ] = [] #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    pixel_idx_forward_T : List[ List[List[float]] ] = Field([],exclude=True) #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    pixel_idx_backward_T: List[ List[List[float]] ] = Field([],exclude=True) #[eye(3,3)...] # [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     
     _numpy_pixel_idx_forward_T : List[ np.ndarray ] = []
     _numpy_pixel_idx_backward_T: List[ np.ndarray ] = []
@@ -599,8 +599,10 @@ class ImageMatProcessor(BaseModel):
         return self.forward(imgs, meta)
 
     def release(self):
-        for i in self.input_mats:i.release()
-        for i in self.out_mats:i.release()
+        if hasattr(self,'input_mats'):
+            for i in self.input_mats:i.release()
+        if hasattr(self,'out_mats'):
+            for i in self.out_mats:i.release()
     
     def __del__(self):
         self.release()

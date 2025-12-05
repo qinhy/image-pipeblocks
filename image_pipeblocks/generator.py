@@ -7,7 +7,7 @@ import time
 import uuid
 import platform
 from enum import IntEnum
-from typing import Iterator, List, Literal, Optional
+from typing import Iterator, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -116,6 +116,63 @@ class ImageMatGenerator(BaseModel):
     def __len__(self):
         return None
 
+class InvalidSourceFrameGenerator(ImageMatGenerator):
+    # Same style as your CvVideoFrameGenerator
+    color_types: List['ColorType'] = []
+    frame_size: Tuple[int, int] = (480, 640)
+    fallback_text: str = "NOT VALID"
+
+    def _make_placeholder_frame(self, source) -> np.ndarray:
+        h, w = self.frame_size
+
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Main message
+        cv2.putText(
+            frame,
+            self.fallback_text,
+            (20, int(h * 0.4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Show (part of) the source string under it
+        src_txt = str(source)
+        if len(src_txt) > 40:
+            src_txt = src_txt[:37] + "..."
+
+        cv2.putText(
+            frame,
+            src_txt,
+            (20, int(h * 0.4) + 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        return np.ascontiguousarray(frame)
+
+    def create_frame_generator(self, idx, source):
+        # Match your color_types handling style, but per index
+        if idx >= len(self.color_types):
+            self.color_types.append(ColorType.BGR)
+        else:
+            self.color_types[idx] = ColorType.BGR
+
+        frame = self._make_placeholder_frame(source)
+
+        def gen(frame=frame):
+            # Infinite stream of the same "NOT VALID" frame
+            while True:
+                yield frame
+
+        return gen()
+    
 class CvVideoFrameGenerator(ImageMatGenerator):    
     color_types: List['ColorType'] = []
     

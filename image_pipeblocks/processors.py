@@ -325,19 +325,27 @@ class Processors:
     except Exception as e:
         print(e)
 
-    class CropToDivisibleBy32(ImageMatProcessor):
+    class CropImageToDivisibleByNum(ImageMatProcessor):
+        num:int = 32
         title: str = 'crop_to_divisible_by_32'
         hs:List[int] = []
         ws:List[int] = []
+        
+        def model_post_init(self, context):
+            self.title = self.title.replace('32',str(self.num))
+            return super().model_post_init(context)
         
         def validate_img(self, img_idx, img):
             img.require_np_uint()
             img.require_HW_or_HWC()
             h, w = img.info.H,img.info.W
-            new_h = h - (h % 32)
-            new_w = w - (w % 32)
+            new_h = h - (h % self.num)
+            new_w = w - (w % self.num)
             self.hs.append(new_h)
             self.ws.append(new_w)
+
+        def build_out_mats(self, validated_imgs, converted_raw_imgs, color_type=None):
+            return super().build_out_mats(validated_imgs, converted_raw_imgs, color_type)
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo] = [], meta={}) -> List[np.ndarray]:
             processed_imgs = []
@@ -868,7 +876,7 @@ class Processors:
                 self.file_counter = 0
 
             def writer_worker(self):
-                while True:
+                while True: # exit if frame is None:
                     try:
                         frame = self.queue.get(timeout=0.1)
                     except queue.Empty:
@@ -1054,7 +1062,7 @@ class Processors:
         title: str = "numpy_image_mask"
         mask_image_path: str
         mask_color_hex: str = "#000000FF"
-        mask_color: Tuple[int, int, int] = (0,0,0)
+        mask_color: Tuple[int, int, int]|List[int] = (0,0,0)
         mask_alpha: float = 0
         mask_split: Optional[Tuple[int, int]] = (2, 2)
         _original_masks:list = []
@@ -1062,7 +1070,7 @@ class Processors:
         _revert_masks:list = []
 
         def model_post_init(self, context: Any) -> None:
-            self.mask_color = np.array(hex2rgba(self.mask_color_hex)[:3], dtype=np.uint8)
+            self.mask_color = np.array(hex2rgba(self.mask_color_hex)[:3], dtype=np.uint8).tolist()
             return super().model_post_init(context)
         
         def reload_masks(self):
@@ -1739,7 +1747,7 @@ class Processors:
                     yolo_results.append(preds)
             yolo_results_xyxycc:List[np.ndarray] = [r.cpu().numpy() for r in yolo_results]
             return [],yolo_results_xyxycc
-
+        
     class SimpleTracking(ImageMatProcessor):
         title:str='simple_tracking'
         detect_frames_thre:int= 10
@@ -1749,10 +1757,10 @@ class Processors:
         detector_uuid:str
         frame_cnt:int = 0
         # frame_recs:List[Dict[int,deque[Tuple[int,Optional[ImageMat]]]]] = []
-        frame_recs:List = []
+        frame_recs:List = Field(default_factory=list,exclude=True)
             # {0:0,1:0,2:0}, # each class continuous cnt
-        # frame_save_queue:queue.Queue[Tuple[str,List[ImageMat]]] = queue.Queue()
-        frame_save_queue:List = queue.Queue()
+        frame_save_queue:queue.Queue[Tuple[str,List[ImageMat]]] = Field(default_factory=queue.Queue,exclude=True)
+        # frame_save_queue:queue.Queue = queue.Queue()
         frame_save_queue_len:int= 1000
         class_names:Dict[str,str] = {}
         all_cls_id:Set[int] = set()
@@ -1764,6 +1772,7 @@ class Processors:
         gps_uuid:str=''
 
         timezone:int=9#(UTC+9)
+        callback:Optional[ImageMatProcessor]=None
 
         _det_processor:'Processors.YOLO'= None
         _gps_processor:'Processors.GPS'= None
@@ -1802,12 +1811,21 @@ class Processors:
                         v.append((0,None))
                 self.frame_recs.append(frame_rec)
 
-        def _save_worker(self):
-            while True:
-                class_name,imagemat_list = self.frame_save_queue.get()
-                if imagemat_list is None:return
+        def stop(self):
+            self.frame_save_queue.put_nowait((None,None))
 
-                timestamp = imagemat_List[len(imagemat_list)//2].timestamp
+        def _save_worker(self):
+            while True: # exit if imagemat_list is None:
+                try:
+                    class_name,imagemat_list = self.frame_save_queue.get()
+                except queue.Empty:
+                    self.frame_save_queue.task_done()
+                    continue
+                if imagemat_list is None:
+                    self.frame_save_queue.task_done()
+                    break
+
+                timestamp = imagemat_list[len(imagemat_list)//2].timestamp
                 # Create timezone-aware UTC datetime
                 dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                 # Convert to (UTC+N)
@@ -1818,12 +1836,16 @@ class Processors:
 
                 os.makedirs(filename,exist_ok=True)
 
+                print('save_jpeg')
                 for i,img in enumerate(imagemat_list):
                     fn = f'{filename}/{i}.jpeg'
                     cv2.imwrite(fn, img.data())
                     if self.save_jpeg_gps:
-                        self._gps_processor._gps.set_jpeg_gps_location(
-                            fn,img.info.latlon[0],img.info.latlon[1],fn)
+                        try:
+                            self._gps_processor._gps.set_jpeg_gps_location(
+                                fn,img.info.latlon[0],img.info.latlon[1],fn)
+                        except:
+                            pass
                 
                 if self.save_mp4:
                     fourcc = cv2.VideoWriter_fourcc(*'avc1')
@@ -1831,6 +1853,10 @@ class Processors:
                     for i,img in enumerate(imagemat_list):
                         writer.write(img.data())
                     writer.release()
+                
+                # callback
+                self.callback(imagemat_list)
+
                 self.frame_save_queue.task_done()
 
         def forward_raw(self, imgs_data:List[np.ndarray], imgs_info = ..., meta=...):
@@ -1871,30 +1897,31 @@ class Processors:
                         
                     if res:# vertify 
                         # do saving
-                        print('save_jpeg',)
+                        latlon=None
                         if  self.save_jpeg or self.save_mp4:
-                            to_save=[q.pop()[1] for _ in range(self.queue_len)][::-1]
-                            to_save=[i for i in to_save if i is not None]
+                            save_imgs=[q.pop()[1] for _ in range(self.queue_len)][::-1]
+                            save_imgs:List[ImageMat]=[i for i in save_imgs if i is not None]
                             if self.save_jpeg_gps:
-                                for i in to_save:
+                                for i in save_imgs:
                                     latlon=self._gps_processor.get_latlon()
                                     if latlon:
                                         i.info.latlon = (latlon[0],latlon[1])
-                            self.frame_save_queue.put((self.class_names[k],to_save))
+                            self.frame_save_queue.put((self.class_names[k],save_imgs))
+
                         # clear up
                         for _ in range(self.queue_len):
                             q.append((0,None))
-
             return imgs_data
         
         def release(self):
-            self.frame_save_queue.put(None)
+            if hasattr(self,'frame_save_queue'):
+                self.frame_save_queue.put((None,None))
             return super().release()
     
     class DrawYOLO(ImageMatProcessor):
         title:str = 'draw_yolo'
-        draw_box_color: Tuple[int, int, int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
-        draw_text_color: Tuple[int, int, int] = Field((255, 255, 255), description="Label text color (B, G, R)")
+        draw_box_color: Tuple[int, int, int]|List[int] = Field((0, 255, 0), description="Bounding box color (B, G, R)")
+        draw_text_color: Tuple[int, int, int]|List[int] = Field((255, 255, 255), description="Label text color (B, G, R)")
         draw_font_scale: float = Field(0.5, description="Font scale for label text")
         draw_thickness: int = Field(2, description="Line thickness for box and text")
         class_names:Dict[str,str] = {}
@@ -2494,7 +2521,7 @@ class Processors:
 class ImageMatProcessors(BaseModel):
     @staticmethod    
     def dumps(pipes:List[ImageMatProcessor]):
-        return json.dumps([p.model_dump() for p in pipes])
+        return json.dumps([json.loads(p.model_dump_json()) for p in pipes])
     
     @staticmethod
     def loads(pipes_json:str)->List[ImageMatProcessor]:
