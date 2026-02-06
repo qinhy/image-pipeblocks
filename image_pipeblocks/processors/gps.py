@@ -1,10 +1,12 @@
+from collections import deque
 import json
 import logging
 import math
+import os
 import pathlib
 import threading
 import time
-from typing import Callable, Dict, Optional, List, TextIO
+from typing import Callable, Deque, Dict, Optional, List, TextIO, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 import datetime
 import serial           # Only needed by UsbGps pyserial
@@ -68,6 +70,9 @@ class BaseGps(BaseModel):
     _state: GpsFix = GpsFix()
     _opened: bool  = False
 
+    _history: Deque[Tuple[float, "GpsFix"]] = deque(maxlen=300)
+    _history_enabled: bool = True
+    
     # --- observer pattern -------------------------------------------- #
     _listeners: Dict[str, Callable[[Optional[GpsFix | Exception]], None]] = {}
 
@@ -75,6 +80,11 @@ class BaseGps(BaseModel):
     _stop_event:threading.Event = None
     _watch_thread: Optional[threading.Thread] = None
     _watch_interval: float = 0.25  # seconds between updates
+
+    def model_post_init(self, context):
+        self._history = deque(maxlen=300)
+        return super().model_post_init(context)
+
 
     # ------------------------------------------------------------------- #
     # Public API
@@ -175,7 +185,25 @@ class BaseGps(BaseModel):
     def get_state(self) -> GpsFix:
         """Return a *copy* of the last known fix."""
         return self._state.model_copy()
+    
+    def get_history(self, limit: int | None = None) -> list[tuple[float, "GpsFix"]]:
+        """Return newest-last. Each fix is already a snapshot copy."""
+        items = list(self._history)
+        if limit is not None:
+            items = items[-limit:]
+        # return copies to keep callers from mutating stored history
+        return [(ts, fix.model_copy()) for ts, fix in items]
 
+    def clear_history(self) -> None:
+        self._history.clear()
+
+    def set_history_maxlen(self, maxlen: int) -> None:
+        """Resize the ring buffer while keeping the newest items."""
+        if maxlen <= 0:
+            self._history = deque(maxlen=1)
+            return
+        old = list(self._history)[-maxlen:]
+        self._history = deque(old, maxlen=maxlen)
     # ------------------------------------------------------------------- #
     # Hooks – override these three in concrete subclasses
     # ------------------------------------------------------------------- #
@@ -193,6 +221,15 @@ class BaseGps(BaseModel):
     # ------------------------------------------------------------------- #
     # Internals
     # ------------------------------------------------------------------- #
+    def _record_history_if_changed(self, fix: "GpsFix") -> None:
+        if not self._history_enabled:
+            return
+        if self._history:
+            _, last = self._history[-1]
+            # customize comparison keys to your model
+            if (last.state, last.lat, last.lon) == (fix.state, fix.lat, fix.lon):
+                return
+        self._history.append((time.time(), fix.model_copy()))
 
     def _start_watcher(self) -> None:
         self._stop_event.clear()
@@ -213,6 +250,8 @@ class BaseGps(BaseModel):
         while not self._stop_event.is_set():
             try:
                 self._update_state()
+                snap = self._state.model_copy()
+                self._record_history_if_changed(snap)
                 self._emit("update", self.get_state())
             except Exception as exc:        # isolate & propagate background errors
                 LOGGER.exception("GPS update error: %s", exc)
@@ -240,8 +279,15 @@ class BaseGps(BaseModel):
 
 class UsbGps(BaseGps):
     """Real NMEA-over-USB GPS receiver using pyserial + pynmea2."""
+    record_dir:str = ''
     _serial: Optional[serial.Serial] = None
 
+    def model_post_init(self, context):
+        if self.record_dir and os.path.isdir(self.record_dir):
+            self.record_dir = os.path.join(self.record_dir,f'{time.strftime("%Y%m%d-%H%M%S")}.jsonl')
+        else:
+            self.record_dir = ''
+        return super().model_post_init(context)
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -262,9 +308,12 @@ class UsbGps(BaseGps):
 
         raw = self._serial.readline().decode("ascii", errors="ignore").strip()
         if raw.startswith("$"):
-            self._parse_nmea(pynmea2.parse(raw).__dict__)
             try:
-                self._parse_nmea(pynmea2.parse(raw).__dict__)
+                raw_data = pynmea2.parse(raw).__dict__
+                self._parse_nmea(raw_data)
+                if self.record_dir:
+                    with open(self.record_dir, "a") as f:
+                        f.write(json.dumps(raw_data) + "\n")
             except pynmea2.nmea.ParseError:
                 pass  # ignore malformed lines
 

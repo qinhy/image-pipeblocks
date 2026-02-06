@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -91,10 +92,11 @@ try:
     from .gps import BaseGps, FileReplayGps, UsbGps
 
     class GPS(ImageMatProcessor):
-        title: str = 'get_gps'
-        port: str = 'gps.jsonl'
-        save_results_to_meta: bool = True
-        _gps: Optional[BaseGps] = None
+        title:str='get_gps'
+        port:str = 'gps.jsonl'
+        record_dir:str = ''
+        save_results_to_meta:bool = True
+        _gps:Optional[BaseGps] = None
 
         @staticmethod
         def coms():
@@ -128,23 +130,28 @@ try:
             del self._gps
             return super().off()
 
-        def ini_gps(self):
+        def ini_gps(self):   
             if os.path.isfile(self.port):
-                self._gps = FileReplayGps()
-            else:
-                self._gps = UsbGps()
+                self._gps:BaseGps = FileReplayGps()
+            else:                
+                self._gps:BaseGps = UsbGps(record_dir=self.record_dir)
+                if self.port.startswith('COM'):
+                    m = re.match(r'^(COM\d+)', self.port.strip(), re.IGNORECASE)
+                    if m:
+                        self.port = m.group(1)
             self._gps.open(self.port)
 
         def validate_img(self, img_idx, img):
             if self._gps is None:
                 self.ini_gps()
 
-        def forward_raw(
-            self,
-            imgs_data: List[np.ndarray],
-            imgs_info: List[ImageMatInfo] = [],
-            meta={},
-        ) -> List[np.ndarray]:
+        def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
+            if len(imgs_data) > 0:
+                for i in imgs_info:
+                    i.latlon = self.get_latlon()
             return imgs_data
+        def release(self):
+            self._gps.close()
+            return super().release()
 except Exception as e:
     print(e)

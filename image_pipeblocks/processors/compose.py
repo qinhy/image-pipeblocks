@@ -5,13 +5,15 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime
-from typing import Any, List, Optional, Tuple, Union
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import torch
 from pydantic import BaseModel
+
+from image_pipeblocks.processors.gps import BaseGps
 
 from ..ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor
 
@@ -189,7 +191,6 @@ class EncodeNumpyToJpeg(ImageMatProcessor):
 
         encoded_images.append(encoded)
         return encoded_images
-
 
 class CvVideoRecorder(ImageMatProcessor):
     class VideoWriterWorker:
@@ -390,3 +391,80 @@ class CvVideoRecorder(ImageMatProcessor):
             self.stop()
         except Exception:
             pass
+
+class SimpleSaveJpeg(ImageMatProcessor):
+    title:str='simple_save_jpeg'
+    timezone:int=9#(UTC+9)
+    save_dir:str=''
+    save_gps:bool = False
+
+    def model_post_init(self, context):
+        # skip validate
+        self.validate([])
+        return super().model_post_init(context)
+    
+    def validate_img(self, img_idx, img):
+        img.require_ndarray()
+
+    def __call__(self, imgs: List[ImageMat], meta: dict = {}):
+        return self.forward(imgs, meta)
+    
+    def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
+        if len(imgs)==0:return imgs,meta
+        timestamp = imgs[len(imgs)//2].timestamp
+        class_name = imgs[len(imgs)//2].class_name
+        # Create timezone-aware UTC datetime
+        dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        # Convert to (UTC+N)
+        dt_jst = dt_utc + timedelta(hours=self.timezone)
+        # Create file name string (JST)
+        timestamp = dt_jst.strftime("%Y%m%d_%H%M%S")
+        filename = f'{self.save_dir}/{timestamp}_{class_name}'
+        os.makedirs(filename,exist_ok=True)
+        for i,img in enumerate(imgs):
+            fn = f'{filename}/{i}.jpeg'
+            cv2.imwrite(fn, img.data())
+            if self.save_gps:
+                try:
+                    BaseGps.set_jpeg_gps_location(
+                        fn,img.info.latlon[0],img.info.latlon[1],fn)
+                except:
+                    pass
+        return imgs,meta
+
+class SimpleSaveMP4(ImageMatProcessor):
+    title:str='simple_save_mp4'
+    timezone:int=9#(UTC+9)
+    save_dir:str=''
+
+    def model_post_init(self, context):
+        # skip validate
+        self.validate([])
+        return super().model_post_init(context)
+    
+    def validate_img(self, img_idx, img):
+        img.require_ndarray()
+
+    def __call__(self, imgs: List[ImageMat], meta: dict = {}):
+        return self.forward(imgs, meta)
+    
+    def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
+        if len(imgs)==0:return imgs,meta
+        timestamp = imgs[len(imgs)//2].timestamp
+        class_name = imgs[len(imgs)//2].class_name
+        # Create timezone-aware UTC datetime
+        dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        # Convert to (UTC+N)
+        dt_jst = dt_utc + timedelta(hours=self.timezone)
+        # Create file name string (JST)
+        timestamp = dt_jst.strftime("%Y%m%d_%H%M%S")
+        filename = f'{self.save_dir}/{timestamp}_{class_name}'
+        os.makedirs(filename,exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        writer = cv2.VideoWriter(f'{filename}/video.mp4', fourcc, 1, (img.info.W, img.info.H))
+        for i,img in enumerate(imgs):
+            writer.write(img.data())
+        writer.release()
+        return imgs,meta
+
+    

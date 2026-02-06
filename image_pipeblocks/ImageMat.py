@@ -241,6 +241,7 @@ class ImageMat(BaseModel):
     info: ImageMatInfo = ImageMatInfo()
     color_type: Union[str, ColorType]
     timestamp:float = 0
+    class_name:str = ''
     _img_data: np.ndarray|torch.Tensor = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False
@@ -403,7 +404,12 @@ class ImageMat(BaseModel):
         if self.info.shape_type not in {ShapeType.HWC, ShapeType.HW}:
             raise TypeError(f"Expected HWC or HW format, got {self.info.shape_type}")
 
-    def require_BCHW(self):       self.require_shape_type(ShapeType.BCHW)
+    def require_BCHW(self, B=None, C=None):
+        self.require_shape_type(ShapeType.BCHW)
+        if B is not None and self.info.B != B:
+            raise TypeError(f"Expected {B} batch dimension, got {self.info.B}")
+        if C is not None and self.info.C != C:
+            raise TypeError(f"Expected {C} channel dimension, got {self.info.C}")
 
     def require_square_size(self):
         if self.info.W != self.info.H:
