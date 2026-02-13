@@ -21,6 +21,7 @@ from .image_ops import (
     NumpyGrayToTorchGray,
     TorchRGBToNumpyBGR,
     TorchGrayToNumpyGray,
+    TorchBBoxExtract,
     TorchResize,
     CVResize,
 )
@@ -62,6 +63,7 @@ class Processors:
     class NumpyGrayToTorchGray(NumpyGrayToTorchGray):pass
     class TorchRGBToNumpyBGR(TorchRGBToNumpyBGR):pass
     class TorchGrayToNumpyGray(TorchGrayToNumpyGray):pass
+    class TorchBBoxExtract(TorchBBoxExtract):pass
     class TorchResize(TorchResize):pass
     class CVResize(CVResize):pass
     class TileNumpyImages(TileNumpyImages):pass

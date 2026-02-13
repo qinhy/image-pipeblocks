@@ -680,6 +680,11 @@ class DrawYOLO(ImageMatProcessor):
         class_names: Dict[str, str] = [],
         class_colors: Dict[str, str] = [],
     ) -> np.ndarray:
+        draw_font_scale = int(self.draw_font_scale * img.shape[1] / 320)
+        draw_thickness = int(self.draw_thickness * img.shape[1] / 320)
+        draw_thickness_d = int(2 * img.shape[1] / 320)
+        position_d = int(5 * img.shape[1] / 320)
+
         for det in detections:
             x1, y1, x2, y2, conf, cls_id = map(float, det[:6])
             cls_id = int(cls_id)
@@ -696,28 +701,28 @@ class DrawYOLO(ImageMatProcessor):
                 (int(x1), int(y1)),
                 (int(x2), int(y2)),
                 box_color,
-                self.draw_thickness,
+                draw_thickness,
             )
 
             cv2.putText(
                 img,
                 label,
-                (int(x1), int(y1) - 10),
+                (int(x1), int(y1) - position_d),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                self.draw_font_scale,
+                draw_font_scale,
                 (0, 0, 0),
-                self.draw_thickness + 2,
+                draw_thickness + draw_thickness_d,
                 cv2.LINE_AA,
             )
 
             cv2.putText(
                 img,
                 label,
-                (int(x1), int(y1) - 10),
+                (int(x1), int(y1) - position_d),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                self.draw_font_scale,
+                draw_font_scale,
                 box_color,
-                self.draw_thickness,
+                draw_thickness,
                 cv2.LINE_AA,
             )
         return img

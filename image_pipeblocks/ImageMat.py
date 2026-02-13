@@ -2,6 +2,7 @@
 # Standard Library Imports
 import enum
 import json
+import math
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
@@ -164,7 +165,9 @@ class ImageMatInfo(BaseModel):
     H: int = 0
     W: int = 0
     color_type: Optional[ColorType] = None
-    latlon: Tuple[float,float] = (0.0,0.0) #gps
+    latlon: Tuple[float,float] = (math.nan,math.nan) #gps
+    class_name:str = ''
+    path:str = ''
     uuid: str = ''
 
     @staticmethod
@@ -241,7 +244,6 @@ class ImageMat(BaseModel):
     info: ImageMatInfo = ImageMatInfo()
     color_type: Union[str, ColorType]
     timestamp:float = 0
-    class_name:str = ''
     _img_data: np.ndarray|torch.Tensor = None
 
     shmIO_mode: Literal[False,'writer','reader'] = False

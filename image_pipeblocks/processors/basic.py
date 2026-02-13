@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -96,6 +97,7 @@ try:
         port:str = 'gps.jsonl'
         record_dir:str = ''
         save_results_to_meta:bool = True
+        latlon: Tuple[float,float] = (math.nan,math.nan)
         _gps:Optional[BaseGps] = None
 
         @staticmethod
@@ -109,6 +111,18 @@ try:
 
         def get_state(self):
             if self._gps:
+                return self._gps.get_state().model_copy()
+            else:
+                return None
+
+        def get_state(self):
+            if self._gps:
+                return self._gps.get_state().model_copy()
+            else:
+                return None
+            
+        def get_state_json(self):
+            if self._gps:
                 return json.loads(self._gps.get_state().model_dump_json())
             else:
                 return {}
@@ -116,9 +130,9 @@ try:
         def get_latlon(self) -> List[float]:
             if self._gps:
                 s = self._gps.get_state()
-                return [s.lat, s.lon]
+                return (s.lat, s.lon)
             else:
-                return []
+                return (math.nan,math.nan)
 
         def on(self):
             self.ini_gps()
@@ -146,12 +160,19 @@ try:
                 self.ini_gps()
 
         def forward_raw(self, imgs_data: List[np.ndarray], imgs_info: List[ImageMatInfo]=[], meta={}) -> List[np.ndarray]:
-            if len(imgs_data) > 0:
-                for i in imgs_info:
-                    i.latlon = self.get_latlon()
+            self.latlon = self.get_latlon()
             return imgs_data
+        
+        def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
+            output_imgs, meta = super().forward(imgs, meta)
+            # copy latlon info
+            for ii,oo in zip(imgs,output_imgs):
+                oo.info.latlon = self.latlon
+            return output_imgs, meta
+
         def release(self):
-            self._gps.close()
+            if self._gps:
+                self._gps.close()
             return super().release()
 except Exception as e:
     print(e)

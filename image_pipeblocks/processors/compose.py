@@ -405,14 +405,11 @@ class SimpleSaveJpeg(ImageMatProcessor):
     
     def validate_img(self, img_idx, img):
         img.require_ndarray()
-
-    def __call__(self, imgs: List[ImageMat], meta: dict = {}):
-        return self.forward(imgs, meta)
     
     def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
         if len(imgs)==0:return imgs,meta
         timestamp = imgs[len(imgs)//2].timestamp
-        class_name = imgs[len(imgs)//2].class_name
+        class_name = imgs[len(imgs)//2].info.class_name
         # Create timezone-aware UTC datetime
         dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
         # Convert to (UTC+N)
@@ -422,14 +419,15 @@ class SimpleSaveJpeg(ImageMatProcessor):
         filename = f'{self.save_dir}/{timestamp}_{class_name}'
         os.makedirs(filename,exist_ok=True)
         for i,img in enumerate(imgs):
-            fn = f'{filename}/{i}.jpeg'
+            fn = f'{filename}/{i}.jpeg'            
             cv2.imwrite(fn, img.data())
             if self.save_gps:
                 try:
                     BaseGps.set_jpeg_gps_location(
                         fn,img.info.latlon[0],img.info.latlon[1],fn)
                 except:
-                    pass
+                    pass            
+            img.info.path = fn
         return imgs,meta
 
 class SimpleSaveMP4(ImageMatProcessor):
@@ -448,23 +446,43 @@ class SimpleSaveMP4(ImageMatProcessor):
     def __call__(self, imgs: List[ImageMat], meta: dict = {}):
         return self.forward(imgs, meta)
     
-    def forward(self, imgs: List[ImageMat], meta: Dict) -> Tuple[List[ImageMat],Dict]:
-        if len(imgs)==0:return imgs,meta
-        timestamp = imgs[len(imgs)//2].timestamp
-        class_name = imgs[len(imgs)//2].class_name
-        # Create timezone-aware UTC datetime
-        dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        # Convert to (UTC+N)
-        dt_jst = dt_utc + timedelta(hours=self.timezone)
-        # Create file name string (JST)
-        timestamp = dt_jst.strftime("%Y%m%d_%H%M%S")
-        filename = f'{self.save_dir}/{timestamp}_{class_name}'
-        os.makedirs(filename,exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        writer = cv2.VideoWriter(f'{filename}/video.mp4', fourcc, 1, (img.info.W, img.info.H))
-        for i,img in enumerate(imgs):
-            writer.write(img.data())
-        writer.release()
-        return imgs,meta
 
-    
+    def forward(self, imgs: List["ImageMat"], meta: Dict) -> Tuple[List["ImageMat"], Dict]:
+        if not imgs:
+            return imgs, meta
+        
+        def _fit_size(w: int, h: int, MAX_PIXELS = 9437184) -> tuple[int, int]:
+            if w * h <= MAX_PIXELS:
+                return w, h
+            s = math.sqrt(MAX_PIXELS / (w * h))
+            nw = int(w * s) // 2 * 2
+            nh = int(h * s) // 2 * 2
+            return max(nw, 2), max(nh, 2)
+
+        mid = imgs[len(imgs)//2]
+        ts = mid.timestamp
+        class_name = mid.info.class_name
+
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt_local = dt_utc + timedelta(hours=self.timezone)
+        stamp = dt_local.strftime("%Y%m%d_%H%M%S")
+
+        out_dir = f"{self.save_dir}/{stamp}_{class_name}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        w0, h0 = imgs[0].info.W, imgs[0].info.H
+        w, h = _fit_size(w0, h0)
+
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        writer = cv2.VideoWriter(f"{out_dir}/video.mp4", fourcc, 1, (w, h))
+        if not writer.isOpened():
+            raise RuntimeError("VideoWriter failed to open (codec/container not available).")
+
+        for im in imgs:
+            frame = im.data()  # expected HxWxC uint8 BGR
+            if frame.shape[1] != w or frame.shape[0] != h:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            writer.write(frame)
+
+        writer.release()
+        return imgs, meta

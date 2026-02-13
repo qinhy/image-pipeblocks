@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -345,6 +345,59 @@ class TorchGrayToNumpyGray(ImageMatProcessor):
             bgr_images += [i for i in img]
         return bgr_images
 
+
+class TorchBBoxExtract(ImageMatProcessor):
+    title: str = "torch_bbox_extract"
+    bounding_box_owner_uuid: str
+
+    def validate_img(self, img_idx, img):
+        img.require_torch_tensor()
+        img.require_BCHW()
+
+    def forward_raw(
+        self,
+        imgs_data: List[torch.Tensor],
+        imgs_info: List["ImageMatInfo"] = [],
+        meta: Dict[str, Any] = {},
+    ) -> List[torch.Tensor]:
+        outputs: List[torch.Tensor] = []
+        owner:ImageMatProcessor = meta.get(self.bounding_box_owner_uuid, None)        
+
+        for inp_idx, imgs in enumerate(imgs_data):
+            B, C, H, W = imgs.shape
+            device, dtype = imgs.device, imgs.dtype
+            bboxes = owner.bounding_box_xyxy[inp_idx]
+            if len(bboxes)==0:continue       
+            bboxes = torch.as_tensor(owner.bounding_box_xyxy[inp_idx],device=device)
+            bboxes = bboxes[:, :4]
+
+            # Clamp + make integer crop coords
+            x1, y1, x2, y2 = bboxes.unbind(-1)
+            x1 = torch.floor(x1).clamp(0, W - 1)
+            y1 = torch.floor(y1).clamp(0, H - 1)
+            x2 = torch.ceil(x2).clamp(0, W)
+            y2 = torch.ceil(y2).clamp(0, H)
+
+            # Ensure at least 1px in each dimension
+            x2 = torch.maximum(x2, x1 + 1)
+            y2 = torch.maximum(y2, y1 + 1)
+
+            # Crop per item (different boxes per batch item)
+            crops = []
+            max_h = 0
+            max_w = 0
+            for b in range(B):
+                xi1, yi1, xi2, yi2 = int(x1[b].item()), int(y1[b].item()), int(x2[b].item()), int(y2[b].item())
+                crop = imgs[b : b + 1, :, yi1:yi2, xi1:xi2]  # [1,C,h,w]
+                crops.append(crop)
+                max_h = max(max_h, crop.shape[-2])
+                max_w = max(max_w, crop.shape[-1])
+                cv2.imshow(self.uuid, crop.mul(255.0).clamp(0, 255).permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()[0][:,:,::-1])
+            outputs.append(crops)
+
+        meta[self.uuid] = outputs
+        return imgs_data
+        
 
 class TorchResize(ImageMatProcessor):
     title: str = 'torch_resize'
