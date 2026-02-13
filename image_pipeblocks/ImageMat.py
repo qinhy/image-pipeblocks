@@ -4,12 +4,12 @@ import enum
 import json
 import math
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import uuid
 
 # Third-Party Library Imports
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 import torch
 
 from .shmIO import NumpyUInt8SharedMemoryStreamIO
@@ -146,6 +146,12 @@ class TorchMatOps(MatOps):
     def nonzero(self, x) : return torch.nonzero(x)
 
 
+def null_to_nan(v):
+    if v is None:
+        return math.nan
+    return v
+NanFloat = Annotated[float, BeforeValidator(null_to_nan)]
+
 class ImageMatInfo(BaseModel):
 
     class TorchDtype(BaseModel):
@@ -165,7 +171,7 @@ class ImageMatInfo(BaseModel):
     H: int = 0
     W: int = 0
     color_type: Optional[ColorType] = None
-    latlon: Tuple[float,float] = (math.nan,math.nan) #gps
+    latlon: Tuple[NanFloat,NanFloat] = (math.nan,math.nan) #gps
     class_name:str = ''
     path:str = ''
     uuid: str = ''

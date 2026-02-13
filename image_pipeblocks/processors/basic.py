@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from ..ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor
+from ..ImageMat import ColorType, ImageMat, ImageMatInfo, ImageMatProcessor, NanFloat
 
 
 class DoingNothing(ImageMatProcessor):
@@ -97,7 +97,7 @@ try:
         port:str = 'gps.jsonl'
         record_dir:str = ''
         save_results_to_meta:bool = True
-        latlon: Tuple[float,float] = (math.nan,math.nan)
+        latlon: Tuple[NanFloat,NanFloat] = (math.nan,math.nan)
         _gps:Optional[BaseGps] = None
 
         @staticmethod

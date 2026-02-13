@@ -11,6 +11,8 @@ dependencies = [
     "pydantic>=2.10",
     "pytorch-lightning>=2.4",
     "ultralytics>=8.3.115",
+    "pyserial>=3.5",
+    "pynmea2>=1.19.0",
 ]
 
 [dependency-groups]
