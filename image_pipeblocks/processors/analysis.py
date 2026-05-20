@@ -219,10 +219,12 @@ class TorchDebayer(ImageMatProcessor):
             GBRG = (1, 2, 0, 1)
             BGGR = (2, 1, 1, 0)
 
-        def __init__(self, layout: Layout = Layout.RGGB):
+        def __init__(self, layout: Layout = Layout.RGGB, clamp: bool = False):
             super().__init__()
             self.layout = layout
-            self.kernels = torch.nn.Parameter(
+            self.clamp = clamp
+
+            kernels = (
                 torch.tensor(
                     [
                         [0, 0, -2, 0, 0],
@@ -230,68 +232,170 @@ class TorchDebayer(ImageMatProcessor):
                         [-2, 4, 8, 4, -2],
                         [0, 0, 4, 0, 0],
                         [0, 0, -2, 0, 0],
+
                         [0, 0, 1, 0, 0],
                         [0, -2, 0, -2, 0],
                         [-2, 8, 10, 8, -2],
                         [0, -2, 0, -2, 0],
                         [0, 0, 1, 0, 0],
+
                         [0, 0, -2, 0, 0],
                         [0, -2, 8, -2, 0],
                         [1, 0, 10, 0, 1],
                         [0, -2, 8, -2, 0],
                         [0, 0, -2, 0, 0],
+
                         [0, 0, -3, 0, 0],
                         [0, 4, 0, 4, 0],
                         [-3, 0, 12, 0, -3],
                         [0, 4, 0, 4, 0],
                         [0, 0, -3, 0, 0],
                     ]
-                ).view(4, 1, 5, 5).float()
-                / 16.0,
-                requires_grad=False,
+                )
+                .view(4, 1, 5, 5)
+                .float()
+                / 16.0
             )
 
-            self.index = torch.nn.Parameter(
-                self._index_from_layout(layout),
-                requires_grad=False,
-            )
+            # self.register_buffer("kernels", kernels)
+            # self.register_buffer("index", self._index_from_layout(layout))            
+
+            index = self._index_from_layout(layout)
+            packed_weight = self._make_packed_weight(kernels, index)
+            self.register_buffer("weight", packed_weight)
+
 
         def forward(self, x):
+            # B, C, H, W = x.shape
+            # if C != 1:
+            #     raise ValueError(f"Expected [B, 1, H, W] Bayer input, got {x.shape}")
+            # if H % 2 != 0 or W % 2 != 0:
+            #     raise ValueError(f"H and W must be even, got H={H}, W={W}")
+
+            # Same reflect padding as original implementation.
+            x = torch.nn.functional.pad(x, (2, 2, 2, 2), mode="reflect")
+
+            # Pack Bayer phases:
+            # channel 0: [0, 0]
+            # channel 1: [0, 1]
+            # channel 2: [1, 0]
+            # channel 3: [1, 1]
+            x = torch.cat(
+                [
+                    x[..., 0::2, 0::2],
+                    x[..., 0::2, 1::2],
+                    x[..., 1::2, 0::2],
+                    x[..., 1::2, 1::2],
+                ],
+                dim=1,
+            )
+
+            # One 3x3 convolution at half resolution.
+            y = torch.nn.functional.conv2d(x, self.weight)
+
+            # [B, 12, H/2, W/2] -> [B, 3, H, W]
+            rgb = torch.nn.functional.pixel_shuffle(y, upscale_factor=2)
+
+            if self.clamp:
+                rgb = torch.clamp(rgb, 0, 1)
+
+            return rgb
+
+        def _make_packed_weight(self, kernels, index):
+            """
+            Converts the original full-res 5x5 phase-dependent demosaic into
+            a packed-Bayer 3x3 convolution.
+
+            Output channels are arranged for PixelShuffle:
+                channel = rgb_channel * 4 + phase_y * 2 + phase_x
+            """
+            weight = torch.zeros(12, 4, 3, 3)
+
+            for rgb_ch in range(3):
+                for phase_y in range(2):
+                    for phase_x in range(2):
+                        out_ch = rgb_ch * 4 + phase_y * 2 + phase_x
+                        plane = int(index[0, rgb_ch, phase_y, phase_x])
+
+                        # plane 4 means use original Bayer sample.
+                        if plane == 4:
+                            in_ch = phase_y * 2 + phase_x
+                            weight[out_ch, in_ch, 1, 1] = 1.0
+                            continue
+
+                        kernel = kernels[plane, 0]
+
+                        for ky in range(5):
+                            for kx in range(5):
+                                v = float(kernel[ky, kx])
+                                if v == 0:
+                                    continue
+
+                                oy = ky - 2
+                                ox = kx - 2
+
+                                src_phase_y = (phase_y + oy) % 2
+                                src_phase_x = (phase_x + ox) % 2
+
+                                cell_y = (phase_y + oy - src_phase_y) // 2
+                                cell_x = (phase_x + ox - src_phase_x) // 2
+
+                                in_ch = src_phase_y * 2 + src_phase_x
+
+                                weight[
+                                    out_ch,
+                                    in_ch,
+                                    cell_y + 1,
+                                    cell_x + 1,
+                                ] += v
+
+            return weight
+        
+        def forward_old(self, x):
             B, C, H, W = x.shape
+
+            if C != 1:
+                raise ValueError(f"Expected [B, 1, H, W] Bayer input, got {x.shape}")
+
+            if H % 2 != 0 or W % 2 != 0:
+                raise ValueError(f"H and W should be even for Bayer input, got H={H}, W={W}")
 
             xpad = torch.nn.functional.pad(x, (2, 2, 2, 2), mode="reflect")
             planes = torch.nn.functional.conv2d(xpad, self.kernels, stride=1)
-            planes = torch.cat((planes, x), 1)
-            rgb = torch.gather(
-                planes,
-                1,
-                self.index.repeat(
-                    1,
-                    1,
-                    torch.div(H, 2, rounding_mode="floor"),
-                    torch.div(W, 2, rounding_mode="floor"),
-                ).expand(B, -1, -1, -1),
-            )
-            return torch.clamp(rgb, 0, 1)
 
-        def _index_from_layout(self, layout: Layout = Layout) -> torch.Tensor:
+            # channels: 0..3 interpolated planes, 4 original Bayer samples
+            planes = torch.cat((planes, x), dim=1)
+
+            index = self.index.repeat(1, 1, H // 2, W // 2).expand(B, -1, -1, -1)
+            rgb = torch.gather(planes, 1, index)
+
+            if self.clamp:
+                rgb = torch.clamp(rgb, 0, 1)
+
+            return rgb
+
+        def _index_from_layout(self, layout):
             rggb = torch.tensor(
                 [
                     [4, 1],
                     [2, 3],
+
                     [0, 4],
                     [4, 0],
+
                     [3, 2],
                     [1, 4],
-                ]
+                ],
+                dtype=torch.long,
             ).view(1, 3, 2, 2)
-            return {
-                layout.RGGB: rggb,
-                layout.GRBG: torch.roll(rggb, 1, -1),
-                layout.GBRG: torch.roll(rggb, 1, -2),
-                layout.BGGR: torch.roll(rggb, (1, 1), (-1, -2)),
-            }.get(layout)
 
+            return {
+                self.Layout.RGGB: rggb,
+                self.Layout.GRBG: torch.roll(rggb, 1, -1),
+                self.Layout.GBRG: torch.roll(rggb, 1, -2),
+                self.Layout.BGGR: torch.roll(rggb, (1, 1), (-1, -2)),
+            }[layout]
+        
     title: str = 'torch_debayer'
     _debayer_models: List['TorchDebayer.Debayer5x5'] = []
     _input_devices = []
