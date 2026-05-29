@@ -371,6 +371,7 @@ class TorchGrayToNumpyGray(ImageMatProcessor):
 class TorchBBoxExtract(ImageMatProcessor):
     title: str = "torch_bbox_extract"
     bounding_box_owner_uuid: str
+    to_numpy: bool = False
 
     def validate_img(self, img_idx, img):
         img.require_torch_tensor()
@@ -382,15 +383,17 @@ class TorchBBoxExtract(ImageMatProcessor):
         imgs_info: List["ImageMatInfo"] = [],
         meta: Dict[str, Any] = {},
     ) -> List[torch.Tensor]:
-        outputs: List[torch.Tensor] = []
+        outputs: Dict[int, List[torch.Tensor]] = {}
         owner:ImageMatProcessor = meta.get(self.bounding_box_owner_uuid, None)        
 
         for inp_idx, imgs in enumerate(imgs_data):
+            outputs[inp_idx] = []
+            if inp_idx >= len(owner.bounding_box_xyxy):continue
             B, C, H, W = imgs.shape
             device, dtype = imgs.device, imgs.dtype
-            bboxes = owner.bounding_box_xyxy[inp_idx]
+            bboxes:np.ndarray = owner.bounding_box_xyxy[inp_idx] # bounding_box_xyxy: [img1_xyxy ... ] [ [[x,y,x,y]...] ... ]
             if len(bboxes)==0:continue       
-            bboxes = torch.as_tensor(owner.bounding_box_xyxy[inp_idx],device=device)
+            bboxes = torch.as_tensor(bboxes,device=device) # [[x,y,x,y]...]
             bboxes = bboxes[:, :4]
 
             # Clamp + make integer crop coords
@@ -409,13 +412,27 @@ class TorchBBoxExtract(ImageMatProcessor):
             max_h = 0
             max_w = 0
             for b in range(B):
+                x1, y1, x2, y2 = x1.reshape(-1),y1.reshape(-1),x2.reshape(-1),y2.reshape(-1)
+
+                if min(x1.numel(), y1.numel(), x2.numel(), y2.numel()) == 0:
+                    # no boxes
+                    continue
+
+                if b >= len(x1) or b >= len(y1) or b >= len(x2) or b >= len(y2):
+                    # invalid index
+                    continue
+
                 xi1, yi1, xi2, yi2 = int(x1[b].item()), int(y1[b].item()), int(x2[b].item()), int(y2[b].item())
                 crop = imgs[b : b + 1, :, yi1:yi2, xi1:xi2]  # [1,C,h,w]
-                crops.append(crop)
+                # crop_mat = ImageMat(color_type=ColorType.RGB).build(crop)
+                # crop_mat.info.path = f"img{inp_idx}/bbox{b}"
                 max_h = max(max_h, crop.shape[-2])
                 max_w = max(max_w, crop.shape[-1])
-                cv2.imshow(self.uuid, crop.mul(255.0).clamp(0, 255).permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()[0][:,:,::-1])
-            outputs.append(crops)
+                if self.to_numpy:
+                    crop = crop.mul(255.0).clamp(0, 255).permute(0, 2, 3, 1).to(torch.uint8).cpu().numpy()[0][:,:,::-1]
+                    cv2.imshow(self.uuid, crop)
+                crops.append(crop)
+            outputs[inp_idx]=crops
 
         meta[self.uuid] = outputs
         return imgs_data
