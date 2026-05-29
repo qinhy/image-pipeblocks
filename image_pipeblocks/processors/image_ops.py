@@ -319,6 +319,28 @@ class TorchRGBToNumpyBGR(ImageMatProcessor):
         return bgr_images
 
 
+class TorchImagesToBatch(ImageMatProcessor):
+    # Converts a list of BCHW torch images into one BCHW torch tensor in a list.
+    # Example:
+    #   [1x3xHxW, 1x3xHxW, 1x3xHxW] -> [3x3xHxW]
+    title: str = "torch_images_to_batch"
+
+    def validate_img(self, img_idx, img):
+        img.require_torch_tensor()
+        img.require_BCHW()
+
+    def forward_raw(
+        self,
+        imgs_data: List[torch.Tensor],
+        imgs_info: Optional[List[ImageMatInfo]] = None,
+        meta: Optional[dict] = None,
+    ) -> List[torch.Tensor]:
+        if len(imgs_data)>1:
+            batched = torch.cat(imgs_data, dim=0)
+            return [batched]
+        else:
+            return imgs_data
+    
 class TorchGrayToNumpyGray(ImageMatProcessor):
     title: str = 'torchgay_to_numpy_gray'
     _numpy_dtype: Any = ImageMatInfo.numpy_img_dtype()

@@ -9,7 +9,7 @@ import uuid
 
 # Third-Party Library Imports
 import numpy as np
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 import torch
 
 from .shmIO import NumpyUInt8SharedMemoryStreamIO
@@ -152,13 +152,14 @@ def null_to_nan(v):
     return v
 NanFloat = Annotated[float, BeforeValidator(null_to_nan)]
 
-class ImageMatInfo(BaseModel):
+class TorchDtype(BaseModel):
+    is_floating_point: bool
+    is_complex: bool
+    is_signed: bool
+    itemsize: int
 
-    class TorchDtype(BaseModel):
-        is_floating_point: bool
-        is_complex: bool
-        is_signed: bool
-        itemsize: int
+class ImageMatInfo(BaseModel):
+    class TorchDtype(TorchDtype):pass
 
     type: Optional[str] = None
     _dtype: Optional[Union[np.dtype, TorchDtype]] = None
@@ -238,15 +239,43 @@ class ImageMatInfo(BaseModel):
         self.color_type = color_type
         self.raw_shape = [*img_data.shape]
         return self
+    
+class BoundingBox(BaseModel):
+    class Format(str, enum.Enum):
+        XYXY = "xyxy"
+        XYWH = "xywh"
+        CXCYWH = "cxcywh"
+
+    class ScaleFormat(str, enum.Enum):
+        ZeroOne = "01"
+        RAW = "raw"
+
+    format: Format = Format.XYXY
+    scale: ScaleFormat = ScaleFormat.ZeroOne
+
+    data: np.ndarray = Field(
+        default_factory=lambda: np.zeros((0, 4), dtype=np.float32)
+    )
+
+    confidence: Optional[float] = None
+    class_id: Optional[int] = None
+    label: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator("data")
+    @classmethod
+    def validate_data(cls, value: np.ndarray) -> np.ndarray:
+        value = np.asarray(value, dtype=np.float32)
+
+        if value.ndim != 2 or value.shape[1] != 4:
+            raise ValueError("data must have shape (N, 4)")
+
+        return value
+
 
 class ImageMat(BaseModel):
-
-    class TorchDtype(BaseModel):
-        is_floating_point: bool
-        is_complex: bool
-        is_signed: bool
-        itemsize: int
-
     info: ImageMatInfo = ImageMatInfo()
     color_type: Union[str, ColorType]
     timestamp:float = 0
@@ -255,6 +284,9 @@ class ImageMat(BaseModel):
     shmIO_mode: Literal[False,'writer','reader'] = False
     shmIO_writer:Optional[NumpyUInt8SharedMemoryStreamIO.Writer] = None
     shmIO_reader:Optional[NumpyUInt8SharedMemoryStreamIO.Reader] = None
+
+    parent: Optional["ImageMat"] = None
+    children: List[Union["ImageMat", BoundingBox]] = []
 
     @staticmethod
     def random(color_type,shape,lib='np',device='cpu'):
