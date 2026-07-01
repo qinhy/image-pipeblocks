@@ -20,6 +20,7 @@ from typing import Any, Protocol, runtime_checkable
 import cv2
 import depthai as dai
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 REQUIRED_CONFIG_FIELDS = ("width", "height", "fps", "queue_max_size", "frame_poll_sleep_s", "device_id")
@@ -350,6 +351,190 @@ class DepthAIH264Decoder:
         except Exception: return []
         return [frame.to_ndarray(format=self.output_format) for frame in frames]
 
+
+class DepthAINvH264Decoder:
+    """NVDEC / PyNvVideoCodec version of DepthAIH264Decoder.
+
+    Input:
+        DepthAI H264 packet/msg with .getData()
+
+    Output:
+        PyNvVideoCodec DecodedFrame objects by default.
+
+    For best performance, keep use_device_memory=True and convert frames
+    to torch/cupy with DLPack only when needed.
+    """
+
+    def __init__(
+        self,
+        *,
+        gpuid: int = 0,
+        use_device_memory: bool = True,
+        output_color_type: str = "RGB",
+        low_latency: bool = True,
+        max_width: int = 0,
+        max_height: int = 0,
+    ):
+        import ctypes
+        import PyNvVideoCodec as nvc
+
+        self.ctypes = ctypes
+        self.nvc = nvc
+        self.gpuid = int(gpuid)
+        self.use_device_memory = bool(use_device_memory)
+
+        codec = self._get_h264_codec()
+        latency = self._get_latency(low_latency)
+        output_color = self._get_output_color_type(output_color_type)
+
+        self.decoder = nvc.CreateDecoder(
+            gpuid=self.gpuid,
+            codec=codec,
+            cudacontext=0,
+            cudastream=0,
+            usedevicememory=self.use_device_memory,
+            maxwidth=int(max_width),
+            maxheight=int(max_height),
+            outputColorType=output_color,
+            latency=latency,
+        )
+
+        # Keep ctypes packet buffers alive until decoder finishes using them.
+        self._packet_refs = deque(maxlen=64)
+        self._pts = 0
+        self._decode_flag = self._get_end_of_picture_flag() if low_latency else 0
+
+    def decode(self, encoded_msg: Any) -> list[Any]:
+        data = _as_bytes(encoded_msg.getData())
+        if not data:
+            return []
+
+        pts = self._get_pts(encoded_msg)
+        packet = self._make_packet(data, pts)
+
+        try:
+            return list(self.decoder.Decode(packet))
+        except Exception as e:
+            logger.debug("NVDEC decode failed: %s", e)
+            return []
+
+    def flush(self) -> list[Any]:
+        try:
+            return list(self.decoder.Flush())
+        except Exception:
+            return []
+
+    def decoded_frame_to_torch(self, decoded_frame: Any):
+        """Zero-copy GPU path when use_device_memory=True."""
+        return torch.from_dlpack(decoded_frame)
+
+    def decoded_frame_to_numpy(self, decoded_frame: Any) -> np.ndarray:
+        """Debug path. Copies GPU -> CPU if needed."""
+        try:
+            return np.asarray(decoded_frame)
+        except Exception:
+            return torch.from_dlpack(decoded_frame).cpu().numpy()
+
+    def _get_h264_codec(self):
+        nvc = self.nvc
+        return getattr(nvc.cudaVideoCodec, "H264")
+
+    def _get_output_color_type(self, name: str):
+        nvc = self.nvc
+        octype = getattr(nvc, "OutputColorType", None)
+        if octype is None:
+            return 0
+
+        name = str(name).upper()
+        for candidate in (name, "RGB", "NATIVE", "NV12"):
+            if hasattr(octype, candidate):
+                return getattr(octype, candidate)
+
+        return getattr(octype, "NATIVE")
+
+    def _get_latency(self, low_latency: bool):
+        nvc = self.nvc
+
+        if hasattr(nvc, "DisplayDecodeLatencyType"):
+            enum = nvc.DisplayDecodeLatencyType
+            return getattr(enum, "LOW" if low_latency else "NATIVE")
+
+        # Older / alternate enum spelling seen in the API reference.
+        if hasattr(nvc, "DisplayDecodeLatency"):
+            enum = nvc.DisplayDecodeLatency
+            return getattr(
+                enum,
+                "DISPLAYDECODELATENCY_LOW" if low_latency else "DISPLAYDECODELATENCY_NATIVE",
+            )
+
+        return 0
+
+    def _get_end_of_picture_flag(self) -> int:
+        flag_enum = getattr(self.nvc, "VideoPacketFlag", None)
+        if flag_enum is None:
+            return 0
+        return int(getattr(flag_enum, "ENDOFPICTURE", 0))
+
+    def _get_pts(self, encoded_msg: Any) -> int:
+        if hasattr(encoded_msg, "getSequenceNum"):
+            try:
+                return int(encoded_msg.getSequenceNum())
+            except Exception:
+                pass
+
+        self._pts += 1
+        return self._pts
+
+    def _make_packet(self, data: bytes, pts: int):
+        nvc = self.nvc
+        flags = int(self._decode_flag)
+
+        # Some PyNvVideoCodec builds accept constructor arguments.
+        for args in (
+            (data, len(data), int(pts), flags),
+            (),
+        ):
+            try:
+                pkt = nvc.PacketData(*args)
+                if args:
+                    return pkt
+                break
+            except Exception:
+                pkt = None
+
+        if pkt is None:
+            pkt = nvc.PacketData()
+
+        # PyNvVideoCodec docs describe PacketData as bitstream/size/pts/flags,
+        # while demuxed packets expose bsl_data/bsl/decode_flag. Support both.
+        self._try_set(pkt, ("bitstream",), data)
+        self._try_set(pkt, ("size",), len(data))
+        self._try_set(pkt, ("pts",), int(pts))
+        self._try_set(pkt, ("dts",), int(pts))
+        self._try_set(pkt, ("duration",), 0)
+        self._try_set(pkt, ("flags", "decode_flag"), flags)
+
+        # Common internal naming: bsl_data + bsl.
+        self._try_set(pkt, ("bsl",), len(data))
+
+        if not self._try_set(pkt, ("bsl_data",), data):
+            # Some builds want bsl_data to be a raw pointer.
+            buf = (self.ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+            self._packet_refs.append(buf)
+            self._try_set(pkt, ("bsl_data",), self.ctypes.addressof(buf))
+
+        return pkt
+
+    @staticmethod
+    def _try_set(obj: Any, names: tuple[str, ...], value: Any) -> bool:
+        for name in names:
+            try:
+                setattr(obj, name, value)
+                return True
+            except Exception:
+                pass
+        return False
+    
 
 def make_full_rgb_stereo_h264_synced_pipeline(
     device: dai.Device, *, fps: float, queue_max_size: int = 30,
@@ -798,7 +983,7 @@ class DepthAICamera:
         return True
 
     def _make_pipeline(self) -> tuple[Any, ...]:
-        if self.pipeline_name is not None:
+        if self.pipeline_name is None:
             self.pipeline_name = "make_full_rgb_stereo_h264_plus_preview_pipeline"
             
         if self.pipeline_name == "make_full_rgb_stereo_h264_plus_preview_pipeline":

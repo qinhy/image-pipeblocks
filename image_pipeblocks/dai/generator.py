@@ -13,10 +13,11 @@ from typing import Iterator, List, Literal, Optional, Tuple
 import cv2
 import numpy as np
 from pydantic import BaseModel, Field
+import torch
 
 from ..ImageMat import ColorType, ImageMat
 from ..generator import ImageMatGenerator, ImageMatGenerators
-from .utils import DepthAICamera
+from .utils import DepthAICamera, DepthAINvH264Decoder
 
 logger = print
 
@@ -39,6 +40,7 @@ class DaiCameraFrameGenerator(ImageMatGenerator):
     queue_max_size: int = 1
     frame_poll_sleep_s: float = 0.001
     pipeline_name: str = "make_full_rgb_h264_pipeline"
+    decoder_for_full_resolution: Literal["pyav","nvdec",None] = None
 
     # Optional pipeline/config knobs consumed by dai_camera.py via getattr().
     rgb_bitrate_kbps: int = 40000
@@ -87,18 +89,52 @@ class DaiCameraFrameGenerator(ImageMatGenerator):
             cam = self.register_resource(DepthAICamera(self._make_config(source),
                                             pipeline_name=self.pipeline_name))
             cam.open()
+            def gen(cam=cam, dec:Literal["pyav","nvdec",None]=self.decoder_for_full_resolution):
+                if dec=="nvdec":
+                    rgb_nvdec = DepthAINvH264Decoder(
+                        gpuid=0,
+                        use_device_memory=True,
+                        output_color_type="RGB",
+                        low_latency=True,
+                        max_width=4096,
+                        max_height=3072,
+                    )
+                    rgb_nvdec_func = rgb_nvdec.decode
+                else:
+                    rgb_nvdec_func = None
 
-            def gen(cam=cam):
                 while cam.is_open:
+                    if rgb_nvdec_func is not None:
+                        # Check full-res encoded packets.
+                        encoded = cam.read_encoded_packets(max_packets=8)
+                        for p in encoded["rgb"]:
+                            frames = rgb_nvdec_func(p)
+                            for f in frames:
+                                f = torch.from_dlpack(f)
+                                print("NVDEC RGB frame shape:", f.shape)
+                                print("format:", getattr(f,"format",None))
+                                print("dtype:", f.dtype)
+                                print("device:", getattr(f,"device",None))
+                                f = f.detach().cpu().numpy()
+                                cv2.imwrite("test.jpg",f)
+
+                    # for name, stream_packets in encoded.items():
+                    #     if stream_packets:
+                    #         p = stream_packets[-1]
+                    #         print(
+                    #             name,
+                    #             "packets:", len(stream_packets),
+                    #             "bytes:", len(p.getData()),
+                    #             "seq:", p.getSequenceNum() if hasattr(p, "getSequenceNum") else None,
+                    #         )
+
+                    # Existing preview frame path.
                     frames = cam.read_frame(timeout_s=self.read_timeout_s)
                     if not frames:
                         if self.stop_on_timeout:
-                            raise StopIteration('No DepthAI frame available before timeout.')
+                            raise StopIteration("No DepthAI frame available before timeout.")
                         continue
 
-                    # The realtime DepthAICamera path returns a single composed preview
-                    # frame. Legacy paths may return multiple frames, so frame_index lets
-                    # callers choose which one to expose as this generator's output.
                     try:
                         frame = frames[self.frame_index]
                     except IndexError:
@@ -108,6 +144,7 @@ class DaiCameraFrameGenerator(ImageMatGenerator):
                         continue
                     if frame.ndim == 2:
                         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
                     yield np.ascontiguousarray(frame)
 
             return gen()
@@ -115,15 +152,14 @@ class DaiCameraFrameGenerator(ImageMatGenerator):
             self.release()
             raise
 
-
-
-if __name__=="__main__":
+def test1():
     gen = DaiCameraFrameGenerator(
         sources=["169.254.1.222"],
         fps=15,
         width=4000,
         height=3000,
         pipeline_name="make_full_rgb_stereo_h264_plus_preview_pipeline",
+        decoder_for_full_resolution="nvdec",
 
         preview_width=960,
         preview_height=720,
@@ -141,3 +177,8 @@ if __name__=="__main__":
             break
 
     cv2.destroyAllWindows()
+
+    gen.release()
+
+if __name__=="__main__":
+    pass

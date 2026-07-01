@@ -164,3 +164,4 @@ xvsdk.py
 *.onnx
 *.trt
 *.jsonl
+test.jpg

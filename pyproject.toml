@@ -21,6 +21,7 @@ dev = [
     "depthai>=3.7.1",
     "ipython>=8.0.0",
     "matplotlib>=3.7.5",
+    "pynvvideocodec>=2.1.0",
     "segmentation-models-pytorch>=0.3.3",
 ]
 
