@@ -17,6 +17,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "av>=17.1.0",
+    "depthai>=3.7.1",
     "ipython>=8.0.0",
     "matplotlib>=3.7.5",
     "segmentation-models-pytorch>=0.3.3",
