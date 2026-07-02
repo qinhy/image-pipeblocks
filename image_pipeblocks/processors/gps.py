@@ -12,8 +12,7 @@ import datetime
 import serial           # Only needed by UsbGps pyserial
 import serial.tools.list_ports
 import pynmea2          # Only needed by UsbGps pynmea2
-
-LOGGER = logging.getLogger(__name__)
+from ..logger import logger as LOGGER
 
 
 # --------------------------------------------------------------------------- #

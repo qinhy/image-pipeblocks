@@ -33,8 +33,7 @@ from ultralytics.utils import ops
 from shmIO import NumpyUInt8SharedMemoryStreamIO
 from ImageMat import ColorType, ImageMat, ImageMatGenerator, ImageMatInfo, ImageMatProcessor, ShapeType
 
-
-logger = print
+from ..logger import logger
 
 def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     """Convert hex color to RGBA format."""

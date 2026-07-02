@@ -14,8 +14,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from .ImageMat import ColorType, ImageMat
-
-logger = print
+from .logger import logger
 
 class ImageMatGenerator(BaseModel):
     sources: List[str]

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Tuple
 
-logger = print
-
 
 def hex2rgba(hex_color: str) -> Tuple[int, int, int, int]:
     """Convert hex color to RGBA format."""
