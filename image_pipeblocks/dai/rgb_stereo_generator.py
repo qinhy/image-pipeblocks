@@ -1,15 +1,20 @@
 import contextlib
+import ctypes
+import os
+import platform
 import queue
+import shutil
+import tempfile
 import threading
 import time
 import traceback
-from typing import List, Literal, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import Dict, List, Literal, Optional, Tuple
 
 import cv2
 import depthai as dai
 import numpy as np
 import torch
-import PyNvVideoCodec as nvc
 
 from ..generator import ImageMatGenerator
 from ..ImageMat import ColorType
@@ -64,30 +69,160 @@ class _LiveBitstreamFeeder:
         return n
 
 
-class _EncodedStreamRuntime:
-    """Host-side state for one encoded DepthAI stream."""
 
-    def __init__(self, name: str, bitstream_queue_size: int, stop_event: threading.Event):
-        self.name = name
-        self.depthai_q = None
-        self.bitstream_q = queue.Queue(maxsize=bitstream_queue_size)
-        self.feeder = _LiveBitstreamFeeder(self.bitstream_q, stop_event)
+class _StreamDecoderBackend(ABC):
+    """Compressed H264/H265 bytes -> decoded torch.Tensor frames for one stream."""
+
+    # True when next_tensor() already returns the public tensor shape/value range.
+    # For gst-nvivafilter this is [1, 3, H, W], CUDA, normalized fp16/fp32.
+    returns_public_tensor = False
+    returns_normalized_tensor = False
+
+    def __init__(
+        self,
+        owner,
+        stream_name: str,
+        codec: str,
+        width: int,
+        height: int,
+        output_color: str,
+        bitstream_queue_size: int,
+        stop_event: threading.Event,
+    ):
+        self.owner = owner
+        self.stream_name = stream_name
+        self.codec = str(codec)
+        self.width = int(width)
+        self.height = int(height)
+        self.output_color = str(output_color)
+        self.bitstream_queue_size = int(bitstream_queue_size)
+        self.stop_event = stop_event
+        self.closed = False
+
+    @abstractmethod
+    def start(self):
+        pass
+
+    @abstractmethod
+    def push_bitstream(self, data: bytes):
+        pass
+
+    @abstractmethod
+    def end_of_stream(self):
+        pass
+
+    @abstractmethod
+    def next_tensor(self) -> torch.Tensor:
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+    def stats(self) -> Dict[str, float]:
+        return {}
+
+
+class _PyNvVideoCodecStreamBackend(_StreamDecoderBackend):
+    """dGPU backend. This keeps the original PyNvVideoCodec + DLPack behavior."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nvc = None
+        self.bitstream_q = queue.Queue(maxsize=self.bitstream_queue_size)
+        self.feeder: Optional[_LiveBitstreamFeeder] = None
         self.demuxer = None
         self.decoder = None
         self.packet_iter = None
-        self.producer_thread = None
-        self.decode_thread = None
         self.pending_decoded_frames = []
-        self.packet_count = 0
-        self.byte_count = 0
         self.demux_packet_count = 0
-        self.decoded_frame_count = 0
-        self.latest_tensor = None
-        self.latest_frame_index = 0
-        self.latest_at = 0.0
-        self.decoded_frame_refs = []
+        self._decoded_frame_refs = []
 
-    def push_eof(self):
+    @staticmethod
+    def _output_color_type(nvc, name: str):
+        if name == "rgbp":
+            return nvc.OutputColorType.RGBP
+        if name == "rgb":
+            return nvc.OutputColorType.RGB
+        if name == "native":
+            return nvc.OutputColorType.NATIVE
+        raise ValueError(f"Unsupported decoder output color: {name}")
+
+    @staticmethod
+    def _get_low_latency_enum(nvc):
+        if hasattr(nvc, "DisplayDecodeLatencyType"):
+            if hasattr(nvc.DisplayDecodeLatencyType, "LOW"):
+                return nvc.DisplayDecodeLatencyType.LOW
+        if hasattr(nvc, "DisplayDecodeLatency"):
+            enum = nvc.DisplayDecodeLatency
+            for name in ("DISPLAYDECODELATENCY_LOW", "LOW"):
+                if hasattr(enum, name):
+                    return getattr(enum, name)
+        return None
+
+    @staticmethod
+    def _set_end_of_picture(nvc, packet):
+        if not hasattr(nvc, "VideoPacketFlag"):
+            return
+        flag = None
+        for name in ("ENDOFPICTURE", "END_OF_PICTURE"):
+            if hasattr(nvc.VideoPacketFlag, name):
+                flag = getattr(nvc.VideoPacketFlag, name)
+                break
+        if flag is None:
+            return
+        for attr in ("decode_flag", "flags"):
+            try:
+                setattr(packet, attr, flag)
+                return
+            except Exception:
+                pass
+
+    def start(self):
+        # Import lazily so Jetson can import this module without PyNvVideoCodec.
+        import PyNvVideoCodec as nvc
+
+        self.nvc = nvc
+        self.feeder = _LiveBitstreamFeeder(self.bitstream_q, self.stop_event)
+
+    def _ensure_decoder(self):
+        if self.decoder is not None:
+            return
+
+        nvc = self.nvc
+        if nvc is None or self.feeder is None:
+            raise RuntimeError("PyNvVideoCodec stream backend was not started")
+
+        logger(f"Creating PyNvVideoCodec demuxer/decoder for {self.stream_name} stream...")
+        self.demuxer = nvc.CreateDemuxer(self.feeder.feed_chunk)
+        kwargs = {
+            "gpuid": self.owner.gpu_id,
+            "codec": self.demuxer.GetNvCodecId(),
+            "usedevicememory": True,
+            "maxwidth": self.width,
+            "maxheight": self.height,
+            "outputColorType": self._output_color_type(nvc, self.output_color),
+        }
+        if self.owner.low_latency:
+            latency = self._get_low_latency_enum(nvc)
+            if latency is not None:
+                kwargs["latency"] = latency
+            else:
+                logger("Warning: PyNvVideoCodec low-latency enum not found.")
+        self.decoder = nvc.CreateDecoder(**kwargs)
+        self.packet_iter = iter(self.demuxer)
+
+    def push_bitstream(self, data: bytes):
+        if self.closed or self.stop_event.is_set():
+            return
+        while not self.closed and not self.stop_event.is_set():
+            try:
+                self.bitstream_q.put(data, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def end_of_stream(self):
         try:
             self.bitstream_q.put_nowait(None)
             return
@@ -103,12 +238,543 @@ class _EncodedStreamRuntime:
         except Exception:
             pass
 
+    def _retain_decoded_frame_ref(self, frame):
+        self._decoded_frame_refs.append(frame)
+        max_refs = max(1, int(getattr(self.owner, "retain_decoded_frame_refs", 16)))
+        if len(self._decoded_frame_refs) > max_refs:
+            self._decoded_frame_refs = self._decoded_frame_refs[-max_refs:]
+
+    def next_tensor(self) -> torch.Tensor:
+        self._ensure_decoder()
+
+        while not self.stop_event.is_set():
+            if self.pending_decoded_frames:
+                frame = self.pending_decoded_frames.pop(0)
+                tensor = torch.from_dlpack(frame)
+                self._retain_decoded_frame_ref(frame)
+                return tensor
+
+            if self.packet_iter is None or self.decoder is None:
+                raise StopIteration
+
+            try:
+                packet = next(self.packet_iter)
+            except StopIteration:
+                raise
+            except Exception:
+                if self.stop_event.is_set() or self.closed:
+                    raise StopIteration
+                raise
+
+            self.demux_packet_count += 1
+
+            if self.owner.low_latency:
+                self._set_end_of_picture(self.nvc, packet)
+
+            try:
+                frames = self.decoder.Decode(packet)
+            except Exception:
+                if self.stop_event.is_set() or self.closed:
+                    raise StopIteration
+                raise
+
+            for frame in frames:
+                self.pending_decoded_frames.append(frame)
+
+        raise StopIteration
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.end_of_stream()
+        self.pending_decoded_frames.clear()
+        self._decoded_frame_refs.clear()
+        self.packet_iter = None
+        self.decoder = None
+        self.demuxer = None
+        self.feeder = None
+
+    def stats(self) -> Dict[str, float]:
+        return {
+            "demux_packets": float(self.demux_packet_count),
+            "fed_mb": float((self.feeder.total_bytes_fed if self.feeder else 0) / 1_000_000),
+        }
+
+
+class _GstNvVivaFilterStreamBackend(_StreamDecoderBackend):
+    """
+    Jetson optimized backend for one stream.
+
+    Pipeline:
+        appsrc
+          -> h264parse/h265parse
+          -> nvv4l2decoder
+          -> NVMM NV12
+          -> nvivafilter custom CUDA library
+          -> preallocated torch CUDA tensor
+          -> fakesink
+
+    The custom nvivafilter library is expected to expose:
+        set_torch_output_buffer(void* ptr, int dtype_code, int n, int c, int h, int w)
+
+    Strongly recommended optional symbols:
+        get_torch_output_frame_count() -> int
+        set_channel_order(int order)
+
+    This backend returns:
+        [1, 3, H, W], CUDA, fp16/fp32, normalized RGB.
+
+    Stereo note:
+        The stock single-stream library usually stores its output buffer in global
+        C state. For three simultaneous streams, this backend defaults to copying
+        the .so to a unique path per stream so RGB/left/right do not share globals.
+    """
+
+    returns_public_tensor = True
+    returns_normalized_tensor = True
+
+    _CHANNEL_ORDER_MAP = {
+        "auto": 0,
+        "rgba": 1,
+        "bgra": 2,
+        "argb": 3,
+        "abgr": 4,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.Gst = None
+        self.pipeline = None
+        self.appsrc = None
+        self.bus = None
+        self.lib = None
+        self.output_tensor: Optional[torch.Tensor] = None
+        self.device = torch.device(f"cuda:{int(self.owner.gpu_id)}")
+        self.frame_index = 0
+        self.bytes_pushed = 0
+        self.last_returned_frame_count = 0
+        self._lock = threading.RLock()
+        self._tmpdir = None
+        self._so_path = None
+
+    def _configured_so_path(self) -> str:
+        specific = getattr(self.owner, f"{self.stream_name}_gst_nvivafilter_so", None)
+        if specific:
+            return str(specific)
+        if self.stream_name in ("left", "right"):
+            stereo_specific = getattr(self.owner, "stereo_gst_nvivafilter_so", None)
+            if stereo_specific:
+                return str(stereo_specific)
+        return str(self.owner.gst_nvivafilter_so)
+
+    def _prepare_so_path(self) -> str:
+        base_path = os.path.abspath(self._configured_so_path())
+        if not os.path.exists(base_path):
+            raise FileNotFoundError(f"nvivafilter .so does not exist: {base_path}")
+
+        if not bool(getattr(self.owner, "gst_nvivafilter_copy_so_per_stream", True)):
+            self._so_path = base_path
+            return base_path
+
+        root = getattr(self.owner, "gst_nvivafilter_work_dir", None)
+        self._tmpdir = tempfile.mkdtemp(
+            prefix=f"depthai_{self.stream_name}_nvivafilter_",
+            dir=str(root) if root else None,
+        )
+        dst = os.path.join(self._tmpdir, f"{self.stream_name}_{os.path.basename(base_path)}")
+        shutil.copy2(base_path, dst)
+        self._so_path = dst
+        return dst
+
+    def _load_library(self):
+        so_path = self._prepare_so_path()
+        lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+
+        if not hasattr(lib, "set_torch_output_buffer"):
+            raise RuntimeError(f"{so_path} does not export set_torch_output_buffer(...)")
+
+        lib.set_torch_output_buffer.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.set_torch_output_buffer.restype = None
+
+        if hasattr(lib, "set_channel_order"):
+            lib.set_channel_order.argtypes = [ctypes.c_int]
+            lib.set_channel_order.restype = None
+
+        if hasattr(lib, "get_torch_output_frame_count"):
+            lib.get_torch_output_frame_count.argtypes = []
+            lib.get_torch_output_frame_count.restype = ctypes.c_int
+        elif bool(self.owner.gst_nvivafilter_require_frame_count):
+            raise RuntimeError(
+                f"{so_path} does not export get_torch_output_frame_count(). "
+                "For live three-stream decode this symbol is needed to know when "
+                "each nvivafilter instance has completed a frame."
+            )
+
+        self.lib = lib
+        return so_path
+
+    def _allocate_output_tensor(self):
+        dtype_name = str(self.owner.gst_nvivafilter_dtype).lower()
+        if dtype_name == "fp16":
+            torch_dtype = torch.float16
+            dtype_code = 1
+        elif dtype_name == "fp32":
+            torch_dtype = torch.float32
+            dtype_code = 0
+        else:
+            raise ValueError("gst_nvivafilter_dtype must be 'fp16' or 'fp32'")
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("gst-nvivafilter requires torch CUDA")
+
+        with torch.cuda.device(self.device):
+            tensor = torch.empty(
+                (1, 3, self.height, self.width),
+                device=self.device,
+                dtype=torch_dtype,
+            )
+            tensor.zero_()
+            torch.cuda.synchronize(self.device)
+
+        n, c, h, w = tensor.shape
+        self.lib.set_torch_output_buffer(
+            ctypes.c_void_p(tensor.data_ptr()),
+            dtype_code,
+            int(n),
+            int(c),
+            int(h),
+            int(w),
+        )
+
+        self.output_tensor = tensor
+        return tensor
+
+    def _get_frame_count(self) -> Optional[int]:
+        if self.lib is None or not hasattr(self.lib, "get_torch_output_frame_count"):
+            return None
+        return int(self.lib.get_torch_output_frame_count())
+
+    def start(self):
+        if self.output_color != "rgbp":
+            raise ValueError(
+                "gst-nvivafilter backend returns normalized RGB NCHW. "
+                "Use decoder_output_color='rgbp' and stereo_decoder_output_color='rgbp'."
+            )
+
+        try:
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+        except Exception as e:
+            raise RuntimeError(
+                "GStreamer Python bindings are required for decoder_backend='gst-nvivafilter'. "
+                "On Jetson install python3-gi and the GStreamer plugins."
+            ) from e
+
+        Gst.init(None)
+        self.Gst = Gst
+
+        so_path = self._load_library()
+
+        channel_order = str(self.owner.gst_nvivafilter_channel_order).lower()
+        if channel_order not in self._CHANNEL_ORDER_MAP:
+            raise ValueError(
+                "gst_nvivafilter_channel_order must be one of: "
+                + ", ".join(self._CHANNEL_ORDER_MAP)
+            )
+
+        if hasattr(self.lib, "set_channel_order"):
+            self.lib.set_channel_order(self._CHANNEL_ORDER_MAP[channel_order])
+        elif channel_order != "auto":
+            logger(
+                "Warning: nvivafilter library does not expose set_channel_order(); "
+                f"requested channel_order={channel_order!r} will be ignored."
+            )
+
+        tensor = self._allocate_output_tensor()
+
+        if self.codec == "h265":
+            caps = "video/x-h265,stream-format=(string)byte-stream,alignment=(string)au"
+            parser = "h265parse config-interval=-1"
+        elif self.codec == "h264":
+            caps = "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au"
+            parser = "h264parse config-interval=-1"
+        else:
+            raise ValueError(f"Unsupported codec: {self.codec}")
+
+        decoder_props = ["enable-max-performance=true"]
+        if bool(self.owner.gst_nvivafilter_disable_dpb):
+            decoder_props.append("disable-dpb=true")
+        if bool(self.owner.gst_nvivafilter_enable_full_frame):
+            decoder_props.append("enable-full-frame=true")
+        decoder_props = " ".join(decoder_props)
+        silent = str(bool(self.owner.gst_nvivafilter_silent)).lower()
+
+        pipeline_desc = f"""
+            appsrc name=src
+                is-live=true
+                block=true
+                format=time
+                do-timestamp=true
+                caps=\"{caps}\"
+            ! queue max-size-buffers={int(self.owner.gst_queue_size)} max-size-time=0 max-size-bytes=0
+            ! {parser}
+            ! nvv4l2decoder {decoder_props}
+            ! video/x-raw(memory:NVMM),format=NV12,width=(int){self.width},height=(int){self.height}
+            ! nvivafilter cuda-process=true customer-lib-name={so_path} silent={silent}
+            ! video/x-raw(memory:NVMM),format=RGBA
+            ! fakesink sync=false
+        """
+        pipeline_desc = " ".join(pipeline_desc.split())
+
+        logger(f"Creating GStreamer nvivafilter torch pipeline for {self.stream_name} stream:")
+        logger(f"  {pipeline_desc}")
+        logger(
+            f"  output tensor: shape={tuple(tensor.shape)}, "
+            f"dtype={tensor.dtype}, device={tensor.device}, clone_output={self.owner.gst_nvivafilter_clone_output}"
+        )
+
+        self.pipeline = Gst.parse_launch(pipeline_desc)
+        self.appsrc = self.pipeline.get_by_name("src")
+        self.bus = self.pipeline.get_bus()
+
+        if self.appsrc is None:
+            raise RuntimeError(f"Could not create appsrc for {self.stream_name} nvivafilter pipeline")
+
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError(f"GStreamer nvivafilter pipeline for {self.stream_name} failed to enter PLAYING state")
+
+        initial_count = self._get_frame_count()
+        self.last_returned_frame_count = int(initial_count or 0)
+
+    def _raise_if_bus_error(self):
+        if self.bus is None:
+            return
+        Gst = self.Gst
+        while True:
+            msg = self.bus.timed_pop_filtered(
+                0,
+                Gst.MessageType.ERROR | Gst.MessageType.EOS,
+            )
+            if msg is None:
+                return
+            if msg.type == Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                raise RuntimeError(f"GStreamer {self.stream_name} error: {err}; debug={debug}")
+            if msg.type == Gst.MessageType.EOS:
+                raise StopIteration
+
+    def push_bitstream(self, data: bytes):
+        if self.closed or self.stop_event.is_set():
+            return
+        Gst = self.Gst
+        if Gst is None:
+            raise RuntimeError(f"GStreamer {self.stream_name} backend was not started")
+
+        with self._lock:
+            if self.closed or self.stop_event.is_set() or self.appsrc is None:
+                return
+            self._raise_if_bus_error()
+            appsrc = self.appsrc
+            duration = int(Gst.SECOND / max(float(self.owner.capture_fps), 1e-6))
+            pts = self.frame_index * duration
+            self.frame_index += 1
+
+        buf = Gst.Buffer.new_allocate(None, len(data), None)
+        buf.fill(0, data)
+        buf.duration = duration
+        buf.pts = pts
+        buf.dts = pts
+
+        ret = appsrc.emit("push-buffer", buf)
+        if ret != Gst.FlowReturn.OK:
+            if self.closed or self.stop_event.is_set():
+                return
+            raise RuntimeError(f"GStreamer {self.stream_name} push-buffer failed: {ret}")
+
+        self.bytes_pushed += len(data)
+
+    def end_of_stream(self):
+        with self._lock:
+            if self.appsrc is None or self.Gst is None:
+                return
+            try:
+                self.appsrc.emit("end-of-stream")
+            except Exception:
+                pass
+
+    def next_tensor(self) -> torch.Tensor:
+        if self.output_tensor is None:
+            raise StopIteration
+
+        timeout_sec = float(self.owner.gst_nvivafilter_wait_timeout_sec)
+        deadline = time.monotonic() + max(timeout_sec, 0.001)
+
+        while not self.stop_event.is_set():
+            self._raise_if_bus_error()
+
+            frame_count = self._get_frame_count()
+            if frame_count is None:
+                # Last-resort mode for experimental libraries without frame_count:
+                # sleep a frame period and return a snapshot. This can repeat frames.
+                time.sleep(1.0 / max(float(self.owner.capture_fps), 1e-6))
+                frame_count = self.last_returned_frame_count + 1
+
+            if frame_count > self.last_returned_frame_count:
+                self.last_returned_frame_count = frame_count
+
+                torch.cuda.synchronize(self.device)
+
+                if bool(self.owner.gst_nvivafilter_clone_output):
+                    out = self.output_tensor.detach().clone()
+                    torch.cuda.synchronize(self.device)
+                    return out
+
+                return self.output_tensor
+
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for {self.stream_name} nvivafilter frame. "
+                    f"last_frame_count={self.last_returned_frame_count}, bytes_pushed={self.bytes_pushed}"
+                )
+
+            time.sleep(0.001)
+
+        raise StopIteration
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+
+        with self._lock:
+            try:
+                self.end_of_stream()
+            except Exception:
+                pass
+            if self.pipeline is not None and self.Gst is not None:
+                try:
+                    self.pipeline.set_state(self.Gst.State.NULL)
+                except Exception:
+                    pass
+            self.bus = None
+            self.appsrc = None
+            self.pipeline = None
+
+        self.output_tensor = None
+        self.lib = None
+
+        if self._tmpdir:
+            try:
+                shutil.rmtree(self._tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            self._tmpdir = None
+
+    def stats(self) -> Dict[str, float]:
+        frame_count = self._get_frame_count()
+        return {
+            "gst_nvivafilter_frames": float(frame_count or 0),
+            "fed_mb": float(self.bytes_pushed / 1_000_000),
+        }
+
+
+class _EncodedStreamRuntime:
+    """Host-side state for one encoded DepthAI stream."""
+
+    def __init__(self, name: str, bitstream_queue_size: int, stop_event: threading.Event):
+        self.name = name
+        self.depthai_q = None
+        self.bitstream_queue_size = int(bitstream_queue_size)
+        self.decoder_backend: Optional[_StreamDecoderBackend] = None
+        self.producer_thread = None
+        self.decode_thread = None
+        self.packet_count = 0
+        self.byte_count = 0
+        self.decoded_frame_count = 0
+        self.latest_tensor = None
+        self.latest_tensor_normalized = False
+        self.latest_frame_index = 0
+        self.latest_at = 0.0
+
+    def push_eof(self):
+        if self.decoder_backend is not None:
+            self.decoder_backend.end_of_stream()
+
+    def close_decoder(self):
+        if self.decoder_backend is not None:
+            self.decoder_backend.close()
+            self.decoder_backend = None
+
+
+def _looks_like_jetson() -> bool:
+    if os.path.exists("/etc/nv_tegra_release"):
+        return True
+    try:
+        with open("/proc/device-tree/model", "r", encoding="utf-8", errors="ignore") as f:
+            model = f.read().lower()
+        if "jetson" in model or "tegra" in model:
+            return True
+    except Exception:
+        pass
+    return platform.machine().lower() in ("aarch64", "arm64")
+
+
+def _create_stream_decoder_backend(
+    owner,
+    stream: _EncodedStreamRuntime,
+    *,
+    codec: str,
+    width: int,
+    height: int,
+    output_color: str,
+    stop_event: threading.Event,
+) -> _StreamDecoderBackend:
+    backend = getattr(owner, "decoder_backend", "auto")
+    if backend == "auto":
+        backend = "gst-nvivafilter" if _looks_like_jetson() else "pynvvideocodec"
+
+    if backend == "pynvvideocodec":
+        return _PyNvVideoCodecStreamBackend(
+            owner,
+            stream.name,
+            codec,
+            width,
+            height,
+            output_color,
+            stream.bitstream_queue_size,
+            stop_event,
+        )
+
+    if backend == "gst-nvivafilter":
+        return _GstNvVivaFilterStreamBackend(
+            owner,
+            stream.name,
+            codec,
+            width,
+            height,
+            output_color,
+            stream.bitstream_queue_size,
+            stop_event,
+        )
+
+    raise ValueError(f"Unsupported decoder_backend: {backend}")
+
 
 class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
     """
     RGB + stereo capture using H26x on all three streams.
 
-    v6 fixes bottom-row packing for non-contiguous BCHW bottom slices.
+    v7 keeps bottom-row packing and adds decoder backends for non-contiguous BCHW bottom slices.
 
     Device side:
         CAM_A RGB  -> NV12 -> VideoEncoder H264/H265
@@ -116,7 +782,9 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         CAM_C right-> NV12/YUV400p -> VideoEncoder H264/H265
 
     Host side:
-        RGB, left and right encoded streams are demuxed/decoded by PyNvVideoCodec.
+        RGB, left and right encoded streams are decoded by a pluggable backend:
+            * PyNvVideoCodec on dGPU
+            * GStreamer nvv4l2decoder + nvivafilter on Jetson
         The latest decoded left/right grayscale frames are packed into the bottom
         rows of the RGB tensor. The returned tensor keeps the RGB-only shape:
 
@@ -180,13 +848,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
     @staticmethod
     def _output_color_type(name: str):
-        if name == "rgbp":
-            return nvc.OutputColorType.RGBP
-        if name == "rgb":
-            return nvc.OutputColorType.RGB
-        if name == "native":
-            return nvc.OutputColorType.NATIVE
-        raise ValueError(f"Unsupported decoder_output_color: {name}")
+        raise RuntimeError("Decoder color conversion is handled by stream decoder backends.")
 
     @staticmethod
     def _img_frame_type(type_name: str):
@@ -223,36 +885,6 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             return bytes(data)
         arr = np.asarray(data, dtype=np.uint8)
         return arr.tobytes()
-
-    @staticmethod
-    def _get_low_latency_enum():
-        if hasattr(nvc, "DisplayDecodeLatencyType"):
-            if hasattr(nvc.DisplayDecodeLatencyType, "LOW"):
-                return nvc.DisplayDecodeLatencyType.LOW
-        if hasattr(nvc, "DisplayDecodeLatency"):
-            enum = nvc.DisplayDecodeLatency
-            for name in ("DISPLAYDECODELATENCY_LOW", "LOW"):
-                if hasattr(enum, name):
-                    return getattr(enum, name)
-        return None
-
-    @staticmethod
-    def _set_end_of_picture(packet):
-        if not hasattr(nvc, "VideoPacketFlag"):
-            return
-        flag = None
-        for name in ("ENDOFPICTURE", "END_OF_PICTURE"):
-            if hasattr(nvc.VideoPacketFlag, name):
-                flag = getattr(nvc.VideoPacketFlag, name)
-                break
-        if flag is None:
-            return
-        for attr in ("decode_flag", "flags"):
-            try:
-                setattr(packet, attr, flag)
-                return
-            except Exception:
-                pass
 
     def _create_depthai_pipeline(self):
         owner = self.owner
@@ -361,11 +993,15 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         logger("Opening DepthAI device...")
         self.device = self._open_device()
 
+        decoder_backend_name = getattr(owner, "decoder_backend", "auto")
+        if decoder_backend_name == "auto":
+            decoder_backend_name = "gst-nvivafilter" if _looks_like_jetson() else "pynvvideocodec"
+
         logger("Connected DepthAI device:")
         logger(f"  Device ID: {self.device.getDeviceInfo().getDeviceId()}")
         logger(f"  Cameras: {self.device.getConnectedCameras()}")
         logger("")
-        logger("Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline v6:")
+        logger("Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline v7:")
         logger(f"  Source: {self.source}")
         logger(f"  RGB socket: {owner.rgb_camera_socket}")
         logger(f"  Left socket: {owner.left_camera_socket}")
@@ -375,6 +1011,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         logger(f"  Capture FPS: {owner.capture_fps}")
         logger(f"  OAK RGB encoder: {owner.rgb_codec.upper()} @ {owner.rgb_bitrate_kbps} kbps")
         logger(f"  OAK stereo encoders: {owner.stereo_codec.upper()} @ {owner.stereo_bitrate_kbps} kbps each")
+        logger(f"  Decoder backend: {getattr(owner, 'decoder_backend', 'auto')} -> {decoder_backend_name}")
         logger(f"  RGB decoder output: {owner.decoder_output_color}")
         logger(f"  Stereo decoder output: {owner.stereo_decoder_output_color}")
         logger(f"  Stereo encoder input type: {owner.stereo_encoder_input_type}")
@@ -389,6 +1026,31 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
         self.pipeline = self._create_depthai_pipeline()
 
+        self._create_stream_decoder(
+            self.rgb,
+            codec=owner.rgb_codec,
+            max_width=owner.rgb_width,
+            max_height=owner.rgb_height,
+            output_color=owner.decoder_output_color,
+        )
+        self._create_stream_decoder(
+            self.left,
+            codec=owner.stereo_codec,
+            max_width=owner.stereo_width,
+            max_height=owner.stereo_height,
+            output_color=owner.stereo_decoder_output_color,
+        )
+        self._create_stream_decoder(
+            self.right,
+            codec=owner.stereo_codec,
+            max_width=owner.stereo_width,
+            max_height=owner.stereo_height,
+            output_color=owner.stereo_decoder_output_color,
+        )
+
+        for stream in (self.rgb, self.left, self.right):
+            stream.decoder_backend.start()
+
         for stream in (self.rgb, self.left, self.right):
             stream.producer_thread = threading.Thread(
                 target=self._encoded_producer_loop,
@@ -396,32 +1058,6 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
                 daemon=True,
             )
             stream.producer_thread.start()
-
-        # Create demuxers/decoders after producer threads start, because
-        # CreateDemuxer(callback) may block until enough header bytes arrive.
-        logger("Creating PyNvVideoCodec demuxer/decoder for RGB stream...")
-        self._create_stream_decoder(
-            self.rgb,
-            max_width=owner.rgb_width,
-            max_height=owner.rgb_height,
-            output_color=owner.decoder_output_color,
-        )
-
-        logger("Creating PyNvVideoCodec demuxer/decoder for left stereo stream...")
-        self._create_stream_decoder(
-            self.left,
-            max_width=owner.stereo_width,
-            max_height=owner.stereo_height,
-            output_color=owner.stereo_decoder_output_color,
-        )
-
-        logger("Creating PyNvVideoCodec demuxer/decoder for right stereo stream...")
-        self._create_stream_decoder(
-            self.right,
-            max_width=owner.stereo_width,
-            max_height=owner.stereo_height,
-            output_color=owner.stereo_decoder_output_color,
-        )
 
         for stream in (self.left, self.right):
             stream.decode_thread = threading.Thread(
@@ -431,27 +1067,18 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             )
             stream.decode_thread.start()
 
-        logger("DepthAI RGB + H26x stereo bottom-pack tensor pipeline v6 ready.")
+        logger("DepthAI RGB + H26x stereo bottom-pack tensor pipeline v7 ready.")
 
-    def _create_stream_decoder(self, stream: _EncodedStreamRuntime, max_width: int, max_height: int, output_color: str):
-        owner = self.owner
-        stream.demuxer = nvc.CreateDemuxer(stream.feeder.feed_chunk)
-        kwargs = {
-            "gpuid": owner.gpu_id,
-            "codec": stream.demuxer.GetNvCodecId(),
-            "usedevicememory": True,
-            "maxwidth": int(max_width),
-            "maxheight": int(max_height),
-            "outputColorType": self._output_color_type(output_color),
-        }
-        if owner.low_latency:
-            latency = self._get_low_latency_enum()
-            if latency is not None:
-                kwargs["latency"] = latency
-            else:
-                logger("Warning: PyNvVideoCodec low-latency enum not found.")
-        stream.decoder = nvc.CreateDecoder(**kwargs)
-        stream.packet_iter = iter(stream.demuxer)
+    def _create_stream_decoder(self, stream: _EncodedStreamRuntime, codec: str, max_width: int, max_height: int, output_color: str):
+        stream.decoder_backend = _create_stream_decoder_backend(
+            self.owner,
+            stream,
+            codec=codec,
+            width=int(max_width),
+            height=int(max_height),
+            output_color=output_color,
+            stop_event=self.stop_event,
+        )
 
     def _encoded_producer_loop(self, stream: _EncodedStreamRuntime):
         try:
@@ -475,12 +1102,8 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
                 # Do not drop compressed packets during normal operation. Dropping
                 # H26x bytes corrupts the stream until a later keyframe.
-                while not self.stop_event.is_set():
-                    try:
-                        stream.bitstream_q.put(data, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
+                if stream.decoder_backend is not None:
+                    stream.decoder_backend.push_bitstream(data)
 
         except Exception:
             if not self.stop_event.is_set() and not self._released:
@@ -489,49 +1112,13 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         finally:
             stream.push_eof()
 
-    def _retain_decoded_frame_ref(self, stream: _EncodedStreamRuntime, frame):
-        stream.decoded_frame_refs.append(frame)
-        max_refs = max(1, int(getattr(self.owner, "retain_decoded_frame_refs", 16)))
-        if len(stream.decoded_frame_refs) > max_refs:
-            stream.decoded_frame_refs = stream.decoded_frame_refs[-max_refs:]
-
     def _decode_next_frame_tensor(self, stream: _EncodedStreamRuntime) -> torch.Tensor:
-        while not self.stop_event.is_set():
-            if stream.pending_decoded_frames:
-                frame = stream.pending_decoded_frames.pop(0)
-                tensor = torch.from_dlpack(frame)
-                self._retain_decoded_frame_ref(stream, frame)
-                stream.decoded_frame_count += 1
-                return tensor
-
-            if stream.packet_iter is None or stream.decoder is None:
-                raise StopIteration
-
-            try:
-                packet = next(stream.packet_iter)
-            except StopIteration:
-                raise
-            except Exception:
-                if self.stop_event.is_set() or self._released:
-                    raise StopIteration
-                raise
-
-            stream.demux_packet_count += 1
-
-            if self.owner.low_latency:
-                self._set_end_of_picture(packet)
-
-            try:
-                frames = stream.decoder.Decode(packet)
-            except Exception:
-                if self.stop_event.is_set() or self._released:
-                    raise StopIteration
-                raise
-
-            for frame in frames:
-                stream.pending_decoded_frames.append(frame)
-
-        raise StopIteration
+        if stream.decoder_backend is None:
+            raise StopIteration
+        tensor = stream.decoder_backend.next_tensor()
+        stream.decoded_frame_count += 1
+        stream.latest_tensor_normalized = bool(getattr(stream.decoder_backend, "returns_normalized_tensor", False))
+        return tensor
 
     def _stereo_decode_loop(self, stream: _EncodedStreamRuntime):
         try:
@@ -581,6 +1168,12 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             if not getattr(self, printed_attr, False):
                 logger(f"Decoded stereo tensor shape={tuple(tensor.shape)}, dtype={tensor.dtype}, color={output_color}")
                 setattr(self, printed_attr, True)
+
+        # gst-nvivafilter returns [1, 3, H, W] normalized RGB. Use channel 0
+        # for mono/stereo payload streams.
+        if tensor.ndim == 4 and tensor.shape[0] >= 1 and tensor.shape[1] >= 1:
+            gray = tensor[0, 0]
+            return gray.contiguous()
 
         if output_color == "native":
             # Fallback only. Native NV12 can be pitched/planar depending on the decoder build.
@@ -659,6 +1252,17 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         return torch.device("cpu")
 
     def _decoded_rgb_frame_to_tensor(self, frame_tensor: torch.Tensor) -> torch.Tensor:
+        backend = self.rgb.decoder_backend
+        if backend is not None and getattr(backend, "returns_public_tensor", False):
+            public_tensor = frame_tensor
+            preview_tensor = frame_tensor[0] if frame_tensor.ndim == 4 else frame_tensor
+            self.owner.on_rgb_tensor(preview_tensor, self.rgb.decoded_frame_count)
+
+            if self.owner.show_rgb_preview:
+                self._show_small_rgb_preview(preview_tensor)
+
+            return public_tensor
+
         self.owner.on_rgb_tensor(frame_tensor, self.rgb.decoded_frame_count)
 
         if self.owner.show_rgb_preview:
@@ -686,7 +1290,10 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         else:
             logger(f"Cannot preview RGB tensor shape: {tuple(tensor.shape)}")
             return
-        small_rgb = small_hwc.detach().cpu().numpy()
+        small = small_hwc.detach()
+        if small.dtype.is_floating_point and float(small.max()) <= 1.5:
+            small = small.mul(255.0)
+        small_rgb = small.cpu().numpy()
         if small_rgb.dtype != np.uint8:
             small_rgb = np.clip(small_rgb, 0, 255).astype(np.uint8)
         small_bgr = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2BGR)
@@ -725,13 +1332,14 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             "Use decoder_output_color='rgbp' or 'rgb'."
         )
 
-    def _prepare_stereo_flat_for_rgb(self, gray: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
+    def _prepare_stereo_flat_for_rgb(self, gray: torch.Tensor, rgb: torch.Tensor, *, source_normalized: bool = False) -> torch.Tensor:
         flat = gray.reshape(-1)
         if flat.device != rgb.device or flat.dtype != rgb.dtype:
             flat = flat.to(device=rgb.device, dtype=rgb.dtype, non_blocking=self.owner.non_blocking_gpu_copy)
-        if self.owner.normalize_stereo and flat.dtype.is_floating_point:
-            # Stereo H26x decode produces 0..255 values. Match normalized RGB by
-            # writing 0..1 payload values when requested.
+        if self.owner.normalize_stereo and flat.dtype.is_floating_point and not source_normalized:
+            # PyNvVideoCodec decode produces 0..255 values. Match normalized RGB by
+            # writing 0..1 payload values when requested. gst-nvivafilter already
+            # writes normalized values, so do not divide those again.
             flat = flat / 255.0
         return flat
 
@@ -814,8 +1422,16 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
         payload = rgb[:, :, payload_start:, :]
 
-        left_flat = self._prepare_stereo_flat_for_rgb(left_gray, rgb)[:stereo_one_values]
-        right_flat = self._prepare_stereo_flat_for_rgb(right_gray, rgb)[:stereo_one_values]
+        left_flat = self._prepare_stereo_flat_for_rgb(
+            left_gray,
+            rgb,
+            source_normalized=bool(getattr(self.left, "latest_tensor_normalized", False)),
+        )[:stereo_one_values]
+        right_flat = self._prepare_stereo_flat_for_rgb(
+            right_gray,
+            rgb,
+            source_normalized=bool(getattr(self.right, "latest_tensor_normalized", False)),
+        )[:stereo_one_values]
 
         self._copy_flat_into_payload_channels(payload, left_flat, start_offset=0)
         self._copy_flat_into_payload_channels(payload, right_flat, start_offset=stereo_one_values)
@@ -904,6 +1520,12 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             except Exception as e:
                 logger(f"Error joining {stream.name} decode thread: {e}")
 
+        for stream in (self.rgb, self.left, self.right):
+            try:
+                stream.close_decoder()
+            except Exception as e:
+                logger(f"Error closing {stream.name} decoder backend: {e}")
+
         try:
             if self.pipeline is not None:
                 if not hasattr(self.pipeline, "isRunning") or self.pipeline.isRunning():
@@ -917,13 +1539,8 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             pass
 
         for stream in (self.rgb, self.left, self.right):
-            stream.pending_decoded_frames.clear()
-            stream.decoded_frame_refs.clear()
             stream.latest_tensor = None
-            stream.packet_iter = None
-            stream.decoder = None
-            stream.demuxer = None
-            stream.feeder = None
+            stream.latest_tensor_normalized = False
             stream.depthai_q = None
 
         try:
@@ -946,7 +1563,7 @@ class DepthAIPoeRGBStereoTorchGenerator(ImageMatGenerator):
     """
     ImageMatGenerator-style DepthAI PoE RGB + stereo generator.
 
-    This v6 version encodes RGB, left mono, and right mono on the OAK device using
+    This v7 version encodes RGB, left mono, and right mono on the OAK device using
     H264/H265 before sending them over PoE. It is intended for the case where
     RGB-only H26x reaches about 15 FPS, but adding raw stereo throttles the
     pipeline.
@@ -1001,6 +1618,32 @@ class DepthAIPoeRGBStereoTorchGenerator(ImageMatGenerator):
     gpu_id: int = 0
     torch_device: Optional[str] = None
     non_blocking_gpu_copy: bool = True
+
+    # Backend selection:
+    #   auto            -> gst-nvivafilter on Jetson/aarch64, PyNvVideoCodec otherwise
+    #   pynvvideocodec  -> original dGPU NVDEC + DLPack path
+    #   gst-nvivafilter -> Jetson nvv4l2decoder + nvivafilter CUDA tensor path
+    decoder_backend: Literal["auto", "pynvvideocodec", "gst-nvivafilter"] = "auto"
+
+    # Jetson optimized nvivafilter -> torch CUDA backend.
+    # For three streams, copy_so_per_stream=True is the safe default because most
+    # simple nvivafilter libraries keep the output buffer in global C state.
+    gst_queue_size: int = 8
+    gst_nvivafilter_so: str = "./libdepthai_cuda_preprocess.so"
+    rgb_gst_nvivafilter_so: Optional[str] = None
+    stereo_gst_nvivafilter_so: Optional[str] = None
+    left_gst_nvivafilter_so: Optional[str] = None
+    right_gst_nvivafilter_so: Optional[str] = None
+    gst_nvivafilter_copy_so_per_stream: bool = True
+    gst_nvivafilter_work_dir: Optional[str] = None
+    gst_nvivafilter_dtype: Literal["fp16", "fp32"] = "fp16"
+    gst_nvivafilter_channel_order: Literal["auto", "rgba", "bgra", "argb", "abgr"] = "rgba"
+    gst_nvivafilter_clone_output: bool = True
+    gst_nvivafilter_wait_timeout_sec: float = 2.0
+    gst_nvivafilter_require_frame_count: bool = True
+    gst_nvivafilter_disable_dpb: bool = True
+    gst_nvivafilter_enable_full_frame: bool = True
+    gst_nvivafilter_silent: bool = False
 
     # Match your original RGB-only float32 output by default. Set both False if
     # you want raw uint8 output instead.
@@ -1177,10 +1820,8 @@ def to_small_cv(mat, s=10, rgb_to_bgr=True):
 
     return arr
 
-def test_rgb_stereo():
-    """Small shape/unpack smoke test. This prints every frame and is not a benchmark."""
-
-    gen = DepthAIPoeRGBStereoTorchGenerator(
+def _get_gen(decoder_backend="gst-nvivafilter"):
+    return DepthAIPoeRGBStereoTorchGenerator(
         sources=["169.254.1.222"],
         color_types=[],
         rgb_width=4032,
@@ -1192,6 +1833,10 @@ def test_rgb_stereo():
         stereo_codec="h265",
         rgb_bitrate_kbps=60000,
         stereo_bitrate_kbps=6000,
+        decoder_backend=decoder_backend,
+        gst_nvivafilter_so="./libdepthai_cuda_preprocess.so",
+        gst_nvivafilter_dtype="fp16",
+        gst_nvivafilter_channel_order="rgba",
         decoder_output_color="rgbp",
         stereo_decoder_output_color="rgbp",
         rgb_camera_socket="CAM_A",
@@ -1203,6 +1848,11 @@ def test_rgb_stereo():
         show_stereo_preview=False,
         fps=0,
     )
+
+def test_rgb_stereo(decoder_backend="pynvvideocodec"):
+    """Small shape/unpack smoke test. This prints every frame and is not a benchmark."""
+
+    gen = _get_gen(decoder_backend=decoder_backend)
 
     try:
         for i,mats in enumerate(gen):
@@ -1240,34 +1890,16 @@ def test_rgb_stereo():
         gen.release()
         cv2.destroyAllWindows()
 
+def test_rgb_stereo_pynvvideocodec():
+    return test_rgb_stereo(decoder_backend="pynvvideocodec")
+
+def test_rgb_stereo_gst_nvivafilter():
+    return test_rgb_stereo(decoder_backend="gst-nvivafilter")
+
 def benchmark_rgb_stereo(duration_sec: float = 10.0, warmup_sec: float = 2.0):
     """No per-frame printing/unpacking benchmark."""
 
-    gen = DepthAIPoeRGBStereoTorchGenerator(
-        sources=["169.254.1.222"],
-        color_types=[],
-        rgb_width=4032,
-        rgb_height=3040,
-        stereo_width=1280,
-        stereo_height=800,
-        capture_fps=15,
-        rgb_codec="h265",
-        stereo_codec="h265",
-        rgb_bitrate_kbps=60000,
-        stereo_bitrate_kbps=6000,
-        decoder_output_color="rgbp",
-        stereo_decoder_output_color="rgbp",
-        rgb_camera_socket="CAM_A",
-        left_camera_socket="CAM_B",
-        right_camera_socket="CAM_C",
-        normalize_rgb=True,
-        normalize_stereo=True,
-        show_rgb_preview=False,
-        show_stereo_preview=False,
-        log_fps=False,
-        fps=0,
-    )
-
+    gen = _get_gen()
     total = 0
     measured = 0
     first_shape = None
