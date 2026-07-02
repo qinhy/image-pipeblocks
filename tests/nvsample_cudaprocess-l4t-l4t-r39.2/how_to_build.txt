@@ -1,0 +1,38 @@
+
+sed -i -E \
+  -e 's/[[:space:]]*-gencode arch=compute_53,code=sm_53//g' \
+  -e 's/[[:space:]]*-gencode arch=compute_62,code=sm_62//g' \
+  -e 's/[[:space:]]*-gencode arch=compute_72,code=sm_72//g' \
+  Makefile
+
+sed -i 's|-I./|-I./ -I/usr/src/jetson_multimedia_api/include|g' Makefile
+
+make clean
+make
+
+ls -lh libnvsample_cudaprocess.so
+ldd libnvsample_cudaprocess.so
+nm -D libnvsample_cudaprocess.so | grep ' init'
+
+echo "To install"
+sudo install -m 755 libnvsample_cudaprocess.so /usr/lib/aarch64-linux-gnu/
+sudo ldconfig
+
+
+echo "Test running"
+INPUT=/media/user/image-pipeblocks/rgb_full_test.h264
+LIB=/usr/lib/aarch64-linux-gnu/libnvsample_cudaprocess.so
+OUT=/media/user/image-pipeblocks/tmp/filtered_output.mp4
+
+gst-launch-1.0 -e -v \
+  filesrc location="$INPUT" ! \
+  h264parse ! \
+  nvv4l2decoder ! \
+  'video/x-raw(memory:NVMM),format=NV12,width=4000,height=3000,framerate=15/1' ! \
+  nvivafilter cuda-process=true customer-lib-name="$LIB" ! \
+  'video/x-raw(memory:NVMM),format=NV12' ! \
+  nvv4l2h264enc ! \
+  h264parse ! \
+  qtmux ! \
+  filesink location="$OUT"
+
