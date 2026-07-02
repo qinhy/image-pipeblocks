@@ -990,7 +990,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
                 f"payload_rows={payload_rows}, rgb_height={owner.rgb_height}."
             )
 
-        logger("Opening DepthAI device...")
+        logger(f"[{self.owner.uuid}:info] Opening DepthAI device...")
         self.device = self._open_device()
 
         decoder_backend_name = getattr(owner, "decoder_backend", "auto")
@@ -1822,6 +1822,7 @@ def to_small_cv(mat, s=10, rgb_to_bgr=True):
 
 def _get_gen(decoder_backend="gst-nvivafilter"):
     return DepthAIPoeRGBStereoTorchGenerator(
+        uuid="OkadCam:CamA",
         sources=["169.254.1.222"],
         color_types=[],
         rgb_width=4032,

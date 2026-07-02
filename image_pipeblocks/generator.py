@@ -30,7 +30,8 @@ class ImageMatGenerator(BaseModel):
 
     def model_post_init(self, context):
         self._min_frame_time = 1.0 / self.fps if self.fps != 0 else 0
-        self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'        
+        if not self.uuid:
+            self.uuid = f'{self.__class__.__name__}:{uuid.uuid4()}'
         if len(self.sources)==0:raise ValueError('empty sources.')
         self._frame_generators = [self.create_frame_generator(i,src) for i,src in enumerate(self.sources)]
 
