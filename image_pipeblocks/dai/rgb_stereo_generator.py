@@ -110,9 +110,9 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
     RGB + stereo capture using H26x on all three streams.
 
     Device side:
-        CAM_A RGB  -> NV12  -> VideoEncoder H264/H265
-        CAM_B left -> GRAY8 -> VideoEncoder H264/H265
-        CAM_C right-> GRAY8 -> VideoEncoder H264/H265
+        CAM_A RGB  -> NV12 -> VideoEncoder H264/H265
+        CAM_B left -> NV12/YUV400p -> VideoEncoder H264/H265
+        CAM_C right-> NV12/YUV400p -> VideoEncoder H264/H265
 
     Host side:
         RGB, left and right encoded streams are demuxed/decoded by PyNvVideoCodec.
@@ -191,8 +191,20 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
     def _img_frame_type(type_name: str):
         if hasattr(dai.ImgFrame.Type, type_name):
             return getattr(dai.ImgFrame.Type, type_name)
-        if type_name == "GRAY8" and hasattr(dai.ImgFrame.Type, "RAW8"):
-            return dai.ImgFrame.Type.RAW8
+
+        # Older/newer DepthAI builds expose 8-bit mono using slightly different
+        # enum names. Prefer YUV400p for VideoEncoder, because the encoder
+        # warning explicitly says it accepts NV12 or YUV400p.
+        if type_name == "GRAY8":
+            for fallback in ("YUV400p", "YUV400P", "RAW8"):
+                if hasattr(dai.ImgFrame.Type, fallback):
+                    return getattr(dai.ImgFrame.Type, fallback)
+
+        if type_name == "YUV400p":
+            for fallback in ("YUV400P", "GRAY8", "RAW8"):
+                if hasattr(dai.ImgFrame.Type, fallback):
+                    return getattr(dai.ImgFrame.Type, fallback)
+
         raise ValueError(f"Unsupported DepthAI ImgFrame.Type: {type_name}")
 
     @staticmethod
@@ -352,7 +364,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         logger(f"  Device ID: {self.device.getDeviceInfo().getDeviceId()}")
         logger(f"  Cameras: {self.device.getConnectedCameras()}")
         logger("")
-        logger("Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline:")
+        logger("Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline v4:")
         logger(f"  Source: {self.source}")
         logger(f"  RGB socket: {owner.rgb_camera_socket}")
         logger(f"  Left socket: {owner.left_camera_socket}")
@@ -414,11 +426,12 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             stream.decode_thread = threading.Thread(
                 target=self._stereo_decode_loop,
                 args=(stream,),
+                name=f"stereo-{stream.name}-decode",
                 daemon=True,
             )
             stream.decode_thread.start()
 
-        logger("DepthAI RGB + H26x stereo bottom-pack tensor pipeline ready.")
+        logger("DepthAI RGB + H26x stereo bottom-pack tensor pipeline v4 ready.")
 
     def _create_stream_decoder(self, stream: _EncodedStreamRuntime, max_width: int, max_height: int, output_color: str):
         owner = self.owner
@@ -544,33 +557,108 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
     def _stereo_decoded_tensor_to_gray(self, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Convert decoded stereo video frame to a single-channel [H, W] GPU tensor.
+        Convert a decoded stereo video frame to one clean [H, W] GPU tensor.
 
-        With stereo_decoder_output_color='rgbp', H26x decoded mono frames usually
-        arrive as [3, H, W]. We keep the first channel. The source was GRAY8, so
-        RGB channels should be equivalent after decode/conversion.
+        v3 still could show horizontal stripes because this function treated every
+        3-D tensor as CHW. On some PyNvVideoCodec builds, RGB/RGBP output can
+        arrive as HWC. If HWC is read as CHW, tensor[0] is the first image row,
+        not the first color channel, and the later resize/pack step produces
+        striped stereo previews.
+
+        v4 detects all common layouts explicitly:
+            [3, H, W]       -> CHW
+            [H, W, 3]       -> HWC
+            [1, 3, H, W]    -> BCHW
+            [1, H, W, 3]    -> BHWC
+            [H, W]          -> gray/native luma
         """
 
         owner = self.owner
+        stereo_h = int(owner.stereo_height)
+        stereo_w = int(owner.stereo_width)
+        output_color = str(getattr(owner, "stereo_decoder_output_color", "rgbp"))
+
+        if getattr(owner, "debug_stereo_decoded_shape", False):
+            # Print once per stream, not once total, so left/right can be compared.
+            printed_attr = f"_debug_printed_{getattr(self, 'idx', 0)}_{output_color}_{id(tensor)}"
+            stream_name = "unknown"
+            # This function is called from the stereo decode thread. Use the
+            # current thread name if available to make debugging less ambiguous.
+            try:
+                stream_name = threading.current_thread().name
+            except Exception:
+                pass
+            if not getattr(self, f"_debug_printed_shape_{stream_name}", False):
+                logger(
+                    f"Decoded stereo tensor stream={stream_name}, "
+                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                    f"stride={tuple(tensor.stride())}, color={output_color}"
+                )
+                setattr(self, f"_debug_printed_shape_{stream_name}", True)
+
+        shape = tuple(tensor.shape)
+
+        # Native/luma or already gray.
         if tensor.ndim == 2:
             gray = tensor
-        elif tensor.ndim == 3 and tensor.shape[0] >= 1:
-            gray = tensor[0]
-        elif tensor.ndim == 3 and tensor.shape[-1] >= 1:
-            gray = tensor[..., 0]
-        else:
-            raise ValueError(f"Cannot extract gray stereo frame from tensor shape {tuple(tensor.shape)}")
 
-        if gray.shape[-2:] != (int(owner.stereo_height), int(owner.stereo_width)):
+        elif tensor.ndim == 3:
+            c_first = tensor.shape[0]
+            c_last = tensor.shape[-1]
+
+            # CHW, e.g. [3, H, W] or [1, H, W].
+            if c_first in (1, 3, 4) and tensor.shape[-2:] == (stereo_h, stereo_w):
+                gray = tensor[0]
+
+            # HWC, e.g. [H, W, 3] or [H, W, 1]. This is the important v4 fix.
+            elif c_last in (1, 3, 4) and tensor.shape[:2] == (stereo_h, stereo_w):
+                gray = tensor[..., 0]
+
+            # Native NV12-like fallback: take the visible luma rectangle.
+            elif tensor.shape[-2] >= stereo_h and tensor.shape[-1] >= stereo_w:
+                gray = tensor.reshape(-1, tensor.shape[-2], tensor.shape[-1])[0, :stereo_h, :stereo_w]
+
+            elif tensor.shape[0] >= stereo_h and tensor.shape[1] >= stereo_w:
+                gray = tensor[:stereo_h, :stereo_w, 0] if c_last in (1, 3, 4) else tensor[:stereo_h, :stereo_w]
+
+            else:
+                raise ValueError(
+                    f"Cannot infer stereo decoded layout from shape={shape}; "
+                    f"expected CHW/HWC/native for {(stereo_h, stereo_w)}."
+                )
+
+        elif tensor.ndim == 4:
+            # BCHW, e.g. [1, 3, H, W].
+            if tensor.shape[0] == 1 and tensor.shape[1] in (1, 3, 4) and tensor.shape[-2:] == (stereo_h, stereo_w):
+                gray = tensor[0, 0]
+
+            # BHWC, e.g. [1, H, W, 3].
+            elif tensor.shape[0] == 1 and tensor.shape[-1] in (1, 3, 4) and tensor.shape[1:3] == (stereo_h, stereo_w):
+                gray = tensor[0, ..., 0]
+
+            # Generic fallback for unexpected leading dimensions.
+            else:
+                flat = tensor.reshape(-1, *tensor.shape[-2:])
+                if flat.shape[-2] >= stereo_h and flat.shape[-1] >= stereo_w:
+                    gray = flat[0, :stereo_h, :stereo_w]
+                else:
+                    raise ValueError(
+                        f"Cannot infer stereo decoded layout from shape={shape}; "
+                        f"expected BCHW/BHWC/native for {(stereo_h, stereo_w)}."
+                    )
+        else:
+            raise ValueError(f"Cannot extract gray stereo frame from tensor shape {shape}")
+
+        if tuple(gray.shape[-2:]) != (stereo_h, stereo_w):
             if owner.strict_stereo_shape:
                 raise ValueError(
-                    f"Decoded stereo frame shape {tuple(gray.shape)} does not match "
-                    f"({owner.stereo_height}, {owner.stereo_width})."
+                    f"Decoded stereo frame shape {tuple(gray.shape)} from tensor shape {shape} "
+                    f"does not match ({owner.stereo_height}, {owner.stereo_width}). "
+                    "Set debug_stereo_decoded_shape=True to print the actual decoder layout."
                 )
-            # Avoid CPU resize in the fast path. This branch is for unusual decoder output only.
             gray = torch.nn.functional.interpolate(
                 gray.unsqueeze(0).unsqueeze(0).to(dtype=torch.float32),
-                size=(int(owner.stereo_height), int(owner.stereo_width)),
+                size=(stereo_h, stereo_w),
                 mode="bilinear",
                 align_corners=False,
             )[0, 0]
@@ -848,11 +936,11 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
                 pass
 
 
-class DepthAIPoeRGBStereoH26xBottomTorchGenerator(ImageMatGenerator):
+class DepthAIPoeRGBStereoH26xBottomV4TorchGenerator(ImageMatGenerator):
     """
     ImageMatGenerator-style DepthAI PoE RGB + stereo generator.
 
-    This version encodes RGB, left mono, and right mono on the OAK device using
+    This v4 version encodes RGB, left mono, and right mono on the OAK device using
     H264/H265 before sending them over PoE. It is intended for the case where
     RGB-only H26x reaches about 15 FPS, but adding raw stereo throttles the
     pipeline.
@@ -894,7 +982,12 @@ class DepthAIPoeRGBStereoH26xBottomTorchGenerator(ImageMatGenerator):
 
     decoder_output_color: Literal["rgbp", "rgb", "native"] = "rgbp"
     stereo_decoder_output_color: Literal["rgbp", "rgb", "native"] = "rgbp"
-    stereo_encoder_input_type: Literal["GRAY8", "RAW8"] = "GRAY8"
+    # VideoEncoder accepts NV12 or 8-bit gray. On some DepthAI v3 builds,
+    # Camera.requestOutput(GRAY8) can arrive as a different internal type and
+    # trigger: "Arrived frame type (...) is not either NV12 or YUV400p".
+    # NV12 is the safest default; with stereo_decoder_output_color="rgbp"
+    # v4 defaults to stereo_decoder_output_color="rgbp" to avoid native NV12 pitch/plane interpretation issues; payload is still grayscale because channel 0 is used.
+    stereo_encoder_input_type: Literal["NV12", "YUV400p", "GRAY8", "RAW8"] = "NV12"
 
     rgb_resize_mode: Literal["CROP", "LETTERBOX", "STRETCH"] = "CROP"
     stereo_resize_mode: Literal["CROP", "LETTERBOX", "STRETCH"] = "CROP"
@@ -908,6 +1001,7 @@ class DepthAIPoeRGBStereoH26xBottomTorchGenerator(ImageMatGenerator):
     normalize_rgb: bool = True
     normalize_stereo: bool = True
     strict_stereo_shape: bool = True
+    debug_stereo_decoded_shape: bool = False
 
     packed_stereo_pad_value: float = 0.0
     clear_unused_payload_tail: bool = False
@@ -1029,7 +1123,7 @@ class DepthAIPoeRGBStereoH26xBottomTorchGenerator(ImageMatGenerator):
 def test_rgb_stereo():
     """Small shape/unpack smoke test. This prints every frame and is not a benchmark."""
 
-    gen = DepthAIPoeRGBStereoH26xBottomTorchGenerator(
+    gen = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator(
         sources=["169.254.1.222"],
         color_types=[],
         rgb_width=4032,
@@ -1068,11 +1162,110 @@ def test_rgb_stereo():
         gen.release()
         cv2.destroyAllWindows()
 
+def to_small_cv(mat, s=10, rgb_to_bgr=True):
+    """
+    Accepts torch tensor in:
+      CHW RGB: [3, H, W]
+      HWC RGB: [H, W, 3]
+      Gray:    [H, W]
+
+    Returns uint8 CPU numpy image for cv2.imshow().
+    """
+    x = mat.detach()
+
+    # CHW -> HWC
+    if x.ndim == 3 and x.shape[0] in (1, 3):
+        x = x.permute(1, 2, 0)
+
+    x = x[::s, ::s]
+
+    if x.dtype.is_floating_point:
+        # Works for normalized 0-1 tensors.
+        # Also safe if values are already 0-255-ish.
+        if float(x.max()) <= 1.5:
+            x = x * 255.0
+        x = x.clamp(0, 255).to(torch.uint8)
+    else:
+        x = x.to(torch.uint8)
+
+    arr = x.cpu().numpy()
+
+    # RGB -> BGR only for 3-channel images.
+    if rgb_to_bgr and arr.ndim == 3 and arr.shape[-1] == 3:
+        arr = arr[:, :, ::-1].copy()
+
+    # If shape is [H, W, 1], make it [H, W]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+
+    return arr
+
+def test_rgb_stereo():
+    """Small shape/unpack smoke test. This prints every frame and is not a benchmark."""
+
+    gen = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator(
+        sources=["169.254.1.222"],
+        color_types=[],
+        rgb_width=4032,
+        rgb_height=3040,
+        stereo_width=1280,
+        stereo_height=800,
+        capture_fps=15,
+        rgb_codec="h265",
+        stereo_codec="h265",
+        rgb_bitrate_kbps=60000,
+        stereo_bitrate_kbps=6000,
+        decoder_output_color="rgbp",
+        stereo_decoder_output_color="rgbp",
+        rgb_camera_socket="CAM_A",
+        left_camera_socket="CAM_B",
+        right_camera_socket="CAM_C",
+        normalize_rgb=True,
+        normalize_stereo=True,
+        show_rgb_preview=False,
+        show_stereo_preview=False,
+        fps=0,
+    )
+
+    try:
+        for mats in gen:
+            packed = mats[0].data()
+            rgb, stereo, left, right = gen.unpack_packed_tensor(packed)
+
+            # Important for bottom-inplace packing:
+            # bottom rows of rgb are overwritten by stereo payload.
+            rgb_valid = rgb[:, :, :gen.stereo_payload_start_row, :]
+
+            small_rgb = to_small_cv(rgb_valid[0], s=10, rgb_to_bgr=True)
+            small_left = to_small_cv(left[0], s=4, rgb_to_bgr=False)
+            small_right = to_small_cv(right[0], s=4, rgb_to_bgr=False)
+
+            cv2.imshow("small_rgb", small_rgb)
+            cv2.imshow("small_left", small_left)
+            cv2.imshow("small_right", small_right)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+
+            # For FPS testing, do not print every frame.
+            # Print every N frames instead.
+            # print(
+            #     "packed", tuple(packed.shape), packed.device, packed.dtype,
+            #     "rgb", tuple(rgb.shape),
+            #     "stereo", tuple(stereo.shape),
+            #     "left", tuple(left.shape),
+            #     "right", tuple(right.shape),
+            # )
+
+    finally:
+        gen.release()
+        cv2.destroyAllWindows()
 
 def benchmark_rgb_stereo(duration_sec: float = 10.0, warmup_sec: float = 2.0):
     """No per-frame printing/unpacking benchmark."""
 
-    gen = DepthAIPoeRGBStereoH26xBottomTorchGenerator(
+    gen = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator(
         sources=["169.254.1.222"],
         color_types=[],
         rgb_width=4032,
@@ -1137,9 +1330,11 @@ def benchmark_rgb_stereo(duration_sec: float = 10.0, warmup_sec: float = 2.0):
 
 
 # Compatibility aliases.
-DepthAIPoeRGBStereoEncodedBottomTorchGenerator = DepthAIPoeRGBStereoH26xBottomTorchGenerator
-DepthAIPoeRGBStereoH265BottomTorchGenerator = DepthAIPoeRGBStereoH26xBottomTorchGenerator
-DepthAIPoeRGBStereoPackedGenerator = DepthAIPoeRGBStereoH26xBottomTorchGenerator
+DepthAIPoeRGBStereoH26xBottomV3TorchGenerator = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator
+DepthAIPoeRGBStereoH26xBottomTorchGenerator = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator
+DepthAIPoeRGBStereoEncodedBottomTorchGenerator = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator
+DepthAIPoeRGBStereoH265BottomTorchGenerator = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator
+DepthAIPoeRGBStereoPackedGenerator = DepthAIPoeRGBStereoH26xBottomV4TorchGenerator
 
 
 if __name__ == "__main__":
