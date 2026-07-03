@@ -22,6 +22,7 @@ dev = [
     "ipython>=8.0.0",
     "matplotlib>=3.7.5",
     "pynvvideocodec>=2.1.0",
+    "redis>=8.0.1",
     "segmentation-models-pytorch>=0.3.3",
 ]
 
@@ -33,3 +34,9 @@ torchvision = { index = "torch-cuda" }
 name = "torch-cuda"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[tool.setuptools.packages.find]
+include = ["image_pipeblocks*"]
+
+[tool.uv]
+package = true

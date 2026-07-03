@@ -6,103 +6,127 @@ def logger(msg, level="info"):
 
 try:
 
-    import asyncio
+    import atexit
     import os
+    import queue
     import re
     import socket
+    import threading
     import time
     import traceback
     from typing import Any, Optional
 
-    import redis.asyncio as redis
+    import redis
 
 
-    class AsyncRedisLogger:
+    class RedisLogger:
         """
+        Singleton Redis Stream logger.
+
         Usage:
-            logger = AsyncRedisLogger()
-            await logger.start()
+            logger = RedisLogger()
 
-            logger("[Amodule:member1] say something")
-            logger("[Amodule:member1] failed", level="error")
+            logger("[App:init] started")
+            logger("[Auth:login] failed", level="warning", extra={"user_id": 123})
 
-            await logger.close()
+            try:
+                1 / 0
+            except Exception:
+                logger.exception("[Calc:divide] failed")
+
+            logger.close()
+
+        Check Redis:
+            redis-cli XRANGE "log:App:init" - +
+            redis-cli XRANGE "log:Auth:login" - +
         """
+
+        _instance = None
+        _instance_lock = threading.Lock()
+        _parse_pattern = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
+
+        def __new__(cls, *args, **kwargs):
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+            return cls._instance
 
         def __init__(
             self,
             redis_url: str = "redis://localhost:6379/0",
-            key_prefix: str = "log:",
+            key_prefix: str = "",#"log:",
             max_queue_size: int = 10_000,
             max_stream_len: int = 100_000,
             print_also: bool = True,
+            redis_socket_timeout: float = 2.0,
         ):
+            # Prevent singleton from initializing multiple times.
+            if getattr(self, "_initialized", False):
+                return
+
             self.redis_url = redis_url
             self.key_prefix = key_prefix
             self.max_stream_len = max_stream_len
             self.print_also = print_also
 
-            self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue_size)
+            self.queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
 
-            self.redis: Optional[redis.Redis] = redis.from_url(self.redis_url, decode_responses=True)
+            self.redis = redis.Redis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=redis_socket_timeout,
+                socket_timeout=redis_socket_timeout,
+            )
+
             if not self.redis.ping():
                 raise RuntimeError("Failed to connect to Redis")
 
-            self.worker_task: Optional[asyncio.Task] = None
-            self.closed = False
-
             self.hostname = socket.gethostname()
-            self.pid = os.getpid()
-
-        async def start(self):
-            """
-            Start Redis connection and background worker.
-            """
-            self.redis = redis.from_url(self.redis_url, decode_responses=True)
-            await self.redis.ping()
+            self.pid = str(os.getpid())
 
             self.closed = False
-            self.worker_task = asyncio.create_task(self._worker())
+            self._sentinel = object()
 
-        def __call__(self, raw_msg: str, level: str = "info", **extra):
+            self.worker_thread = threading.Thread(
+                target=self._worker,
+                name="RedisLoggerWorker",
+                daemon=True,
+            )
+            self.worker_thread.start()
+
+            atexit.register(self.close)
+
+            self._initialized = True
+
+        def __call__(
+            self,
+            raw_msg: str,
+            level: str = "info",
+            extra: Optional[dict[str, Any]] = None,
+        ):
             """
-            Print-like API.
+            Very light hot path.
 
-            Example:
-                logger("[Amodule:member1] say something")
-                logger("[Auth:login] failed password", level="warning", user_id=123)
+            This does NOT parse, format, build Redis keys, build Redis records,
+            or write to Redis. It only puts a small tuple into the queue.
             """
             if self.closed:
                 return
 
-            parsed_key, message = self.parse(raw_msg)
-            redis_key = self.make_redis_key(parsed_key)
-
-            record = {
-                "redis_key": redis_key,
-                "key": parsed_key,
-                "level": level.upper(),
-                "message": message,
-                "raw": raw_msg,
-                "ts": str(time.time()),
-                "hostname": self.hostname,
-                "pid": str(self.pid),
-            }
-
-            for k, v in extra.items():
-                record[f"extra:{k}"] = str(v)
-
-            if self.print_also:
-                print(f"[{record['level']}] [{parsed_key}] {message}")
-
             try:
-                self.queue.put_nowait(record)
-            except asyncio.QueueFull:
+                # Capture timestamp here so it means "time log was called",
+                # not "time worker processed the log".
+                self.queue.put_nowait((time.time(), raw_msg, level, extra))
+            except queue.Full:
                 print("[LOGGER WARNING] queue full; dropped log:", raw_msg)
 
-        def exception(self, raw_msg: str, **extra):
+        def exception(
+            self,
+            raw_msg: str,
+            extra: Optional[dict[str, Any]] = None,
+        ):
             """
-            Use inside except block.
+            Use inside an except block.
 
             Example:
                 try:
@@ -110,65 +134,97 @@ try:
                 except Exception:
                     logger.exception("[Calc:divide] failed")
             """
+            if extra is None:
+                extra = {}
+
+            # Copy to avoid mutating caller's dict.
+            extra = dict(extra)
             extra["traceback"] = traceback.format_exc()
-            self(raw_msg, level="error", **extra)
 
-        async def _worker(self):
+            self(raw_msg, level="error", extra=extra)
+
+        def _worker(self):
             """
-            Background task that writes queued logs to Redis.
+            Heavy work happens here, not in __call__().
             """
-            while not self.closed or not self.queue.empty():
+            while True:
+                item = self.queue.get()
+
                 try:
-                    record = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+                    if item is self._sentinel:
+                        return
 
-                    redis_key = record.pop("redis_key")
+                    ts, raw_msg, level, extra = item
 
-                    if self.redis is None:
-                        raise RuntimeError("Redis logger is not started")
+                    parsed_key, message = self.parse(raw_msg)
+                    redis_key = self.make_redis_key(parsed_key)
+                    level = str(level).upper()
 
-                    await self.redis.xadd(
+                    record = {
+                        # "key": parsed_key,
+                        "msg": message,
+                        # "raw": str(raw_msg),
+                        "level": level,
+                        "ts": str(ts),
+                        # "hostname": self.hostname,
+                        # "pid": self.pid,
+                    }
+
+                    if extra:
+                        for k, v in extra.items():
+                            record[f"extra:{k}"] = str(v)
+
+                    if self.print_also:
+                        print(f"[{level}] [{parsed_key}] {message}")
+
+                    self.redis.xadd(
                         redis_key,
                         record,
                         maxlen=self.max_stream_len,
                         approximate=True,
                     )
 
-                    self.queue.task_done()
-
-                except asyncio.TimeoutError:
-                    continue
-
-                except asyncio.CancelledError:
-                    break
-
                 except Exception as exc:
                     print("[LOGGER ERROR] failed to write to Redis:", repr(exc))
 
-                    try:
-                        self.queue.task_done()
-                    except ValueError:
-                        pass
+                finally:
+                    self.queue.task_done()
 
-                    await asyncio.sleep(0.5)
+        def close(self):
+            """
+            Flush queued logs and close Redis.
 
-        async def close(self):
+            Safe to call multiple times.
             """
-            Flush logs and close Redis connection.
-            redis-py async clients should be closed when finished. 
-            """
+            if getattr(self, "closed", True):
+                return
+
             self.closed = True
 
-            await self.queue.join()
+            try:
+                # Wait until all real log items are processed.
+                self.queue.join()
+            except Exception:
+                pass
 
-            if self.worker_task:
-                self.worker_task.cancel()
+            try:
+                # Stop worker.
+                self.queue.put_nowait(self._sentinel)
+            except queue.Full:
                 try:
-                    await self.worker_task
-                except asyncio.CancelledError:
+                    self.queue.put(self._sentinel, timeout=1)
+                except Exception:
                     pass
 
-            if self.redis:
-                await self.redis.aclose()
+            try:
+                self.worker_thread.join(timeout=2)
+            except Exception:
+                pass
+
+            try:
+                self.redis.close()
+            except Exception:
+                pass
 
         def parse(self, raw_msg: str) -> tuple[str, str]:
             """
@@ -181,31 +237,22 @@ try:
             """
             raw_msg = str(raw_msg).strip()
 
-            match = re.match(r"^\[([^\]]+)\]\s*(.*)$", raw_msg)
+            match = self._parse_pattern.match(raw_msg)
 
             if not match:
                 return "unknown", raw_msg
 
-            key = match.group(1).strip()
+            key = match.group(1).strip() or "unknown"
             message = match.group(2).strip()
-
-            if not key:
-                key = "unknown"
 
             return key, message
 
         def make_redis_key(self, key: str) -> str:
-            """
-            Convert:
-                Amodule:member1
-
-            Into:
-                log:Amodule:member1
-            """
             return f"{self.key_prefix}{key}"
 
+    logger = RedisLogger()
+    logger("[RedisLogger:init] start")
 
-    logger = AsyncRedisLogger()
 except:
     pass
 

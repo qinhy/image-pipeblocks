@@ -193,7 +193,7 @@ class _PyNvVideoCodecStreamBackend(_StreamDecoderBackend):
         if nvc is None or self.feeder is None:
             raise RuntimeError("PyNvVideoCodec stream backend was not started")
 
-        logger(f"Creating PyNvVideoCodec demuxer/decoder for {self.stream_name} stream...")
+        logger(f"[PyNvVideoCodecStreamBackend:info] Creating PyNvVideoCodec demuxer/decoder for {self.stream_name} stream...")
         self.demuxer = nvc.CreateDemuxer(self.feeder.feed_chunk)
         kwargs = {
             "gpuid": self.owner.gpu_id,
@@ -208,7 +208,7 @@ class _PyNvVideoCodecStreamBackend(_StreamDecoderBackend):
             if latency is not None:
                 kwargs["latency"] = latency
             else:
-                logger("Warning: PyNvVideoCodec low-latency enum not found.")
+                logger("[PyNvVideoCodecStreamBackend:warning] PyNvVideoCodec low-latency enum not found.")
         self.decoder = nvc.CreateDecoder(**kwargs)
         self.packet_iter = iter(self.demuxer)
 
@@ -495,7 +495,7 @@ class _GstNvVivaFilterStreamBackend(_StreamDecoderBackend):
             self.lib.set_channel_order(self._CHANNEL_ORDER_MAP[channel_order])
         elif channel_order != "auto":
             logger(
-                "Warning: nvivafilter library does not expose set_channel_order(); "
+                "[GstNvVivaFilterStreamBackend:warning] nvivafilter library does not expose set_channel_order(); "
                 f"requested channel_order={channel_order!r} will be ignored."
             )
 
@@ -535,9 +535,9 @@ class _GstNvVivaFilterStreamBackend(_StreamDecoderBackend):
         """
         pipeline_desc = " ".join(pipeline_desc.split())
 
-        logger(f"Creating GStreamer nvivafilter torch pipeline for {self.stream_name} stream:")
-        logger(f"  {pipeline_desc}")
-        logger(
+        logger(f"[GstNvVivaFilterStreamBackend:info] Creating GStreamer nvivafilter torch pipeline for {self.stream_name} stream:")
+        logger(f"[GstNvVivaFilterStreamBackend:info]  {pipeline_desc}")
+        logger("[GstNvVivaFilterStreamBackend:info]"
             f"  output tensor: shape={tuple(tensor.shape)}, "
             f"dtype={tensor.dtype}, device={tensor.device}, clone_output={self.owner.gst_nvivafilter_clone_output}"
         )
@@ -826,7 +826,11 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             src = src.replace("depthai://", "", 1).strip()
         if src in ("", "auto", "default", "none", "None"):
             return dai.Device()
-        return dai.Device(dai.DeviceInfo(src))
+        try:
+            cam = dai.Device(dai.DeviceInfo(src))
+        except Exception:            
+            self._log("error", f"could not open DepthAI device: {src}")
+        return cam
 
     @staticmethod
     def _camera_socket(socket_name: str):
@@ -949,7 +953,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             try:
                 enc.setBitrateKbps(int(bitrate))
             except Exception as e:
-                logger(f"Warning: could not set OAK {enc_name} encoder bitrate: {e}")
+                logger(f"[GstNvVivaFilterStreamBackend:warning] could not set OAK {enc_name} encoder bitrate: {e}")
             try:
                 enc.setKeyframeFrequency(int(owner.capture_fps))
             except Exception:
@@ -970,6 +974,13 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
         pipeline.start()
         return pipeline
+    
+    def _log(self, path:str, msg: str):
+        level="info"
+        if path in ["error","warning","debug","info"]:
+            level=path
+            
+        logger(f"[{self.owner.uuid}:{path}] {msg}", level=level)
 
     def _start(self):
         owner = self.owner
@@ -990,39 +1001,38 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
                 f"payload_rows={payload_rows}, rgb_height={owner.rgb_height}."
             )
 
-        logger(f"[{self.owner.uuid}:info] Opening DepthAI device...")
+        self._log("info", "Opening DepthAI device...")
         self.device = self._open_device()
 
         decoder_backend_name = getattr(owner, "decoder_backend", "auto")
         if decoder_backend_name == "auto":
             decoder_backend_name = "gst-nvivafilter" if _looks_like_jetson() else "pynvvideocodec"
 
-        logger("Connected DepthAI device:")
-        logger(f"  Device ID: {self.device.getDeviceInfo().getDeviceId()}")
-        logger(f"  Cameras: {self.device.getConnectedCameras()}")
-        logger("")
-        logger("Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline v7:")
-        logger(f"  Source: {self.source}")
-        logger(f"  RGB socket: {owner.rgb_camera_socket}")
-        logger(f"  Left socket: {owner.left_camera_socket}")
-        logger(f"  Right socket: {owner.right_camera_socket}")
-        logger(f"  RGB size: {owner.rgb_width}x{owner.rgb_height}")
-        logger(f"  Stereo size: {owner.stereo_width}x{owner.stereo_height}")
-        logger(f"  Capture FPS: {owner.capture_fps}")
-        logger(f"  OAK RGB encoder: {owner.rgb_codec.upper()} @ {owner.rgb_bitrate_kbps} kbps")
-        logger(f"  OAK stereo encoders: {owner.stereo_codec.upper()} @ {owner.stereo_bitrate_kbps} kbps each")
-        logger(f"  Decoder backend: {getattr(owner, 'decoder_backend', 'auto')} -> {decoder_backend_name}")
-        logger(f"  RGB decoder output: {owner.decoder_output_color}")
-        logger(f"  Stereo decoder output: {owner.stereo_decoder_output_color}")
-        logger(f"  Stereo encoder input type: {owner.stereo_encoder_input_type}")
-        logger(f"  Output: [1, 3, {owner.rgb_height}, {owner.rgb_width}]")
-        logger(f"  Stereo payload rows inside RGB bottom: {payload_rows}")
-        logger(f"  Stereo payload start row: {payload_start}")
-        logger("  Note: bottom RGB rows are overwritten by stereo payload")
-        logger(f"  normalize_rgb: {owner.normalize_rgb}")
-        logger(f"  normalize_stereo: {owner.normalize_stereo}")
-        logger(f"  GPU ID: {owner.gpu_id}")
-        logger("")
+        self._log("info","Connected DepthAI device:")
+        self._log("status",f"  Device ID: {self.device.getDeviceInfo().getDeviceId()}")
+        self._log("status",f"  Cameras: {self.device.getConnectedCameras()}")
+
+        self._log("info","Starting DepthAI RGB + H26x stereo bottom-pack tensor pipeline v7:")
+        self._log("status",f"  Source: {self.source}")
+        self._log("status",f"  RGB socket: {owner.rgb_camera_socket}")
+        self._log("status",f"  Left socket: {owner.left_camera_socket}")
+        self._log("status",f"  Right socket: {owner.right_camera_socket}")
+        self._log("status",f"  RGB size: {owner.rgb_width}x{owner.rgb_height}")
+        self._log("status",f"  Stereo size: {owner.stereo_width}x{owner.stereo_height}")
+        self._log("status",f"  Capture FPS: {owner.capture_fps}")
+        self._log("status",f"  OAK RGB encoder: {owner.rgb_codec.upper()} @ {owner.rgb_bitrate_kbps} kbps")
+        self._log("status",f"  OAK stereo encoders: {owner.stereo_codec.upper()} @ {owner.stereo_bitrate_kbps} kbps each")
+        self._log("status",f"  Decoder backend: {getattr(owner, 'decoder_backend', 'auto')} -> {decoder_backend_name}")
+        self._log("status",f"  RGB decoder output: {owner.decoder_output_color}")
+        self._log("status",f"  Stereo decoder output: {owner.stereo_decoder_output_color}")
+        self._log("status",f"  Stereo encoder input type: {owner.stereo_encoder_input_type}")
+        self._log("status",f"  Output: [1, 3, {owner.rgb_height}, {owner.rgb_width}]")
+        self._log("status",f"  Stereo payload rows inside RGB bottom: {payload_rows}")
+        self._log("status",f"  Stereo payload start row: {payload_start}")
+        self._log("info",  f"  Note: bottom RGB rows are overwritten by stereo payload")
+        self._log("status",f"  normalize_rgb: {owner.normalize_rgb}")
+        self._log("status",f"  normalize_stereo: {owner.normalize_stereo}")
+        self._log("status",f"  GPU ID: {owner.gpu_id}")
 
         self.pipeline = self._create_depthai_pipeline()
 
@@ -1067,7 +1077,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             )
             stream.decode_thread.start()
 
-        logger("DepthAI RGB + H26x stereo bottom-pack tensor pipeline v7 ready.")
+        self._log("info","DepthAI RGB + H26x stereo bottom-pack tensor pipeline ready.")
 
     def _create_stream_decoder(self, stream: _EncodedStreamRuntime, codec: str, max_width: int, max_height: int, output_color: str):
         stream.decoder_backend = _create_stream_decoder_backend(
@@ -1107,7 +1117,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
 
         except Exception:
             if not self.stop_event.is_set() and not self._released:
-                logger(f"DepthAI {stream.name} producer thread failed:")
+                self._log("error",f"DepthAI {stream.name} producer thread failed:")
                 traceback.print_exc()
         finally:
             stream.push_eof()
@@ -1137,7 +1147,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             pass
         except Exception:
             if not self.stop_event.is_set() and not self._released:
-                logger(f"DepthAI {stream.name} stereo decode thread failed:")
+                self._log("error",f"DepthAI {stream.name} stereo decode thread failed:")
                 traceback.print_exc()
         finally:
             self._stereo_ready.set()
@@ -1166,7 +1176,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         if getattr(owner, "debug_stereo_decoded_shape", False):
             printed_attr = f"_debug_printed_{getattr(self, 'idx', 0)}_{output_color}"
             if not getattr(self, printed_attr, False):
-                logger(f"Decoded stereo tensor shape={tuple(tensor.shape)}, dtype={tensor.dtype}, color={output_color}")
+                self._log("info",f"Decoded stereo tensor shape={tuple(tensor.shape)}, dtype={tensor.dtype}, color={output_color}")
                 setattr(self, printed_attr, True)
 
         # gst-nvivafilter returns [1, 3, H, W] normalized RGB. Use channel 0
@@ -1281,14 +1291,14 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
         owner = self.owner
         stride = max(1, int(owner.preview_stride))
         if tensor.ndim != 3:
-            logger(f"Cannot preview RGB tensor shape: {tuple(tensor.shape)}")
+            self._log("error",f"Cannot preview RGB tensor shape: {tuple(tensor.shape)}")
             return
         if tensor.shape[0] == 3:
             small_hwc = tensor[:, ::stride, ::stride].permute(1, 2, 0).contiguous()
         elif tensor.shape[-1] == 3:
             small_hwc = tensor[::stride, ::stride, :].contiguous()
         else:
-            logger(f"Cannot preview RGB tensor shape: {tuple(tensor.shape)}")
+            self._log("error",f"Cannot preview RGB tensor shape: {tuple(tensor.shape)}")
             return
         small = small_hwc.detach()
         if small.dtype.is_floating_point and float(small.max()) <= 1.5:
@@ -1468,7 +1478,7 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
                 rgb_mbps = self.rgb.byte_count * 8.0 / elapsed / 1_000_000
                 left_mbps = self.left.byte_count * 8.0 / elapsed / 1_000_000
                 right_mbps = self.right.byte_count * 8.0 / elapsed / 1_000_000
-                logger(
+                self._log("info",
                     f"combined={self.combined_frame_count}, "
                     f"fps={combined_fps:.2f}, "
                     f"rgb_dec={self.rgb.decoded_frame_count}, "
@@ -1489,74 +1499,144 @@ class _DepthAIPoeRGBStereoH26xBottomTorchTensorCapture:
             if self._released or self.stop_event.is_set():
                 raise StopIteration
             raise
-
+        
     def release(self):
+        self._log("debug", "release() called")
+
         if self._released:
+            self._log("debug", "release() skipped: already released")
             return
 
-        self._released = True
-        self.stop_event.set()
-        self._stereo_ready.set()
+        self._log("info", "Starting DepthAI resource release")
 
-        for stream in (self.rgb, self.left, self.right):
-            stream.push_eof()
+        self._released = True
+        self._log("debug", "Marked object as released")
+
+        self.stop_event.set()
+        self._log("debug", "Stop event set")
+
+        self._stereo_ready.set()
+        self._log("debug", "Stereo ready event set to unblock waiting threads")
+
+        streams = (self.rgb, self.left, self.right)
+
+        for stream in streams:
+            self._log("debug", f"Sending EOF to stream '{stream.name}'")
+
+            try:
+                stream.push_eof()
+                self._log("debug", f"EOF pushed to stream '{stream.name}'")
+            except Exception as e:
+                self._log("warning", f"Failed to push EOF to stream '{stream.name}': {e}")
+
             try:
                 if stream.depthai_q is not None and hasattr(stream.depthai_q, "close"):
+                    self._log("debug", f"Closing DepthAI queue for stream '{stream.name}'")
                     stream.depthai_q.close()
-            except Exception:
-                pass
+                    self._log("debug", f"DepthAI queue closed for stream '{stream.name}'")
+                else:
+                    self._log("debug", f"No closable DepthAI queue for stream '{stream.name}'")
+            except Exception as e:
+                self._log("warning", f"Error closing DepthAI queue for stream '{stream.name}': {e}")
 
-        for stream in (self.rgb, self.left, self.right):
+        for stream in streams:
             try:
                 if stream.producer_thread is not None:
+                    self._log("debug", f"Joining producer thread for stream '{stream.name}'")
+
                     stream.producer_thread.join(timeout=2.0)
+
+                    if stream.producer_thread.is_alive():
+                        self._log(
+                            "warning",
+                            f"Producer thread for stream '{stream.name}' did not exit within timeout"
+                        )
+                    else:
+                        self._log("debug", f"Producer thread joined for stream '{stream.name}'")
+                else:
+                    self._log("debug", f"No producer thread for stream '{stream.name}'")
             except Exception as e:
-                logger(f"Error joining {stream.name} producer thread: {e}")
+                self._log("error", f"Error joining producer thread for stream '{stream.name}': {e}")
 
         for stream in (self.left, self.right):
             try:
                 if stream.decode_thread is not None:
-                    stream.decode_thread.join(timeout=2.0)
-            except Exception as e:
-                logger(f"Error joining {stream.name} decode thread: {e}")
+                    self._log("debug", f"Joining decode thread for stream '{stream.name}'")
 
-        for stream in (self.rgb, self.left, self.right):
-            try:
-                stream.close_decoder()
+                    stream.decode_thread.join(timeout=2.0)
+
+                    if stream.decode_thread.is_alive():
+                        self._log(
+                            "warning",
+                            f"Decode thread for stream '{stream.name}' did not exit within timeout"
+                        )
+                    else:
+                        self._log("debug", f"Decode thread joined for stream '{stream.name}'")
+                else:
+                    self._log("debug", f"No decode thread for stream '{stream.name}'")
             except Exception as e:
-                logger(f"Error closing {stream.name} decoder backend: {e}")
+                self._log("error", f"Error joining decode thread for stream '{stream.name}': {e}")
+
+        for stream in streams:
+            try:
+                self._log("debug", f"Closing decoder backend for stream '{stream.name}'")
+                stream.close_decoder()
+                self._log("debug", f"Decoder backend closed for stream '{stream.name}'")
+            except Exception as e:
+                self._log("error", f"Error closing decoder backend for stream '{stream.name}': {e}")
 
         try:
             if self.pipeline is not None:
+                self._log("debug", "Checking DepthAI pipeline state before stop")
+
                 if not hasattr(self.pipeline, "isRunning") or self.pipeline.isRunning():
+                    self._log("info", "Stopping DepthAI pipeline")
                     self.pipeline.stop()
+                    self._log("info", "DepthAI pipeline stopped")
+                else:
+                    self._log("debug", "DepthAI pipeline was not running")
+            else:
+                self._log("debug", "No DepthAI pipeline to stop")
         except Exception as e:
-            logger(f"Warning: DepthAI pipeline stop during release: {e}")
+            self._log("warning", f"DepthAI pipeline stop failed during release: {e}")
 
         try:
+            self._log("debug", "Closing exit stack")
             self._exit_stack.close()
-        except Exception:
-            pass
+            self._log("debug", "Exit stack closed")
+        except Exception as e:
+            self._log("warning", f"Error closing exit stack during release: {e}")
 
-        for stream in (self.rgb, self.left, self.right):
+        for stream in streams:
+            self._log("debug", f"Clearing cached tensors and queue references for stream '{stream.name}'")
+
             stream.latest_tensor = None
             stream.latest_tensor_normalized = False
             stream.depthai_q = None
 
         try:
             if self.device is not None and hasattr(self.device, "close"):
+                self._log("info", "Closing DepthAI device")
                 self.device.close()
-        except Exception:
-            pass
+                self._log("info", "DepthAI device closed")
+            else:
+                self._log("debug", "No closable DepthAI device")
+        except Exception as e:
+            self._log("warning", f"Error closing DepthAI device during release: {e}")
 
         self.pipeline = None
         self.device = None
+        self._log("debug", "Cleared pipeline and device references")
 
         for window_name in (self.owner.rgb_window_name, self.owner.stereo_window_name):
             try:
+                self._log("debug", f"Destroying OpenCV window '{window_name}'")
                 cv2.destroyWindow(window_name)
-            except Exception:
-                pass
+                self._log("debug", f"OpenCV window destroyed: '{window_name}'")
+            except Exception as e:
+                self._log("warning", f"Error destroying OpenCV window '{window_name}': {e}")
+
+        self._log("info", "DepthAI resource release completed")
 
 
 class DepthAIPoeRGBStereoTorchGenerator(ImageMatGenerator):
@@ -1775,7 +1855,7 @@ class DepthAIPoeRGBStereoTorchGenerator(ImageMatGenerator):
                 except Exception:
                     if capture.stop_event.is_set() or capture._released:
                         return
-                    logger("DepthAI RGB + H26x stereo bottom generator failed:")
+                    logger(f"[{self.owner.uuid}:warning] DepthAI RGB + H26x stereo bottom generator failed:")
                     traceback.print_exc()
                     raise
 
